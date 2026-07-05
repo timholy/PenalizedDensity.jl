@@ -7,7 +7,7 @@ export PenalizedDensityEstimate, amplitude, action, select_kappa, kappa_interval
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
-    PenalizedDensityEstimate(x; κ, atol=0.0)
+    PenalizedDensityEstimate(x; κ, rtol=0.0)
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -29,8 +29,13 @@ strictly convex potential; normalisation is then a rescaling.
 The returned object is callable: `d(x)` evaluates the density `Q(x)` at any real
 `x` (scalar or array). Use [`amplitude`](@ref) for `ψ(x)`.
 
-Repeated (or near-repeated within `atol`) points are merged and enter with integer
-weight, so weighted data is handled naturally.
+Repeated points, and points closer than `rtol / κ` (i.e. within a fraction `rtol` of the
+smoothing length `1 / κ`), are merged into one node carrying the count as its integer
+weight, so weighted data is handled naturally. Points that close carry no independent
+information at resolution `1 / κ`; merging them with `rtol > 0` bounds both the node count
+and the conditioning of the tridiagonal system, which keeps the fit fast and well
+conditioned on large, densely packed samples. The default `rtol = 0` merges only exact
+duplicates.
 
 # Examples
 ```jldoctest
@@ -51,12 +56,12 @@ struct PenalizedDensityEstimate{T<:AbstractFloat}
     λ::T           # normalisation multiplier (diagnostic)
 end
 
-function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, atol::Real=0.0)
+function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, rtol::Real=0.0)
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
-    atol >= 0 || throw(ArgumentError("atol must be nonnegative, got $atol"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
-    T = float(promote_type(eltype(x), typeof(κ), typeof(atol)))
-    nodes, weights = _merge_sorted(x, T(atol), T)
+    T = float(promote_type(eltype(x), typeof(κ), typeof(rtol)))
+    nodes, weights = _merge_sorted(x, T(rtol) / T(κ), T)
     return _fit(nodes, weights, T(κ))
 end
 
@@ -76,12 +81,16 @@ Sort `x` and collapse runs of points within `atol` of the run's first member int
 single node carrying the count as its weight. Returns distinct, strictly increasing
 `nodes::Vector{T}` and matching `weights`, regardless of the axes of `x`.
 """
-function _merge_sorted(x::AbstractVector, atol::T, ::Type{T}) where {T}
-    p = sortperm(x)
+_merge_sorted(x::AbstractVector, atol::T, ::Type{T}) where {T} =
+    _merge_presorted(sort!(T[xi for xi in x]), atol)
+
+# Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
+# Factored out so kappa_interval can re-merge one sorted copy at many tolerances.
+function _merge_presorted(xs, atol::T) where {T}
     nodes = T[]
     weights = T[]
-    for k in p
-        xk = T(x[k])
+    for xi in xs
+        xk = T(xi)
         if !isempty(nodes) && xk - nodes[end] <= atol
             weights[end] += one(T)
         else
@@ -110,6 +119,15 @@ function _neg_M(x::Vector{T}, κ::T) where {T}
     return SymTridiagonal(d, e)
 end
 
+# F(ψ) = ½ ψ'(−M)ψ − Σ wᵢ ln ψᵢ, the potential minimised by _solve_amplitude.
+function _objective(negM::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T}
+    s = zero(T)
+    for i in eachindex(w, ψ)
+        s += w[i] * log(ψ[i])
+    end
+    return dot(ψ, negM, ψ) / 2 - s
+end
+
 """
     _solve_amplitude(x, w, κ) -> ψ
 
@@ -117,32 +135,51 @@ Minimise the strictly convex potential `F(ψ) = ½ ψ'(−M)ψ − Σ wᵢ ln ψ
 by a damped Newton iteration with an SPD tridiagonal Hessian. The minimiser solves
 `(−M)ψ = w ./ ψ`, i.e. the field equation at unit multiplier; the caller rescales it
 to impose normalisation.
+
+Each step factorises the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
+along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
+Newton decrement `λ² = ∇FᵀΔ` drops below a relative tolerance, or when the line search can
+no longer decrease `F` — the point where rounding, not the algorithm, limits progress.
+Chasing the decrement below that floor would spin uselessly, so the stalled line search is
+itself the convergence signal. All scratch is allocated once; the iterations do not allocate.
 """
 function _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T) where {T}
-    n = length(x)
     negM = _neg_M(x, κ)
+    n = length(w)
     ψ = fill(one(T), n)             # strictly positive start
-    F(ψ) = (dot(ψ, negM, ψ) - 2 * dot(w, log.(ψ))) / 2
-    Fψ = F(ψ)
+    g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
+    Hdv = similar(ψ); Hev = similar(negM.ev)   # Hessian factorisation scratch
+    ctol = eps(T)^(2 // 3)          # relative Newton-decrement tolerance
+    Fψ = _objective(negM, w, ψ)
     for _ in 1:100
-        g = negM * ψ .- w ./ ψ                      # ∇F
-        H = SymTridiagonal(negM.dv .+ w ./ ψ.^2, negM.ev)   # ∇²F, SPD tridiagonal
-        Δ = H \ g
-        # Backtracking that also keeps ψ + αΔ strictly positive.
+        mul!(g, negM, ψ)
+        @. g -= w / ψ                       # ∇F = (−M)ψ − w./ψ
+        @. Hdv = negM.dv + w / ψ^2          # diagonal of ∇²F; off-diagonal equals negM.ev
+        Hev .= negM.ev                      # ldlt! overwrites its arguments; refill each step
+        Δ .= g
+        ldiv!(ldlt!(SymTridiagonal(Hdv, Hev)), Δ)   # Δ = (∇²F)⁻¹ ∇F
+        decrement = dot(g, Δ)               # Newton decrement λ² = ∇Fᵀ(∇²F)⁻¹∇F ≥ 0
+        decrement <= ctol * max(one(T), abs(Fψ)) && break
+        # Largest α ≤ 1 keeping ψ − αΔ strictly positive, then Armijo backtracking.
         α = one(T)
-        while any(<=(0), ψ .- α .* Δ)
+        for i in eachindex(ψ, Δ)
+            Δ[i] > 0 && (α = min(α, ψ[i] / Δ[i]))
+        end
+        α < one(T) && (α *= oftype(α, 0.99))
+        armijo = false
+        local Fnew
+        while α >= eps(T)
+            @. ψnew = ψ - α * Δ
+            Fnew = _objective(negM, w, ψnew)
+            if Fnew <= Fψ - α * decrement / 4
+                armijo = true
+                break
+            end
             α /= 2
         end
-        local ψnew, Fnew
-        while true
-            ψnew = ψ .- α .* Δ
-            Fnew = F(ψnew)
-            (Fnew <= Fψ - α * dot(g, Δ) / 4 || α < eps(T)) && break
-            α /= 2
-        end
-        decrement = dot(g, Δ)       # Newton decrement λ² = gᵀH⁻¹g = gᵀΔ
-        ψ, Fψ = ψnew, Fnew
-        decrement <= 2 * eps(T) * max(one(T), abs(Fψ)) && break
+        armijo || break                     # no decrease available ⇒ converged to rounding
+        copyto!(ψ, ψnew)
+        Fψ = Fnew
     end
     return ψ
 end
@@ -295,7 +332,7 @@ Significance of the fit of a trial density `Q`: the probability that the referen
 pvalue(d::PenalizedDensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
 
 """
-    select_kappa(x; κs, atol=0.0) -> κ
+    select_kappa(x; κs, rtol=0.0) -> κ
 
 Choose the smoothing scale by Stevenson's principle of minimum sensitivity: return
 the `κ` in the grid `κs` at which the classical action [`action`](@ref) is least
@@ -304,11 +341,11 @@ a plateau of width `~N`, `S` is insensitive to the precise `κ`.
 
 `κs` must be sorted and positive.
 """
-function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, atol::Real=0.0)
+function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, rtol::Real=0.0)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to estimate sensitivity"))
     lnκ = log.(κs)
-    S = [action(PenalizedDensityEstimate(x; κ, atol)) for κ in κs]
+    S = [action(PenalizedDensityEstimate(x; κ, rtol)) for κ in κs]
     best_i, best_slope = 0, Inf
     for i in 2:length(κs)-1
         slope = abs((S[i+1] - S[i-1]) / (lnκ[i+1] - lnκ[i-1]))
@@ -320,7 +357,7 @@ function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, at
 end
 
 """
-    kappa_interval(x; level=0.2, atol=0.0) -> (; κ, lo, hi)
+    kappa_interval(x; level=0.2, rtol=0.0) -> (; κ, lo, hi)
 
 Principled smoothing-scale selection with an interval of plausible values.
 
@@ -341,16 +378,23 @@ Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo,
 bracketing `h ∈ [(1−level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
 Requires at least two distinct points.
 """
-function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, atol::Real=0.0)
+function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=0.0)
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
-    atol >= 0 || throw(ArgumentError("atol must be nonnegative, got $atol"))
-    T = float(promote_type(eltype(x), typeof(level), typeof(atol)))
-    nodes, w = _merge_sorted(x, T(atol), T)
-    length(nodes) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
-    W = sum(w)
-    Hent = -sum(wi / W * log(wi / W) for wi in w)   # entropy of the multiplicities
-    # h(κ): fraction of the entropy resolved, monotone from 0 (κ→0) to 1 (κ→∞).
-    h(κ) = (action(_fit(nodes, w, κ)) + W * log(κ) - W / 2) / (W * Hent)
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
+    xs = sort!(T[xi for xi in x])
+    nodes0, w0 = _merge_presorted(xs, zero(T))      # exact duplicates fix the entropy baseline
+    length(nodes0) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
+    W = sum(w0)
+    Hent = -sum(wi / W * log(wi / W) for wi in w0)  # entropy of the multiplicities
+    r = T(rtol)
+    # h(κ): fraction of the entropy resolved, monotone from 0 (κ→0) to 1 (κ→∞). Points closer
+    # than rtol/κ are merged before each fit; as κ→∞ this reduces to the distinct nodes, so h
+    # still approaches 1 against the same entropy baseline W, H.
+    function h(κ)
+        nodes, w = _merge_presorted(xs, r / κ)
+        return (action(_fit(nodes, w, κ)) + W * log(κ) - W / 2) / (W * Hent)
+    end
     lvl = T(level)
     lo = _invert_monotone(h, (1 - lvl) / 2)
     κ = _invert_monotone(h, one(T) / 2)

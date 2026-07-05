@@ -45,10 +45,52 @@ end
         @test d1.ψ[1] > d1.ψ[2]
     end
 
-    @testset "atol merges near-coincident points" begin
-        d = PenalizedDensityEstimate([0.0, 1e-10, 1.0]; κ=1.0, atol=1e-6)
+    @testset "rtol merges points within rtol/κ" begin
+        d = PenalizedDensityEstimate([0.0, 1e-10, 1.0]; κ=1.0, rtol=1e-6)
         @test length(d.x) == 2
         @test d.w == [2.0, 1.0]
+        # The threshold is rtol/κ: here 1e-3/2 = 5e-4.
+        @test length(PenalizedDensityEstimate([0.0, 1e-4, 1.0]; κ=2.0, rtol=1e-3).x) == 2
+        @test length(PenalizedDensityEstimate([0.0, 1e-3, 1.0]; κ=2.0, rtol=1e-3).x) == 3
+        # Merging points closer than the resolution is lossless.
+        Random.seed!(5)
+        x = randn(5_000)
+        da = PenalizedDensityEstimate(x; κ=3.0)
+        db = PenalizedDensityEstimate(x; κ=3.0, rtol=1e-3)
+        g = range(-4, 4; length=101)
+        @test maximum(abs.(da.(g) .- db.(g))) < 1e-3
+    end
+
+    @testset "solver is robust and allocates O(N), not O(N·iterations)" begin
+        # Dense samples drive adjacent-node spacings toward zero, which sharply
+        # ill-conditions the tridiagonal Newton system; the fit must still converge
+        # and normalise, with memory proportional to N rather than N × iterations.
+        Random.seed!(4)
+        x = randn(20_000)
+        d = PenalizedDensityEstimate(x; κ=3.0)
+        @test all(isfinite, d.ψ) && all(>(0), d.ψ)
+        @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
+        # Stationarity of the normalised amplitude: (−M)ψ = (κ/λ) w ./ ψ (Eq. field equation).
+        negM = PenalizedDensity._neg_M(d.x, d.κ)
+        resid = negM * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
+        @test maximum(abs, resid) < 1e-6 * maximum(abs, negM * d.ψ)
+        PenalizedDensityEstimate(x; κ=3.0)                      # compile before measuring
+        @test (@allocated PenalizedDensityEstimate(x; κ=3.0)) < 40 * length(x) * sizeof(Float64)
+    end
+
+    @testset "scale equivariance" begin
+        # Q is scale-equivariant: rescaling x → s·x with κ → κ/s gives Q_s(s·x) = Q(x)/s.
+        # −M, the Newton solve, and the convergence test depend on x, κ only through κ·Δx,
+        # so the unnormalised fit and its stopping criterion are invariant under this scaling.
+        Random.seed!(11)
+        x = randn(2_000)
+        d = PenalizedDensityEstimate(x; κ=3.0)
+        xt = range(-3, 3; length=25)
+        Q = d.(xt)
+        for s in (1e-15, 1e20)
+            ds = PenalizedDensityEstimate(s .* x; κ=3.0 / s)
+            @test maximum(abs.(ds.(s .* xt) .- Q ./ s) ./ (Q ./ s)) < 1e-8
+        end
     end
 
     @testset "λ ≈ N near the optimal κ (Eq. 10 asymptotics)" begin
@@ -155,7 +197,7 @@ end
         @test_throws ArgumentError PenalizedDensityEstimate(Float64[]; κ=1.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=0.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=-1.0)
-        @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=1.0, atol=-1.0)
+        @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=1.0, rtol=-1.0)
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=0.0)
