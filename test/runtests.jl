@@ -52,6 +52,8 @@ end
         # The threshold is rtol/κ: here 1e-3/2 = 5e-4.
         @test length(PenalizedDensityEstimate([0.0, 1e-4, 1.0]; κ=2.0, rtol=1e-3).x) == 2
         @test length(PenalizedDensityEstimate([0.0, 1e-3, 1.0]; κ=2.0, rtol=1e-3).x) == 3
+        # The default rtol > 0 merges points far below the resolution (numerical hygiene).
+        @test length(PenalizedDensityEstimate([0.0, 1e-9, 1.0]; κ=1.0).x) == 2
         # Merging points closer than the resolution is lossless.
         Random.seed!(5)
         x = randn(5_000)
@@ -65,17 +67,18 @@ end
         # Dense samples drive adjacent-node spacings toward zero, which sharply
         # ill-conditions the tridiagonal Newton system; the fit must still converge
         # and normalise, with memory proportional to N rather than N × iterations.
+        # rtol=0 exercises the raw solver without the near-coincident-point merge.
         Random.seed!(4)
         x = randn(20_000)
-        d = PenalizedDensityEstimate(x; κ=3.0)
+        d = PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
         # Stationarity of the normalised amplitude: (−M)ψ = (κ/λ) w ./ ψ (Eq. field equation).
         negM = PenalizedDensity._neg_M(d.x, d.κ)
         resid = negM * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
         @test maximum(abs, resid) < 1e-6 * maximum(abs, negM * d.ψ)
-        PenalizedDensityEstimate(x; κ=3.0)                      # compile before measuring
-        @test (@allocated PenalizedDensityEstimate(x; κ=3.0)) < 40 * length(x) * sizeof(Float64)
+        PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)           # compile before measuring
+        @test (@allocated PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
     @testset "scale equivariance" begin

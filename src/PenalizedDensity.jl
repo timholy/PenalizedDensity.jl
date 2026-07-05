@@ -7,7 +7,7 @@ export PenalizedDensityEstimate, amplitude, action, select_kappa, kappa_interval
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
-    PenalizedDensityEstimate(x; κ, rtol=0.0)
+    PenalizedDensityEstimate(x; κ, rtol=1e-6)
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -32,10 +32,11 @@ The returned object is callable: `d(x)` evaluates the density `Q(x)` at any real
 Repeated points, and points closer than `rtol / κ` (i.e. within a fraction `rtol` of the
 smoothing length `1 / κ`), are merged into one node carrying the count as its integer
 weight, so weighted data is handled naturally. Points that close carry no independent
-information at resolution `1 / κ`; merging them with `rtol > 0` bounds both the node count
-and the conditioning of the tridiagonal system, which keeps the fit fast and well
-conditioned on large, densely packed samples. The default `rtol = 0` merges only exact
-duplicates.
+information at resolution `1 / κ`, and a near-coincident pair drives an entry of the
+tridiagonal system toward a singularity; merging bounds both the node count and the
+conditioning. The default `rtol = 1e-6` merges only points far below the resolution, which
+keeps the solve well conditioned without visibly changing the estimate; increase it (e.g.
+`rtol = 1e-3`) to cap the node count and speed up fits on large, densely packed samples.
 
 # Examples
 ```jldoctest
@@ -56,7 +57,7 @@ struct PenalizedDensityEstimate{T<:AbstractFloat}
     λ::T           # normalisation multiplier (diagnostic)
 end
 
-function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, rtol::Real=0.0)
+function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, rtol::Real=1e-6)
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
@@ -332,7 +333,7 @@ Significance of the fit of a trial density `Q`: the probability that the referen
 pvalue(d::PenalizedDensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
 
 """
-    select_kappa(x; κs, rtol=0.0) -> κ
+    select_kappa(x; κs, rtol=1e-6) -> κ
 
 Choose the smoothing scale by Stevenson's principle of minimum sensitivity: return
 the `κ` in the grid `κs` at which the classical action [`action`](@ref) is least
@@ -341,7 +342,7 @@ a plateau of width `~N`, `S` is insensitive to the precise `κ`.
 
 `κs` must be sorted and positive.
 """
-function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, rtol::Real=0.0)
+function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, rtol::Real=1e-6)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to estimate sensitivity"))
     lnκ = log.(κs)
@@ -357,7 +358,7 @@ function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, rt
 end
 
 """
-    kappa_interval(x; level=0.2, rtol=0.0) -> (; κ, lo, hi)
+    kappa_interval(x; level=0.2, rtol=1e-6) -> (; κ, lo, hi)
 
 Principled smoothing-scale selection with an interval of plausible values.
 
@@ -378,7 +379,7 @@ Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo,
 bracketing `h ∈ [(1−level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
 Requires at least two distinct points.
 """
-function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=0.0)
+function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1e-6)
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
