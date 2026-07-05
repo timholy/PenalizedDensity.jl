@@ -77,10 +77,11 @@ resolved — and the shaded band is the plausible range:
 
 ![Reduced action rising between its two entropy limits](assets/action_entropy.png)
 
-The half-entropy point coincides with the classical point of minimum sensitivity — the
-scale returned by [`select_kappa`](@ref) — but is located against exact bounds rather than
-a discrete derivative, and it comes with an interval (widen it with the `level` keyword).
-The band is broad because the action is genuinely flat over a wide range of ``\kappa``.
+For roughly balanced data the half-entropy point roughly coincides with the
+classical point of minimum sensitivity, as returned by [`select_kappa`](@ref),
+and can be determine with lower noise than the curve's derivative. When the data
+are skewed (e.g., more points drawn from one Gaussian than the other), the two
+criteria can differ, though the resulting difference in entropy is often modest.
 
 ## Goodness of fit
 
