@@ -1,0 +1,13 @@
+name = "PenalizedDensity"
+uuid = "a53fa1a1-8a2d-4fe0-8d35-d78a1429f885"
+authors = ["Tim Holy <tim.holy@gmail.com> and contributors"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.10.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
