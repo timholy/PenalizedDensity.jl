@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite the paper it implements (see
+  preferred-citation). To cite the software itself, use the metadata below.
+title: PenalizedDensity.jl
+abstract: >-
+  Julia implementation of a binning-free, penalized maximum-likelihood estimator
+  for continuous one-dimensional probability densities, with entropy-based
+  smoothing-scale selection and a robust goodness-of-fit statistic.
+type: software
+authors:
+  - given-names: Tim
+    family-names: Holy
+    email: tim.holy@gmail.com
+repository-code: https://github.com/timholy/PenalizedDensity.jl
+url: https://timholy.github.io/PenalizedDensity.jl/
+license: MIT
+keywords:
+  - density estimation
+  - nonparametric statistics
+  - Julia
+preferred-citation:
+  type: article
+  title: Analysis of Data from Continuous Probability Distributions
+  authors:
+    - given-names: Timothy E.
+      family-names: Holy
+  journal: Physical Review Letters
+  volume: 79
+  issue: 19
+  start: 3545
+  end: 3548
+  year: 1997
+  month: 11
+  doi: 10.1103/PhysRevLett.79.3545
