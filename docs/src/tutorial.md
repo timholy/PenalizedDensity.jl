@@ -77,11 +77,14 @@ resolved — and the shaded band is the plausible range:
 
 ![Reduced action rising between its two entropy limits](assets/action_entropy.png)
 
-For roughly balanced data the half-entropy point roughly coincides with the
-classical point of minimum sensitivity, as returned by [`select_kappa`](@ref),
-and can be determine with lower noise than the curve's derivative. When the data
-are skewed (e.g., more points drawn from one Gaussian than the other), the two
-criteria can differ, though the resulting difference in entropy is often modest.
+[`select_kappa`](@ref) returns a related but distinct scale: the point of *minimum
+sensitivity*, where `|dS/d ln κ|` is smallest. Its derivative is computed analytically, so
+the result is free of the noise that finite-differencing the action curve would introduce.
+The two criteria generally select different scales — the minimum-sensitivity scale is usually
+the coarser (smoother) of the two — so `select_kappa` is a good default when you want a single
+`κ`, while `kappa_interval` additionally reports a plausible band. Neither targets minimum
+integrated squared error; for error-optimal smoothing a cross-validated kernel bandwidth may
+do better, but both here give a principled scale without reference to a ground-truth density.
 
 ## Goodness of fit
 

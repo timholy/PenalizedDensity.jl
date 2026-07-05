@@ -107,6 +107,34 @@ end
         @test mean(abs.(d.(range(-4, 4; length=161)) .- φ.(range(-4, 4; length=161)))) < 0.05
     end
 
+    @testset "analytic dS/dln κ matches finite differences" begin
+        Random.seed!(6)
+        nodes, w = PenalizedDensity._merge_presorted(sort(randn(1000)), 0.0)
+        Sof(κ) = action(PenalizedDensity._fit(nodes, w, κ))
+        for κ in (1.5, 5.0, 15.0)
+            S, slope = PenalizedDensity._action_and_slope(nodes, w, κ)
+            @test S ≈ Sof(κ)
+            δ = 1e-5
+            fd = (Sof(κ * exp(δ)) - Sof(κ * exp(-δ))) / (2δ)     # dS/dln κ
+            @test slope ≈ fd rtol = 1e-3
+        end
+    end
+
+    @testset "select_kappa: analytic, grid-independent" begin
+        Random.seed!(2)
+        x = randn(1500)
+        κ = select_kappa(x)                                       # data-scaled default grid
+        @test κ > 0
+        # Golden-section refinement makes the result independent of the bracketing grid.
+        κ10  = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 10)))
+        κ200 = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 200)))
+        @test κ10 ≈ κ200 rtol = 1e-3
+        @test κ ≈ κ200 rtol = 1e-2
+        # The returned κ is a local minimum of |dS/dln κ|.
+        slope(κ) = abs(last(PenalizedDensity._action_and_slope(sort(x), ones(1500), κ)))
+        @test slope(κ) < slope(κ * 1.3) && slope(κ) < slope(κ / 1.3)
+    end
+
     @testset "callable on arrays; amplitude² == density" begin
         d = PenalizedDensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
         g = range(-4, 5; length=25)

@@ -202,6 +202,65 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     return Z
 end
 
+# Z = ∫ψ² together with its κ-derivative at fixed ψ and Bψ = ½ ∂Z/∂ψ, where Z = ψᵀBψ. The
+# three share the per-interval coth/csch coefficients, so one pass returns all of them.
+function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+    n = length(x)
+    Bψ = zeros(T, n)
+    t = one(T) / (2κ)               # tail coefficient
+    Z  = t * (ψ[1]^2 + ψ[n]^2)
+    dZ = -(ψ[1]^2 + ψ[n]^2) / (2κ^2)
+    Bψ[1] += t * ψ[1]
+    Bψ[n] += t * ψ[n]
+    for k in 1:n-1
+        h = x[k+1] - x[k]; θ = κ * h; ct = coth(θ); cs = csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - one(T)) / (2κ)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        dfdiag  = h * cs^2 * (θ * ct - 1) / κ - (ct - θ * cs^2) / (2κ^2)
+        dfcross = h * cs * (2ct - θ * (ct^2 + cs^2)) / (2κ) - cs * (θ * ct - 1) / (2κ^2)
+        dZ += dfdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * dfcross * ψ[k] * ψ[k+1]
+        Bψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
+        Bψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
+    end
+    return Z, dZ, Bψ
+end
+
+# (d(−M)/dκ) ψ: the κ-derivative of _neg_M's coth/csch entries, applied to ψ. The tails are
+# κ-independent and drop out.
+function _dnegM_dκ_mul(x::Vector{T}, κ::T, ψ::Vector{T}) where {T}
+    n = length(x)
+    r = zeros(T, n)
+    for k in 1:n-1
+        h = x[k+1] - x[k]; θ = κ * h; cs = csch(θ); ct = coth(θ)
+        dd = -h * cs^2                  # d/dκ coth(θ)
+        de =  h * cs * ct               # d/dκ (−csch(θ))
+        r[k]   += dd * ψ[k]   + de * ψ[k+1]
+        r[k+1] += dd * ψ[k+1] + de * ψ[k]
+    end
+    return r
+end
+
+# S(κ) = action of the fit, and dS/dln κ. ψ minimises the potential, but S also depends on κ
+# through the normalisation, so the sensitivity ψ′ = dψ/dκ contributes; it solves the same
+# SPD Newton system as the fit, `∇²F ψ′ = −(d(−M)/dκ) ψ`.
+function _action_and_slope(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
+    ψ = _solve_amplitude(nodes, w, κ)
+    A = _neg_M(nodes, κ)
+    Z, dZdκ, Bψ = _norm_sq_grad(nodes, ψ, κ)
+    W = sum(w)
+    S = W - κ * Z + W * log(Z)
+    for i in eachindex(w, ψ)
+        S -= 2 * w[i] * log(ψ[i])
+    end
+    H = SymTridiagonal(A.dv .+ w ./ ψ.^2, copy(A.ev))
+    ψ′ = ldiv!(ldlt!(H), _dnegM_dκ_mul(nodes, κ, ψ))
+    ψ′ .= .-ψ′                          # ψ′ = −H⁻¹ (d(−M)/dκ) ψ
+    c = W / Z - κ
+    dSdκ = -Z + c * dZdκ + 2 * c * dot(Bψ, ψ′) - 2 * dot(w ./ ψ, ψ′)   # w./ψ = (−M)ψ
+    return S, κ * dSdκ
+end
+
 """
     amplitude(d::PenalizedDensityEstimate, x)
 
@@ -332,29 +391,62 @@ Significance of the fit of a trial density `Q`: the probability that the referen
 """
 pvalue(d::PenalizedDensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
 
-"""
-    select_kappa(x; κs, rtol=1e-6) -> κ
-
-Choose the smoothing scale by Stevenson's principle of minimum sensitivity: return
-the `κ` in the grid `κs` at which the classical action [`action`](@ref) is least
-sensitive to `κ`, i.e. `|dS/d ln κ|` is smallest (Eq. and Fig. 1 of the paper). Over
-a plateau of width `~N`, `S` is insensitive to the precise `κ`.
-
-`κs` must be sorted and positive.
-"""
-function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, rtol::Real=1e-6)
-    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
-    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to estimate sensitivity"))
-    lnκ = log.(κs)
-    S = [action(PenalizedDensityEstimate(x; κ, rtol)) for κ in κs]
-    best_i, best_slope = 0, Inf
-    for i in 2:length(κs)-1
-        slope = abs((S[i+1] - S[i-1]) / (lnκ[i+1] - lnκ[i-1]))
-        if slope < best_slope
-            best_slope, best_i = slope, i
+# Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimiser.
+function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
+    invφ = (sqrt(T(5)) - 1) / 2      # 1/golden ≈ 0.618
+    c = b - invφ * (b - a); fc = f(c)
+    d = a + invφ * (b - a); fd = f(d)
+    for _ in 1:iters
+        if fc < fd
+            b, d, fd = d, c, fc
+            c = b - invφ * (b - a); fc = f(c)
+        else
+            a, c, fc = c, d, fd
+            d = a + invφ * (b - a); fd = f(d)
         end
     end
-    return oftype(float(first(κs)), κs[best_i])
+    return (a + b) / 2
+end
+
+# Geometric κ grid from coarse (≈ one blob over the data) to fine (≈ individual points),
+# scaled to the data's extent, wide enough to bracket the minimum-sensitivity scale.
+function _default_κs(x::AbstractVector{<:Real})
+    lo, hi = extrema(x)
+    span = hi - lo
+    span > 0 || throw(ArgumentError("need at least two distinct points to select κ"))
+    return exp.(range(log(0.5 / span), log(5 * length(x) / span); length = 40))
+end
+
+"""
+    select_kappa(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+
+Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
+the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
+is smallest (Fig. 1 of the paper). The derivative `dS/d ln κ` is evaluated analytically and
+minimised over `κ` by a golden-section search, bracketed by the grid `κs` (which defaults to
+a geometric range scaled to the data's extent).
+
+This is a principled convention rather than a unique optimum: `S` has no exact stationary
+point in `κ`, so the flattest point depends on measuring sensitivity in `ln κ`. It generally
+selects a different — usually coarser — scale than the entropy-based [`kappa_interval`](@ref),
+and neither targets minimum integrated squared error; a cross-validated kernel bandwidth is
+more appropriate for that.
+
+`κs` must be sorted and positive, with at least three values to bracket the minimum.
+"""
+function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
+    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+    xs = sort!(T[xi for xi in x])
+    r = T(rtol)
+    absslope(κ) = abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
+    lnκ = log.(T.(κs))
+    i = argmin(absslope.(exp.(lnκ)))            # coarse bracket on the grid
+    lo = lnκ[max(i - 1, firstindex(lnκ))]
+    hi = lnκ[min(i + 1, lastindex(lnκ))]
+    return exp(_golden_min(l -> absslope(exp(l)), lo, hi))
 end
 
 """
