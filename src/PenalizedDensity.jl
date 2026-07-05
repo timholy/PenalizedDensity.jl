@@ -3,7 +3,7 @@ module PenalizedDensity
 using LinearAlgebra
 using SpecialFunctions: erfc, erfcx
 
-export PenalizedDensityEstimate, amplitude, action, select_kappa
+export PenalizedDensityEstimate, amplitude, action, select_kappa, kappa_interval
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
@@ -57,12 +57,16 @@ function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, atol::Rea
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
     T = float(promote_type(eltype(x), typeof(κ), typeof(atol)))
     nodes, weights = _merge_sorted(x, T(atol), T)
-    κT = T(κ)
-    ψ = _solve_amplitude(nodes, weights, κT)
-    Z = _norm_sq(nodes, ψ, κT)
+    return _fit(nodes, weights, T(κ))
+end
+
+# Fit from already-merged distinct nodes and their weights.
+function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
+    ψ = _solve_amplitude(nodes, weights, κ)
+    Z = _norm_sq(nodes, ψ, κ)
     ψ ./= sqrt(Z)
-    λ = κT * Z                      # scaling law: normalised ψ solves (−M)ψ = (κ/λ)/ψ
-    return PenalizedDensityEstimate{T}(nodes, weights, ψ, κT, λ)
+    λ = κ * Z                       # scaling law: normalised ψ solves (−M)ψ = (κ/λ)/ψ
+    return PenalizedDensityEstimate{T}(nodes, weights, ψ, κ, λ)
 end
 
 """
@@ -99,10 +103,9 @@ function _neg_M(x::Vector{T}, κ::T) where {T}
     d[n] += one(T)                  # right tail
     for k in 1:n-1
         θ = κ * (x[k+1] - x[k])
-        s = sinh(θ)
-        d[k]   += cosh(θ) / s       # coth θ
-        d[k+1] += cosh(θ) / s
-        e[k]    = -one(T) / s       # −csch θ
+        d[k]   += coth(θ)
+        d[k+1] += coth(θ)
+        e[k]    = -csch(θ)          # coth/csch stay finite as θ → ∞ (isolated points)
     end
     return SymTridiagonal(d, e)
 end
@@ -151,11 +154,12 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     Z = (ψ[1]^2 + ψ[n]^2) / (2κ)    # tails
     for k in 1:n-1
         θ = κ * (x[k+1] - x[k])
-        s = sinh(θ)
-        Ia = sinh(2θ) / 4 - θ / 2               # ∫ sinh² over the interval (both ends)
-        Ic = (θ * cosh(θ) - sinh(θ)) / 2        # cross term
-        f = 1 / (κ * s^2)
-        Z += f * (Ia * (ψ[k]^2 + ψ[k+1]^2) + 2 * Ic * ψ[k] * ψ[k+1])
+        ct, cs = coth(θ), csch(θ)
+        # Endpoint and cross contributions of ∫ψ² over the interval, written with
+        # coth/csch so they stay finite as θ → ∞ rather than overflowing via sinh.
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - one(T)) / (2κ)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
     end
     return Z
 end
@@ -178,9 +182,13 @@ function _amplitude(d::PenalizedDensityEstimate{T}, x::Real) where {T}
         return ψ[n] * exp(-κ * (x - xs[n]))
     end
     k = searchsortedlast(xs, x)     # xs[k] <= x < xs[k+1]
-    θ = κ * (xs[k+1] - xs[k])
-    return (ψ[k] * sinh(κ * (xs[k+1] - x)) + ψ[k+1] * sinh(κ * (x - xs[k]))) / sinh(θ)
+    a = κ * (xs[k+1] - x)           # a, b ≥ 0 and a + b = θ
+    b = κ * (x - xs[k])
+    return ψ[k] * _sinh_ratio(a, a + b) + ψ[k+1] * _sinh_ratio(b, a + b)
 end
+
+# sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
+_sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
 
 (d::PenalizedDensityEstimate)(x::Real) = _amplitude(d, x)^2
 (d::PenalizedDensityEstimate)(x::AbstractArray) = map(d, x)
@@ -309,6 +317,67 @@ function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}, at
         end
     end
     return oftype(float(first(κs)), κs[best_i])
+end
+
+"""
+    kappa_interval(x; level=0.2, atol=0.0) -> (; κ, lo, hi)
+
+Principled smoothing-scale selection with an interval of plausible values.
+
+As `κ` sweeps from `0` to `∞` the classical action's reduced form `g(κ) = S(κ) + W ln κ`
+(with `W = Σ wᵢ` the total count) rises monotonically between two exact limits:
+`g → W/2` as `κ → 0` (all points merge into one lump) and `g → W/2 + W H` as `κ → ∞`
+(the `N` points become isolated), where `H = −Σᵢ (wᵢ/W) ln(wᵢ/W)` is the Shannon entropy
+of the multiplicities (`ln N` for distinct points). The normalised quantity
+
+    h(κ) = (g(κ) − W/2) / (W H) ∈ [0, 1]
+
+is therefore the fraction of the data's entropy that scale `κ` resolves. Its half-point
+`h = 1/2` coincides with the point of minimum sensitivity of `S` used by
+[`select_kappa`](@ref), but is located against exact bounds rather than a discrete
+derivative.
+
+Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo, hi]`
+bracketing `h ∈ [(1−level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
+Requires at least two distinct points.
+"""
+function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, atol::Real=0.0)
+    0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
+    atol >= 0 || throw(ArgumentError("atol must be nonnegative, got $atol"))
+    T = float(promote_type(eltype(x), typeof(level), typeof(atol)))
+    nodes, w = _merge_sorted(x, T(atol), T)
+    length(nodes) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
+    W = sum(w)
+    Hent = -sum(wi / W * log(wi / W) for wi in w)   # entropy of the multiplicities
+    # h(κ): fraction of the entropy resolved, monotone from 0 (κ→0) to 1 (κ→∞).
+    h(κ) = (action(_fit(nodes, w, κ)) + W * log(κ) - W / 2) / (W * Hent)
+    lvl = T(level)
+    lo = _invert_monotone(h, (1 - lvl) / 2)
+    κ = _invert_monotone(h, one(T) / 2)
+    hi = _invert_monotone(h, (1 + lvl) / 2)
+    return (; κ, lo, hi)
+end
+
+# Solve h(κ) = target for a function h that increases monotonically in κ, by bracketing
+# in ln κ and bisecting. Used by kappa_interval.
+function _invert_monotone(h, target::T) where {T}
+    # At very large κ the points become numerically isolated and h(κ) can overflow to a
+    # non-finite value; since h → 1 there, treat non-finite as "above target".
+    above(κ) = (v = h(κ); !isfinite(v) || v >= target)
+    lnlo, lnhi = log(T(1e-6)), log(T(1e6))
+    for _ in 1:40                     # expand outward until the root is bracketed
+        above(exp(lnlo)) || break
+        lnlo -= log(T(10))
+    end
+    for _ in 1:40
+        above(exp(lnhi)) && break
+        lnhi += log(T(10))
+    end
+    for _ in 1:60                     # bisection
+        m = (lnlo + lnhi) / 2
+        above(exp(m)) ? (lnhi = m) : (lnlo = m)
+    end
+    return exp((lnlo + lnhi) / 2)
 end
 
 end # module

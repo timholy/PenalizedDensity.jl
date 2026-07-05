@@ -118,6 +118,39 @@ end
         @test pvalue(d, Q) == chisq_ccdf(d, chisq(d, Q))
     end
 
+    @testset "kappa_interval: principled range" begin
+        Random.seed!(7)
+        x = randn(600)
+        ki = kappa_interval(x)
+        @test ki.lo < ki.κ < ki.hi
+        # h = ½ point agrees with the minimum-sensitivity scale within a small factor.
+        κms = select_kappa(x; κs = exp.(range(log(0.05), log(50); length = 60)))
+        @test 0.5 < ki.κ / κms < 2.0
+        # A wider band brackets a narrower one around the same central κ.
+        wide = kappa_interval(x; level = 0.6)
+        @test wide.κ ≈ ki.κ rtol = 1e-3
+        @test wide.lo < ki.lo && wide.hi > ki.hi
+        # Analytic asymptotes of g(κ) = S(κ) + W ln κ: W/2 (κ→0) and W/2 + W·H (κ→∞).
+        # Use widely-separated points so isolation is reached at a moderate κ (avoiding
+        # sinh overflow), where H = ln 3 exactly.
+        xs = [0.0, 5.0, 10.0]; W3 = 3; H3 = log(3)
+        g(κ) = action(PenalizedDensityEstimate(xs; κ)) + W3 * log(κ)
+        @test g(1e-5) ≈ W3 / 2 rtol = 1e-3            # one lump
+        @test g(3.0) ≈ W3 / 2 + W3 * H3 rtol = 1e-4   # three isolated points
+        # Repeated points enter through the multiplicity entropy.
+        @test kappa_interval([0.0, 0.0, 1.0, 5.0]; level = 0.4).κ > 0
+    end
+
+    @testset "large κ stays finite (no sinh overflow)" begin
+        Random.seed!(3)
+        x = randn(300)
+        d = PenalizedDensityEstimate(x; κ = 5000.0)   # kernels far narrower than spacings
+        @test all(isfinite, d.ψ) && all(>(0), d.ψ)
+        @test isfinite(d.λ) && d.λ > 0
+        @test isfinite(action(d))
+        @test all(isfinite, amplitude(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
+    end
+
     @testset "input validation (fail fast)" begin
         @test_throws ArgumentError PenalizedDensityEstimate(Float64[]; κ=1.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=0.0)
@@ -125,5 +158,9 @@ end
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=1.0, atol=-1.0)
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
+        @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=0.0)
+        @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=1.0)
+        @test_throws ArgumentError kappa_interval([3.0])              # need ≥ 2 distinct
+        @test_throws ArgumentError kappa_interval([3.0, 3.0, 3.0])    # all coincident
     end
 end
