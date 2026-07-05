@@ -24,10 +24,11 @@ N = 2000
 x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
                            comps[2].μ + comps[2].σ * randn() for _ in 1:N]
 
-# Fit at the half-entropy scale and at the most-smoothing (smallest κ) end of the range.
+# Fit at the cross-validated (MISE) scale and at the half-entropy scale.
 ki = kappa_interval(x)
+κcv = select_kappa_cv(x)
 d_half = PenalizedDensityEstimate(x; κ=ki.κ)
-d_smooth = PenalizedDensityEstimate(x; κ=ki.lo)
+d_cv = PenalizedDensityEstimate(x; κ=κcv)
 
 g = range(-4.5, 7.5; length=800)
 fig = Figure(size=(760, 420), fontsize=15)
@@ -35,8 +36,8 @@ ax = Axis(fig[1, 1]; xlabel="x", ylabel="probability density",
           title="Two Gaussians, σ = 0.4 and 1.2, recovered with a single κ")
 hist!(ax, x; bins=60, normalization=:pdf, color=(:gray, 0.22), strokewidth=0, label="data")
 lines!(ax, g, truepdf.(g); color=:black, linestyle=:dash, linewidth=2, label="true density")
-lines!(ax, g, d_smooth.(g); color=:steelblue, linewidth=2.5,
-       label="κ = $(round(ki.lo; digits=1)) (widest in range)")
+lines!(ax, g, d_cv.(g); color=:steelblue, linewidth=2.5,
+       label="κ = $(round(κcv; digits=1)) (cross-validated)")
 lines!(ax, g, d_half.(g); color=:crimson, linewidth=2.5,
        label="κ = $(round(ki.κ; digits=1)) (half-entropy)")
 axislegend(ax; position=:rt, framevisible=false)
