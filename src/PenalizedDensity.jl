@@ -370,10 +370,10 @@ of the multiplicities (`ln N` for distinct points). The normalised quantity
 
     h(κ) = (g(κ) − W/2) / (W H) ∈ [0, 1]
 
-is therefore the fraction of the data's entropy that scale `κ` resolves. Its half-point
-`h = 1/2` coincides with the point of minimum sensitivity of `S` used by
-[`select_kappa`](@ref), but is located against exact bounds rather than a discrete
-derivative.
+is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
+`h = 1/2` is returned as `κ`. This entropy criterion is distinct from the minimum-sensitivity
+scale of [`select_kappa`](@ref); one advantage of this function is that it doesn't require
+computing a noisy numerical derivative.
 
 Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo, hi]`
 bracketing `h ∈ [(1−level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
