@@ -350,3 +350,19 @@ than overstating it:
 All of this — the exact law and the `:largeN` shape alike — works unchanged on a fit at a
 varying scale or a finite `support`: both are read from the same reference the fit assembles,
 in the same ``O(N)``.
+
+## Entropy and negentropy
+
+Because the fit is a smooth density, its information content follows in closed form.
+[`entropy`](@ref) is a plug-in estimate of the differential entropy ``H(Q) = -\int Q \ln Q``,
+and [`negentropy`](@ref) is the entropy deficit relative to the Gaussian of the same mean and
+variance — a scale-free measure of how *non-Gaussian* the density is, zero for a Gaussian and
+positive otherwise:
+
+```@example tutorial
+(H = round(entropy(d); digits = 3), J = round(negentropy(d); digits = 3))
+```
+
+The bimodal fit is strongly non-Gaussian, so its negentropy is well above zero. `negentropy`
+is invariant to shifting and rescaling the data (with the matching ``\kappa \mapsto \kappa/|a|``),
+so it measures shape alone.

@@ -8,6 +8,7 @@ using Statistics: Statistics, quantile
 export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
+export entropy, negentropy
 export cdf, quantile
 
 """
@@ -575,6 +576,51 @@ end
 _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
     _norm_sq_gram(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 
+# (μ, σ²) of the density Q = ψ², i.e. ∫x Q dx and ∫x² Q dx - μ², via the same per-interval
+# hyperbolic closed forms as _norm_sq (ψ is already normalized, so Z ≡ ∫Q dx = 1 is assumed
+# rather than recomputed). On each interval, with local coordinate t = x - x[k] ∈ [0, h],
+# ∫₀ʰ t Q dt and ∫₀ʰ t² Q dt reduce to the same tridiagonal quadratic-form structure as
+# ∫₀ʰ Q dt, via the coth/csch coefficients gdiag1, gdiag2, gcross (weight t) and hdiag1,
+# hdiag2, hcross (weight t²); the interval's contribution to μ and the second moment then
+# picks up the node offset x[k] as in ∫x Q dx = ∫(x[k] + t) Q dt.
+#
+# Node positions are measured relative to x[1] throughout (not the caller's absolute
+# coordinate) before accumulating M1, M2: since μ, σ² are translation-covariant/-invariant,
+# this doesn't change the result, but it keeps M1, M2 (and hence M2 - M1²) of order the data's
+# spread rather than of order its absolute location, which is what M2 - M1² needs to stay
+# well-conditioned. Without it, data far from the origin (e.g. x .+ 1e8) can drive σ² negative.
+function _moments(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+    n = length(x)
+    x0 = x[1]
+    xn = x[n] - x0
+    # Tails: ∫x Q dx and ∫x² Q dx over ψ² e^{-2κ|x - x_edge|}, exact via ∫₀^∞ uᵏ e^{-2κu} du.
+    M1 = ψ[1]^2 * (-1 / (4κ^2)) + ψ[n]^2 * (xn / (2κ) + 1 / (4κ^2))
+    M2 = ψ[1]^2 * (1 / (4κ^3)) +
+         ψ[n]^2 * (xn^2 / (2κ) + xn / (2κ^2) + 1 / (4κ^3))
+    for k in 1:n-1
+        h = x[k+1] - x[k]; θ = κ * h; ct, cs = coth(θ), csch(θ)
+        p, q = ψ[k], ψ[k+1]
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q                     # ∫₀ʰ Q dt
+
+        gdiag1 = (1 - θ^2 * cs^2) / (4κ^2)
+        gdiag2 = (2θ * ct - 1 - θ^2 * cs^2) / (4κ^2)
+        gcross = θ * cs * (θ * ct - 1) / (4κ^2)
+        Jseg = gdiag1 * p^2 + gdiag2 * q^2 + 2 * gcross * p * q             # ∫₀ʰ t Q dt
+
+        hdiag1 = (3ct - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
+        hdiag2 = (3ct + 6θ^2 * ct - 6θ - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
+        hcross = cs * (2θ^3 * ct - 3θ^2 + 3θ * ct - 3) / (12κ^3)
+        Kseg = hdiag1 * p^2 + hdiag2 * q^2 + 2 * hcross * p * q             # ∫₀ʰ t² Q dt
+
+        xk = x[k] - x0
+        M1 += xk * Iseg + Jseg
+        M2 += xk^2 * Iseg + 2 * xk * Jseg + Kseg
+    end
+    return M1 + x0, M2 - M1^2
+end
+
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
 # Differentiating in κ presupposes a single rate: this serves the scalar-κ sensitivity
@@ -1072,6 +1118,44 @@ where `N = Σ wᵢ`. Used by [`select_kappa_ms`](@ref).
 function action(d::DensityEstimate)
     N = sum(d.w)
     return N - d.λ - sum(d.w .* log.(d.ψ.^2))
+end
+
+"""
+    entropy(d::DensityEstimate) -> Ĥ
+
+Plug-in estimate of the differential entropy `H(Q) = -∫ Q ln Q dx` of the fitted density,
+
+    Ĥ = -(1/W) Σᵢ wᵢ ln Q(xᵢ) = -(2/W) Σᵢ wᵢ ln ψ(xᵢ),
+
+where `W = Σᵢ wᵢ`. Evaluating `ln Q` at the data rather than integrating it exactly avoids a
+second quadrature pass and is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at
+small `W`: for the one-point fit (a Laplace density with rate `2κ`), `Ĥ = -ln κ` against the
+exact `H = 1 - ln κ`. See [`negentropy`](@ref).
+"""
+function entropy(d::DensityEstimate)
+    W = sum(d.w)
+    return -2 * sum(d.w .* log.(d.ψ)) / W
+end
+
+"""
+    negentropy(d::DensityEstimate) -> J
+
+Negentropy of the fitted density: the entropy deficit relative to the Gaussian with the same
+mean and variance,
+
+    J = ½ ln(2π e σ²) - Ĥ,
+
+where `σ²` is the fit's variance (computed analytically from the nodal amplitudes, the same
+per-interval hyperbolic closed form as [`action`](@ref)'s normalization) and `Ĥ` is
+[`entropy`](@ref)`(d)`. `J ≥ 0` in the large-sample limit (the Gaussian maximizes entropy at
+fixed variance), but the plug-in `Ĥ` can push a finite-sample estimate slightly off zero even
+when the underlying density is Gaussian. `J` is invariant under `x ↦ a·x + b` (with `κ ↦ κ/|a|`
+for the corresponding fit, per the package's scale equivariance): both terms shift by `ln|a|`
+under the rescaling and cancel.
+"""
+function negentropy(d::DensityEstimate{T}) where {T}
+    _, σ² = _moments(d.x, d.ψ, d.κ)
+    return log(2 * T(π) * exp(one(T)) * σ²) / 2 - entropy(d)
 end
 
 """

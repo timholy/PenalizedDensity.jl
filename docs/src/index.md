@@ -43,5 +43,6 @@ d = DensityEstimate(xs, 1.0)  # d is Q, and callable: d(x) returns the density e
 The result is callable and returns the estimated density; [`amplitude`](@ref) gives
 ``\psi(x) = \sqrt{Q(x)}``.
 
-The [Tutorial](@ref) works through choosing the smoothing scale and testing a model
-against the data; the [API reference](@ref) documents every function.
+The [Tutorial](@ref) works through choosing the smoothing scale, testing a model
+against the data, and measuring the fit's [`entropy`](@ref) and [`negentropy`](@ref);
+the [API reference](@ref) documents every function.
