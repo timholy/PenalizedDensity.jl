@@ -27,8 +27,8 @@ x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 # Fit at the cross-validated (MISE) scale and at the half-entropy scale.
 ki = kappa_interval(x)
 κcv = select_kappa_cv(x)
-d_half = PenalizedDensityEstimate(x; κ=ki.κ)
-d_cv = PenalizedDensityEstimate(x; κ=κcv)
+d_half = DensityEstimate(x; κ=ki.κ)
+d_cv = DensityEstimate(x; κ=κcv)
 
 g = range(-4.5, 7.5; length=800)
 fig = Figure(size=(760, 420), fontsize=15)
@@ -50,7 +50,7 @@ save(joinpath(ASSETS, "mixture_example.png"), fig; px_per_unit=2)
 # right axis reads this as h = fraction of the entropy resolved.
 W = N; Hent = log(N)                    # distinct samples ⇒ H = ln N
 κg = exp.(range(log(0.02), log(5000); length=80))
-Svals = [action(PenalizedDensityEstimate(x; κ)) for κ in κg]
+Svals = [action(DensityEstimate(x; κ)) for κ in κg]
 gvals = Svals .+ W .* log.(κg)
 glo, ghi = W / 2, W / 2 + W * Hent
 

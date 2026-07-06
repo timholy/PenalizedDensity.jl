@@ -13,7 +13,7 @@ end
 @testset "PenalizedDensity.jl" begin
     @testset "single point is a Laplace density" begin
         κ = 1.5
-        d = PenalizedDensityEstimate([2.0]; κ)
+        d = DensityEstimate([2.0]; κ)
         @test d.ψ[1] ≈ sqrt(κ)
         @test d(2.0) ≈ κ                       # Q(x₀) = κ
         @test d(3.0) ≈ κ * exp(-2κ)            # Q(x) = κ e^{-2κ|x-x₀|}
@@ -22,15 +22,15 @@ end
     end
 
     @testset "normalization, shape, and `show`" begin
-        d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         @test integrate(d, -30, 30) ≈ 1 atol = 1e-8
         @test d(0.0) > d(2.0)                  # denser near the data
         @test all(≥(0), d.(range(-5, 5; length=101)))   # Q = ψ² ≥ 0
-        @test startswith(sprint(show, d), "PenalizedDensityEstimate with 3 distinct nodes, 4.0 total weight, κ=1.0, λ=2.8163")
+        @test startswith(sprint(show, d), "DensityEstimate with 3 distinct nodes, 4.0 total weight, κ=1.0, λ=2.8163")
     end
 
     @testset "continuity at the nodes" begin
-        d = PenalizedDensityEstimate([0.0, 1.3, 2.0, 5.1]; κ=0.7)
+        d = DensityEstimate([0.0, 1.3, 2.0, 5.1]; κ=0.7)
         for xi in d.x
             @test amplitude(d, xi - 1e-9) ≈ amplitude(d, xi + 1e-9) atol = 1e-6
         end
@@ -38,7 +38,7 @@ end
 
     @testset "repeated points equal integer weights" begin
         # Merging identical points must reproduce the weighted problem.
-        d1 = PenalizedDensityEstimate([0.0, 0.0, 0.0, 4.0]; κ=1.2)
+        d1 = DensityEstimate([0.0, 0.0, 0.0, 4.0]; κ=1.2)
         @test d1.x == [0.0, 4.0]
         @test d1.w == [3.0, 1.0]
         @test integrate(d1, -30, 40) ≈ 1 atol = 1e-8
@@ -47,19 +47,19 @@ end
     end
 
     @testset "rtol merges points within rtol/κ" begin
-        d = PenalizedDensityEstimate([0.0, 1e-10, 1.0]; κ=1.0, rtol=1e-6)
+        d = DensityEstimate([0.0, 1e-10, 1.0]; κ=1.0, rtol=1e-6)
         @test length(d.x) == 2
         @test d.w == [2.0, 1.0]
         # The threshold is rtol/κ: here 1e-3/2 = 5e-4.
-        @test length(PenalizedDensityEstimate([0.0, 1e-4, 1.0]; κ=2.0, rtol=1e-3).x) == 2
-        @test length(PenalizedDensityEstimate([0.0, 1e-3, 1.0]; κ=2.0, rtol=1e-3).x) == 3
+        @test length(DensityEstimate([0.0, 1e-4, 1.0]; κ=2.0, rtol=1e-3).x) == 2
+        @test length(DensityEstimate([0.0, 1e-3, 1.0]; κ=2.0, rtol=1e-3).x) == 3
         # The default rtol > 0 merges points far below the resolution (numerical hygiene).
-        @test length(PenalizedDensityEstimate([0.0, 1e-9, 1.0]; κ=1.0).x) == 2
+        @test length(DensityEstimate([0.0, 1e-9, 1.0]; κ=1.0).x) == 2
         # Merging points closer than the resolution is lossless.
         Random.seed!(5)
         x = randn(5_000)
-        da = PenalizedDensityEstimate(x; κ=3.0)
-        db = PenalizedDensityEstimate(x; κ=3.0, rtol=1e-3)
+        da = DensityEstimate(x; κ=3.0)
+        db = DensityEstimate(x; κ=3.0, rtol=1e-3)
         g = range(-4, 4; length=101)
         @test maximum(abs.(da.(g) .- db.(g))) < 1e-3
     end
@@ -71,15 +71,15 @@ end
         # rtol=0 exercises the raw solver without the near-coincident-point merge.
         Random.seed!(4)
         x = randn(20_000)
-        d = PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)
+        d = DensityEstimate(x; κ=3.0, rtol=0.0)
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
         # Stationarity of the normalized amplitude: Mψ = (κ/λ) w ./ ψ (Eq. field equation).
         M = PenalizedDensity.roughness_operator(d.x, d.κ)
         resid = M * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
         @test maximum(abs, resid) < 1e-6 * maximum(abs, M * d.ψ)
-        PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)           # compile before measuring
-        @test (@allocated PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)) < 40 * length(x) * sizeof(Float64)
+        DensityEstimate(x; κ=3.0, rtol=0.0)           # compile before measuring
+        @test (@allocated DensityEstimate(x; κ=3.0, rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
     @testset "scale equivariance" begin
@@ -88,11 +88,11 @@ end
         # so the unnormalized fit and its stopping criterion are invariant under this scaling.
         Random.seed!(11)
         x = randn(2_000)
-        d = PenalizedDensityEstimate(x; κ=3.0)
+        d = DensityEstimate(x; κ=3.0)
         xt = range(-3, 3; length=25)
         Q = d.(xt)
         for s in (1e-15, 1e20)
-            ds = PenalizedDensityEstimate(s .* x; κ=3.0 / s)
+            ds = DensityEstimate(s .* x; κ=3.0 / s)
             @test maximum(abs.(ds.(s .* xt) .- Q ./ s) ./ (Q ./ s)) < 1e-8
         end
     end
@@ -101,7 +101,7 @@ end
         Random.seed!(1)
         x = randn(400)
         κ = select_kappa(x; κs=exp.(range(log(0.05), log(20); length=40)))
-        d = PenalizedDensityEstimate(x; κ)
+        d = DensityEstimate(x; κ)
         @test 0.75 < d.λ / length(x) < 1.25    # paper: λ ≈ N
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
         φ(t) = exp(-t^2 / 2) / sqrt(2π)         # recovers a standard normal
@@ -148,7 +148,7 @@ end
 
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
         # near-coincident points (small θ) that defeat a naive csch⁴ form.
-        d = PenalizedDensityEstimate(x; κ = 4.0)
+        d = DensityEstimate(x; κ = 4.0)
         ∫Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ)
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
@@ -177,7 +177,7 @@ end
         # minimum-sensitivity scale and gives a smaller integrated squared error.
         Q(t) = exp(-t^2 / 2) / sqrt(2π)
         ise(κ0) = (gg = range(-8, 8; length = 6001);
-                   dd = PenalizedDensityEstimate(x; κ = κ0);
+                   dd = DensityEstimate(x; κ = κ0);
                    step(gg) * sum((dd(t) - Q(t))^2 for t in gg))
         @test κ < select_kappa(x)
         @test ise(κ) < ise(select_kappa(x))
@@ -187,22 +187,22 @@ end
     end
 
     @testset "amplitude² == density" begin
-        d = PenalizedDensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
+        d = DensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
         g = range(-4, 5; length=25)
         @test amplitude(d, collect(g)) .^ 2 ≈ d.(g)
     end
 
     @testset "generic indexing: OffsetArray input" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
-        d = PenalizedDensityEstimate(x; κ=1.1)
-        do_ = PenalizedDensityEstimate(OffsetArray(x, -3); κ=1.1)   # 0-based-ish axes
+        d = DensityEstimate(x; κ=1.1)
+        do_ = DensityEstimate(OffsetArray(x, -3); κ=1.1)   # 0-based-ish axes
         @test do_.x == d.x
         @test do_.ψ ≈ d.ψ
         @test do_(0.7) ≈ d(0.7)
     end
 
     @testset "goodness of fit: statistic" begin
-        d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         @test chisq(d, d) == 0                 # a distribution vs itself
         @test chisq(d, x -> 0.9 * d(x)) > 0    # a mismatched (here unnormalized) trial
         # matches the defining sum 4 Σ wᵢ (√Q(xᵢ)/ψ_cl(xᵢ) − 1)²
@@ -213,7 +213,7 @@ end
     end
 
     @testset "goodness of fit: reference distribution" begin
-        d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         μ = expected_chisq(d)
         @test μ > 0
         # Eq. 25: ⟨χ²⟩ is 1/√2 per effective bin (κX bins).
@@ -257,7 +257,7 @@ end
         # Use widely-separated points so isolation is reached at a moderate κ (avoiding
         # sinh overflow), where H = ln 3 exactly.
         xs = [0.0, 5.0, 10.0]; W3 = 3; H3 = log(3)
-        g(κ) = action(PenalizedDensityEstimate(xs; κ)) + W3 * log(κ)
+        g(κ) = action(DensityEstimate(xs; κ)) + W3 * log(κ)
         @test g(1e-5) ≈ W3 / 2 rtol = 1e-3            # one lump
         @test g(3.0) ≈ W3 / 2 + W3 * H3 rtol = 1e-4   # three isolated points
         # Repeated points enter through the multiplicity entropy.
@@ -267,7 +267,7 @@ end
     @testset "large κ stays finite (no sinh overflow)" begin
         Random.seed!(3)
         x = randn(300)
-        d = PenalizedDensityEstimate(x; κ = 5000.0)   # kernels far narrower than spacings
+        d = DensityEstimate(x; κ = 5000.0)   # kernels far narrower than spacings
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test isfinite(d.λ) && d.λ > 0
         @test isfinite(action(d))
@@ -275,14 +275,14 @@ end
     end
 
     @testset "input validation" begin
-        @test_throws ArgumentError PenalizedDensityEstimate(Float64[]; κ=1.0)
-        @test_throws "cannot fit a density to zero points" PenalizedDensityEstimate(Float64[]; κ=1.0)
-        @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=0.0)
-        @test_throws "κ must be positive" PenalizedDensityEstimate([1.0]; κ=0.0)
-        @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=-1.0)
-        @test_throws "κ must be positive" PenalizedDensityEstimate([1.0]; κ=-1.0)
-        @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=1.0, rtol=-1.0)
-        @test_throws "rtol must be nonnegative" PenalizedDensityEstimate([1.0]; κ=1.0, rtol=-1.0)
+        @test_throws ArgumentError DensityEstimate(Float64[]; κ=1.0)
+        @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[]; κ=1.0)
+        @test_throws ArgumentError DensityEstimate([1.0]; κ=0.0)
+        @test_throws "κ must be positive" DensityEstimate([1.0]; κ=0.0)
+        @test_throws ArgumentError DensityEstimate([1.0]; κ=-1.0)
+        @test_throws "κ must be positive" DensityEstimate([1.0]; κ=-1.0)
+        @test_throws ArgumentError DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
+        @test_throws "rtol must be nonnegative" DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws "κs must be sorted and positive" select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3

@@ -23,7 +23,7 @@ x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
                            comps[2].μ + comps[2].σ * randn() for _ in 1:N]
 
 ki = kappa_interval(x)                          # a principled scale + range (see below)
-d = PenalizedDensityEstimate(x; κ = ki.κ)       # fit at the half-entropy scale
+d = DensityEstimate(x; κ = ki.κ)       # fit at the half-entropy scale
 nothing # hide
 ```
 
@@ -35,7 +35,7 @@ below) and the half-entropy scale ``\kappa`` (the plotting code uses
 ```julia
 using CairoMakie
 κcv = select_kappa_cv(x)
-d_cv = PenalizedDensityEstimate(x; κ = κcv)
+d_cv = DensityEstimate(x; κ = κcv)
 g = range(-4.5, 7.5; length = 800)
 lines(g, truepdf.(g); linestyle = :dash, label = "true density")
 lines!(g, d_cv.(g); label = "κ = $(round(κcv, digits=1)) (cross-validated)")

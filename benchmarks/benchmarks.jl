@@ -33,13 +33,13 @@ using Random, Statistics, Printf
 const Κ = 3.0      # PenalizedDensity smoothing scale for the runtime comparison
 const H = 0.3      # kernel bandwidth for the runtime comparison (comparable resolution)
 
-pd_fixed(x, grid; rtol = 0.0) = PenalizedDensityEstimate(x; κ = Κ, rtol).(grid)
+pd_fixed(x, grid; rtol = 0.0) = DensityEstimate(x; κ = Κ, rtol).(grid)
 kd_fixed(x, grid) = pdf(InterpKDE(kde(x; bandwidth = H)), grid)
 sj_fixed(x, grid) = density(x, H, grid)
 ke_fixed(x, grid) = vec(kde!(x, [H])(reshape(collect(grid), 1, :)))
 
 pd_auto(x, grid) = (κ = kappa_interval(x; rtol = 1e-3).κ;
-                    PenalizedDensityEstimate(x; κ, rtol = 1e-3).(grid))
+                    DensityEstimate(x; κ, rtol = 1e-3).(grid))
 kd_auto(x, grid) = pdf(InterpKDE(kde(x)), grid)                 # default (Silverman) bandwidth
 sj_auto(x, grid) = density(x, bwsj(x), grid)                    # Sheather–Jones bandwidth
 ke_auto(x, grid) = vec(kde!(x)(reshape(collect(grid), 1, :)))   # leave-one-out likelihood
@@ -168,10 +168,10 @@ function selection_diagnostic(; N = 2_000, trials = 15, κscan = range(0.5, 40; 
         for _ in 1:trials
             x = case.sample(N)
             aκ += (κ = kappa_interval(x; rtol = 1e-3).κ)
-            aL += trapz(abs.(PenalizedDensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
+            aL += trapz(abs.(DensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
             bestκ = first(κscan); bestL = Inf
             for κ in κscan
-                L = trapz(abs.(PenalizedDensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
+                L = trapz(abs.(DensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
                 L < bestL && (bestL = L; bestκ = κ)
             end
             bκ += bestκ; bL += bestL

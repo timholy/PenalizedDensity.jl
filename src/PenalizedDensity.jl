@@ -3,11 +3,11 @@ module PenalizedDensity
 using LinearAlgebra
 using SpecialFunctions: erfc, erfcx
 
-export PenalizedDensityEstimate, amplitude, action, select_kappa, select_kappa_cv, kappa_interval
+export DensityEstimate, amplitude, action, select_kappa, select_kappa_cv, kappa_interval
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
-    PenalizedDensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
+    DensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -36,7 +36,7 @@ tridiagonal system can be nearly singular.
 
 # Examples
 ```jldoctest
-julia> d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0);
+julia> d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0);
 
 julia> d(0.0) > d(2.0)   # denser near the data
 true
@@ -45,7 +45,7 @@ julia> round(chisq(d, d); digits=8)   # a distribution fits itself perfectly
 0.0
 ```
 """
-struct PenalizedDensityEstimate{T<:AbstractFloat}
+struct DensityEstimate{T<:AbstractFloat}
     x::Vector{T}   # sorted, distinct node locations
     w::Vector{T}   # weight (multiplicity) at each node
     ψ::Vector{T}   # normalized amplitude at the nodes
@@ -53,7 +53,7 @@ struct PenalizedDensityEstimate{T<:AbstractFloat}
     λ::T           # normalization multiplier (diagnostic)
 end
 
-function PenalizedDensityEstimate(x::AbstractVector{R}; κ::Real, rtol::Real=cbrt(eps(R))) where R<:Real
+function DensityEstimate(x::AbstractVector{R}; κ::Real, rtol::Real=cbrt(eps(R))) where R<:Real
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
@@ -62,7 +62,7 @@ function PenalizedDensityEstimate(x::AbstractVector{R}; κ::Real, rtol::Real=cbr
     return _fit(nodes, weights, T(κ))
 end
 
-Base.show(io::IO, d::PenalizedDensityEstimate) = print(io, "PenalizedDensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, κ=$(d.κ), λ=$(d.λ)")
+Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, κ=$(d.κ), λ=$(d.λ)")
 
 # Fit from alreadyMerged distinct nodes and their weights.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
@@ -70,7 +70,7 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
     Z = _norm_sq(nodes, ψ, κ)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
-    return PenalizedDensityEstimate{T}(nodes, weights, ψ, κ, λ)
+    return DensityEstimate{T}(nodes, weights, ψ, κ, λ)
 end
 
 """
@@ -287,15 +287,15 @@ function _action_and_slope(nodes::Vector{T}, w::Vector{T}, κ::T) where {T<:Abst
 end
 
 """
-    amplitude(d::PenalizedDensityEstimate, x)
+    amplitude(d::DensityEstimate, x)
 
 Evaluate the amplitude `ψ(x)` (so that the density is `d(x) == ψ(x)^2`) at real `x`,
 which may be a scalar or an array.
 """
-amplitude(d::PenalizedDensityEstimate, x::Real) = _amplitude(d, x)
-amplitude(d::PenalizedDensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
+amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
+amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
-function _amplitude(d::PenalizedDensityEstimate{T}, x::Real) where {T}
+function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
     xs, ψ, κ = d.x, d.ψ, d.κ
     n = length(xs)
     if x <= xs[1]
@@ -312,21 +312,21 @@ end
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
 
-(d::PenalizedDensityEstimate)(x::Real) = _amplitude(d, x)^2
+(d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
 """
-    action(d::PenalizedDensityEstimate) -> S
+    action(d::DensityEstimate) -> S
 
 Classical action `S[ψ_cl] = N - λ - Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
 where `N = Σ wᵢ`. Used by [`select_kappa`](@ref).
 """
-function action(d::PenalizedDensityEstimate)
+function action(d::DensityEstimate)
     N = sum(d.w)
     return N - d.λ - sum(d.w .* log.(d.ψ.^2))
 end
 
 """
-    chisq(d::PenalizedDensityEstimate, Q) -> χ²
+    chisq(d::DensityEstimate, Q) -> χ²
 
 Goodness-of-fit statistic between a trial density `Q` and the data underlying the
 fit `d`, the robust field-theoretic analogue of Pearson's χ² (Eqs. 13–14 of the
@@ -340,7 +340,7 @@ a normalized density (`∫Q dx = 1`). `chisq(d, d) == 0`. Small χ² means `Q` i
 to the data in the (squared Hellinger) sense; see [`pvalue`](@ref) and
 [`chisq_ccdf`](@ref) for significance.
 """
-function chisq(d::PenalizedDensityEstimate{T}, Q) where {T}
+function chisq(d::DensityEstimate{T}, Q) where {T}
     s = zero(T)
     ψ = d.ψ
     for i in eachindex(d.x, d.w, ψ)
@@ -353,14 +353,14 @@ function chisq(d::PenalizedDensityEstimate{T}, Q) where {T}
 end
 
 """
-    expected_chisq(d::PenalizedDensityEstimate) -> ⟨χ²⟩
+    expected_chisq(d::DensityEstimate) -> ⟨χ²⟩
 
 Mean of the reference χ² distribution in the large-`N` limit (Eq. 25),
 `⟨χ²⟩ = κ X / √2`, where `X = (1/N) Σᵢ wᵢ / Q_cl(xᵢ)` estimates the size of the
 region occupied by the data. With `1/κ` read as an effective bin width this is
 about `1/√2 ≈ 0.7` per degree of freedom.
 """
-function expected_chisq(d::PenalizedDensityEstimate{T}) where {T}
+function expected_chisq(d::DensityEstimate{T}) where {T}
     N = sum(d.w)
     X = sum(d.w ./ d.ψ.^2) / N          # (1/N) Σ wᵢ / Q_cl(xᵢ),  Q_cl = ψ²
     return d.κ * X / sqrt(T(2))
@@ -370,7 +370,7 @@ end
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 
 """
-    chisq_pdf(d::PenalizedDensityEstimate, z) -> P(z)
+    chisq_pdf(d::DensityEstimate, z) -> P(z)
 
 Density of the reference χ² distribution at `z ≥ 0` in the large-`N` limit
 (Eq. 26): the inverse-Gaussian (Wald) law with mean `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`
@@ -378,7 +378,7 @@ and shape `⟨χ²⟩²`,
 
     P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)].
 """
-function chisq_pdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
+function chisq_pdf(d::DensityEstimate{T}, z::Real) where {T}
     zT = T(z)
     zT > 0 || return zero(T)
     μ = expected_chisq(d)
@@ -386,13 +386,13 @@ function chisq_pdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
 end
 
 """
-    chisq_ccdf(d::PenalizedDensityEstimate, z) -> P(χ² ≥ z)
+    chisq_ccdf(d::DensityEstimate, z) -> P(χ² ≥ z)
 
 Upper-tail (complementary CDF, i.e. survival) probability of the reference χ²
 distribution [`chisq_pdf`](@ref). Evaluating it at an observed statistic gives a
 p-value; see [`pvalue`](@ref).
 """
-function chisq_ccdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
+function chisq_ccdf(d::DensityEstimate{T}, z::Real) where {T}
     zT = T(z)
     zT > 0 || return one(T)
     μ = expected_chisq(d)
@@ -407,13 +407,13 @@ function chisq_ccdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
 end
 
 """
-    pvalue(d::PenalizedDensityEstimate, Q) -> p
+    pvalue(d::DensityEstimate, Q) -> p
 
 Significance of the fit of a trial density `Q`: the probability that the reference
 χ² distribution exceeds the observed [`chisq`](@ref)`(d, Q)`, i.e.
 `chisq_ccdf(d, chisq(d, Q))`. Valid in the large-`N` limit.
 """
-pvalue(d::PenalizedDensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
+pvalue(d::DensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
 
 # Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
 function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
