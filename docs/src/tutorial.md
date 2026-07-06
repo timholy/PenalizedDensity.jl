@@ -366,3 +366,25 @@ positive otherwise:
 The bimodal fit is strongly non-Gaussian, so its negentropy is well above zero. `negentropy`
 is invariant to shifting and rescaling the data (with the matching ``\kappa \mapsto \kappa/|a|``),
 so it measures shape alone.
+
+Both quantities also take a second argument of *held-out* points — data that did not enter
+the fit — in which case ``\ln \hat Q`` is scored there and the Gaussian reference uses the
+held-out sample's own variance:
+
+```@example tutorial
+xeval = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
+                               comps[2].μ + comps[2].σ * randn() for _ in 1:1000]
+(H = round(entropy(d, xeval); digits = 3), J = round(negentropy(d, xeval); digits = 3))
+```
+
+The held-out negentropy is close to the in-sample value here because the fit generalizes
+well. Scoring on points that did not build the fit is what makes the held-out form
+informative: unlike the in-sample value, it is not inflated by concentrating the density
+onto the fit sample, the same reason [`select_kappa_cv`](@ref) cross-validates.
+
+The derivatives of the log density are exposed directly:
+[`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,
+and [`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities
+with respect to the node positions, by an implicit-function adjoint that reuses the fit's
+factored Hessian in a single extra tridiagonal solve. Both are documented in the
+[API reference](@ref).

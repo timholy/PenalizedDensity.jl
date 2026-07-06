@@ -9,6 +9,7 @@ export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, sel
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
+export logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile
 
 """
@@ -834,6 +835,40 @@ _sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + 
 # log(cosh(v)) for v ≥ 0, evaluated without overflow at large v.
 _logcosh(v::T) where {T} = v + log1p(exp(-2v)) - log(T(2))
 
+# ψ'(x): derivative of the amplitude with respect to the evaluation coordinate. Mirrors
+# `_amplitude` interval by interval, with cosh/sinh written through the overflow-safe ratios.
+# In an unbounded tail ψ = ψ_edge e^{∓κ(x - x_edge)}, so ψ' = ±κ ψ; at a finite boundary the
+# cosh arc's derivative is the matching sinh arc. Discontinuous at the nodes (ψ' jumps); the
+# value returned at a node is the limit from within the enclosing interval. Outside a finite
+# support ψ ≡ 0, so ψ' = 0 there.
+function _amplitude_prime(d::DensityEstimate{T}, x::Real) where {T}
+    xs, ψ = d.x, d.ψ
+    n = length(xs)
+    xT = T(x)
+    if xT <= xs[1]
+        xT < d.lo && return zero(T)
+        return _left_tail_amplitude_prime(ψ[1], d.κL, xT, xs[1], d.lo)
+    elseif xT >= xs[n]
+        xT > d.hi && return zero(T)
+        return _right_tail_amplitude_prime(ψ[n], d.κR, xT, xs[n], d.hi)
+    end
+    k = searchsortedlast(xs, xT)
+    κ = _kappa(d, k)
+    a = κ * (xs[k+1] - xT)          # a, b ≥ 0 and a + b = θ
+    b = κ * (xT - xs[k])
+    θ = a + b
+    return κ * (ψ[k+1] * _cosh_ratio(b, θ) - ψ[k] * _cosh_ratio(a, θ))
+end
+
+# ψ'(x) in the left tail: κ ψ₁ e^{κ(x-x1)} when unbounded, or the Neumann cosh arc's derivative
+# κ ψ₁ sinh(κ(x-lo))/cosh(κ(x1-lo)) at a finite boundary (the derivative of `_left_tail_amplitude`).
+_left_tail_amplitude_prime(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
+    isfinite(lo) ? κ * ψ1 * _sinh_ratio2(κ * (x - lo), κ * (x1 - lo)) : κ * ψ1 * exp(κ * (x - x1))
+
+# Mirror of `_left_tail_amplitude_prime` for the right tail; the sign flips with dx.
+_right_tail_amplitude_prime(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
+    isfinite(hi) ? -κ * ψn * _sinh_ratio2(κ * (hi - x), κ * (hi - xn)) : -κ * ψn * exp(-κ * (x - xn))
+
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
 # sinh(v) - v, accurate for small v where the direct difference loses all precision.
@@ -1157,6 +1192,166 @@ function negentropy(d::DensityEstimate{T}) where {T}
     _, σ² = _moments(d.x, d.ψ, d.κ)
     return log(2 * T(π) * exp(one(T)) * σ²) / 2 - entropy(d)
 end
+
+"""
+    entropy(d::DensityEstimate, xeval::AbstractVector) -> Ĥ
+
+Held-out plug-in estimate of the differential entropy of the fitted density `d`, scored at
+points `xeval` that did *not* enter the fit `d`:
+
+    Ĥ = -(1/M) Σⱼ ln Q̂(xevalⱼ) = -(2/M) Σⱼ ln ψ(xevalⱼ),   M = length(xeval).
+
+Unlike the one-argument [`entropy`](@ref)`(d)`, which evaluates `ln Q̂` at the fit's own
+nodes, this evaluates it at independent points and so does not reward collapsing the density
+onto the fit sample. It is the entropy term of [`negentropy`](@ref)`(d, xeval)`.
+"""
+function entropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
+    M = length(xeval)
+    M > 0 || throw(ArgumentError("need at least one evaluation point"))
+    s = zero(T)
+    for y in xeval
+        s += log(_amplitude(d, T(y)))
+    end
+    return -2 * s / M
+end
+
+# Empirical mean and population (maximum-likelihood) variance of `xeval`. Moments are
+# accumulated relative to the first point so that the two terms of E[x²] - E[x]² stay of
+# order the data's spread rather than its absolute location; without this, points far from
+# the origin lose precision and can drive the variance negative through cancellation.
+function _mean_var(xeval, ::Type{T}) where {T}
+    M = length(xeval)
+    M > 0 || throw(ArgumentError("need at least one evaluation point"))
+    x0 = T(first(xeval))
+    s1 = zero(T)
+    s2 = zero(T)
+    for y in xeval
+        t = T(y) - x0
+        s1 += t
+        s2 += t * t
+    end
+    m = s1 / M
+    return m + x0, s2 / M - m * m
+end
+
+"""
+    negentropy(d::DensityEstimate, xeval::AbstractVector) -> Ĵ
+
+Held-out negentropy of the fitted density `d`, scored at independent points `xeval`:
+
+    Ĵ = ½ ln(2π e s²) - Ĥ,
+
+where `Ĥ =` [`entropy`](@ref)`(d, xeval)` and `s²` is the *empirical* (maximum-likelihood,
+i.e. population) variance of `xeval`. The Gaussian reference thus uses the evaluation batch's
+own moments, not the fitted density's; with that choice `½ ln(2π e s²) = -(1/M) Σⱼ ln 𝒩(xevalⱼ)`
+is itself a held-out expectation, so `Ĵ` is the mean held-out log-likelihood ratio of the fit
+against its matched Gaussian. It is invariant under `xeval ↦ a·xeval + b` together with the
+`κ ↦ κ/|a|` rescaling of the fit (both terms shift by `ln|a|` and cancel).
+"""
+function negentropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
+    _, s² = _mean_var(xeval, T)
+    return log(2 * T(π) * exp(one(T)) * s²) / 2 - entropy(d, xeval)
+end
+
+"""
+    logdensity_eval_gradient(d::DensityEstimate, y::Real) -> ∂ln Q̂(y)/∂y
+
+Derivative of the log fitted density with respect to the evaluation coordinate,
+
+    ∂ ln Q̂(y) / ∂y = 2 ψ'(y) / ψ(y),
+
+in closed form: `ψ, ψ'` are the hyperbolic interpolant and its derivative on the interval
+enclosing `y` (and `±κ ψ` in the tails), so the cost is `O(1)` per point with no linear
+solve. See [`logdensity_node_gradient`](@ref) for the sensitivity to the node positions
+instead. The log density has a kink at each node `d.x[k]` (`ψ'` jumps there), so at a node
+the value returned is the one-sided derivative approaching from within the enclosing
+interval.
+"""
+logdensity_eval_gradient(d::DensityEstimate, y::Real) =
+    2 * _amplitude_prime(d, y) / _amplitude(d, y)
+
+"""
+    logdensity_node_gradient(d::DensityEstimate, yeval::AbstractVector, weights=nothing) -> g
+
+Gradient, with respect to the node positions `d.x`, of the weighted sum of log densities at
+the held-out points `yeval`:
+
+    g[i] = ∂/∂x_i  Σⱼ weightsⱼ · ln Q̂(yevalⱼ),
+
+computed by the implicit-function adjoint of the fit. Moving a node perturbs the fitted
+amplitude everywhere through the field equation `M ψ = w ⊘ ψ`; differentiating it reuses the
+fit's factored Hessian `∇²F = M + diag(wᵢ/ψᵢ²)`, and the adjoint aggregates the whole
+evaluation batch into a *single* extra tridiagonal solve. The cost is therefore `O(N + M)`
+for `N` nodes and `M` evaluation points, not one solve per point.
+
+`weights` defaults to all ones (the plain sum `Σⱼ ln Q̂(yevalⱼ)`); pass `fill(1/M, M)` for the
+mean. `yeval` should be disjoint from the fit's nodes — an evaluation point coinciding with a
+node sits on the log density's kink, where the gradient is one-sided. The returned `g` is
+indexed like `d.x`; a caller that moved the nodes through some parameter contracts `g` with
+the node-position Jacobian to obtain the parameter gradient. See
+[`logdensity_eval_gradient`](@ref) for the sensitivity to the evaluation point instead.
+"""
+function logdensity_node_gradient(d::DensityEstimate{T,T}, yeval::AbstractVector,
+                                  weights=nothing) where {T}
+    (isinf(d.lo) && isinf(d.hi)) ||
+        throw(ArgumentError("logdensity_node_gradient supports only unbounded fits; " *
+                            "got support=[$(d.lo), $(d.hi)]"))
+    x, w, κ = d.x, d.w, d.κ
+    n = length(x)
+    Z = d.λ / d.κ                       # Z⋆ = ∫φ² for the unnormalized field φ = ψ√Z
+    φ = d.ψ .* sqrt(Z)
+    M = roughness_operator(x, κ)
+    H = SymTridiagonal(M.dv .+ w ./ φ.^2, copy(M.ev))   # ∇²F, the fit's Hessian
+    _, _, Gφ = _norm_sq_grad(x, φ, κ)                   # ½ ∂Z/∂φ
+    src = zeros(T, n)                   # ∂L/∂φ, the adjoint source (L = Σ wⱼ ln Q̂(yⱼ))
+    g = zeros(T, n)                     # explicit ∂L/∂xᵢ at fixed φ accumulates here
+    C = zero(T)                         # Σ weightsⱼ, the coefficient of -ln Z in L
+    wts = weights === nothing ? Iterators.repeated(one(T)) : weights
+    for (yj, cj_) in zip(yeval, wts)
+        cj = T(cj_)
+        C += cj
+        y = T(yj)
+        if y <= x[1]                    # left tail: ln φ = ln φ₁ + κ(y - x₁)
+            src[1] += 2 * cj / φ[1]
+            g[1]   -= 2 * cj * κ
+        elseif y >= x[n]                # right tail: ln φ = ln φₙ - κ(y - xₙ)
+            src[n] += 2 * cj / φ[n]
+            g[n]   += 2 * cj * κ
+        else
+            k = searchsortedlast(x, y)
+            a = κ * (x[k+1] - y); b = κ * (y - x[k]); θ = a + b
+            SA = _sinh_ratio(a, θ); SB = _sinh_ratio(b, θ)   # interpolation weights of φₖ, φₖ₊₁
+            CA = _cosh_ratio(a, θ); CB = _cosh_ratio(b, θ)
+            ct = _cosh_ratio(θ, θ)                           # coth θ
+            φy = φ[k] * SA + φ[k+1] * SB
+            src[k]   += 2 * cj * SA / φy
+            src[k+1] += 2 * cj * SB / φy
+            g[k]   += 2 * cj * κ * (ct - φ[k+1] * CB / φy)   # ∂ln φ(y)/∂xₖ at fixed nodes
+            g[k+1] += 2 * cj * κ * (φ[k] * CA / φy - ct)
+        end
+    end
+    @. src -= 2 * C / Z * Gφ            # -C ∂ln Z/∂φ
+    μ = ldiv!(ldlt!(H), src)            # adjoint μ = H⁻¹ ∂L/∂φ (H and src are consumed)
+    # Add the implicit response -μᵀ(∂M/∂xᵢ)φ and the explicit -C ∂ln Z/∂xᵢ|_φ. Both act only
+    # through θₖ = κ hₖ, with ∂θₖ/∂xᵢ = κ(δ_{i,k+1} - δ_{i,k}), so interval k contributes
+    # ±(κ Bₖ + (C/Z) κ Dₖ) to nodes k and k+1. csch/coth stay finite as θ → ∞.
+    for k in 1:n-1
+        θ = κ * (x[k+1] - x[k]); cs = csch(θ); ct = coth(θ)
+        Bk = -cs^2 * (μ[k] * φ[k] + μ[k+1] * φ[k+1]) + cs * ct * (μ[k] * φ[k+1] + μ[k+1] * φ[k])
+        dfdiag  = cs^2 * (θ * ct - 1) / κ
+        dfcross = cs * (2ct - θ * (ct^2 + cs^2)) / (2κ)
+        Dk = dfdiag * (φ[k]^2 + φ[k+1]^2) + 2 * dfcross * φ[k] * φ[k+1]
+        contrib = κ * Bk + (C / Z) * κ * Dk
+        g[k]   += contrib
+        g[k+1] -= contrib
+    end
+    return g
+end
+
+# The adjoint above differentiates the field equation of a single-rate fit; a per-interval
+# scale would need the κₖ-dependence of every roughness term.
+logdensity_node_gradient(::DensityEstimate{T,Vector{T}}, ::AbstractVector, weights=nothing) where {T} =
+    throw(ArgumentError("logdensity_node_gradient supports only a single-rate (scalar κ) fit"))
 
 """
     chisq(d::DensityEstimate, Q) -> χ²
