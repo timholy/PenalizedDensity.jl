@@ -29,30 +29,31 @@ nothing # hide
 ```
 
 `d` is a callable density: `d(x)` returns ``Q(x)``, and it accepts arrays too. Plotting the
-estimate against the truth — here at both the half-entropy scale ``\kappa`` and the
-most-smoothing end ``\kappa_\mathrm{lo}`` of the returned range (the plotting code uses
+estimate against the truth — here at the cross-validated scale (see [`select_kappa_cv`](@ref)
+below) and the half-entropy scale ``\kappa`` (the plotting code uses
 [Makie](https://docs.makie.org/), which is not a dependency of the package):
 
 ```julia
 using CairoMakie
-d_smooth = PenalizedDensityEstimate(x; κ = ki.lo)
+κcv = select_kappa_cv(x)
+d_cv = PenalizedDensityEstimate(x; κ = κcv)
 g = range(-4.5, 7.5; length = 800)
 lines(g, truepdf.(g); linestyle = :dash, label = "true density")
-lines!(g, d_smooth.(g); label = "κ = $(round(ki.lo, digits=1)) (widest in range)")
+lines!(g, d_cv.(g); label = "κ = $(round(κcv, digits=1)) (cross-validated)")
 lines!(g, d.(g); label = "κ = $(round(ki.κ, digits=1)) (half-entropy)")
 axislegend()
 ```
 
 ![Two-Gaussian mixture recovered with a single κ](assets/mixture_example.png)
 
-Both peaks are recovered across the whole plausible range of ``\kappa``: the smaller
-``\kappa_\mathrm{lo}`` is visibly smoother, the half-entropy ``\kappa`` sharper, but both
-resolve the narrow and the broad component at once. This is the key point: **`κ` is a
-resolution scale, not a component width.** Its reciprocal ``1/\kappa`` is smaller than
-either component's ``\sigma``, so the estimator resolves features of any larger width; the
-local width of ``Q`` is set by the data, not by ``\kappa``. A method that tied the kernel
-width to a single bandwidth would over-smooth the narrow peak or under-smooth the broad
-one. [`kappa_interval`](@ref), introduced next, produced `ki`.
+Both scales recover both peaks: the cross-validated ``\kappa`` is visibly smoother, the
+half-entropy ``\kappa`` sharper, but each resolves the narrow and the broad component at
+once. This is the key point: **`κ` is a resolution scale, not a component width.** Its
+reciprocal ``1/\kappa`` is smaller than either component's ``\sigma``, so the estimator
+resolves features of any larger width; the local width of ``Q`` is set by the data, not by
+``\kappa``. A method that tied the kernel width to a single bandwidth would over-smooth the
+narrow peak or under-smooth the broad one. The two scales come from [`kappa_interval`](@ref)
+and [`select_kappa_cv`](@ref), both introduced next.
 
 ## Choosing the smoothing scale
 
@@ -82,9 +83,21 @@ sensitivity*, where `|dS/d ln κ|` is smallest. Its derivative is computed analy
 the result is free of the noise that finite-differencing the action curve would introduce.
 The two criteria generally select different scales — the minimum-sensitivity scale is usually
 the coarser (smoother) of the two — so `select_kappa` is a good default when you want a single
-`κ`, while `kappa_interval` additionally reports a plausible band. Neither targets minimum
-integrated squared error; for error-optimal smoothing a cross-validated kernel bandwidth may
-do better, but both here give a principled scale without reference to a ground-truth density.
+`κ`, while `kappa_interval` additionally reports a plausible band. Both resolve *information*
+in the data rather than minimizing error, and on smooth densities they tend to over-resolve.
+
+When the goal is instead minimum mean integrated squared error (MISE), use
+[`select_kappa_cv`](@ref), which minimizes a least-squares cross-validation score:
+
+```@example tutorial
+κ_cv = select_kappa_cv(x)       # error-optimal scale, usually finer than select_kappa
+```
+
+Its score is an unbiased estimate of the integrated squared error `∫(Q̂ − Q)²`, evaluated
+analytically — the `∫Q̂²` term in closed form and each leave-one-out density from a first-order
+expansion, so no point-by-point refitting is needed. Cross-validation assumes a continuous
+underlying density; on heavily tied or coarsely rounded data it undersmooths, and the
+action-based selectors are the better choice there.
 
 ## Goodness of fit
 

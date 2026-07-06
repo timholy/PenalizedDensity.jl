@@ -3,7 +3,7 @@ module PenalizedDensity
 using LinearAlgebra
 using SpecialFunctions: erfc, erfcx
 
-export PenalizedDensityEstimate, amplitude, action, select_kappa, kappa_interval
+export PenalizedDensityEstimate, amplitude, action, select_kappa, select_kappa_cv, kappa_interval
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
@@ -224,6 +224,32 @@ function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
         Bψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
     end
     return Z, dZ, Bψ
+end
+
+# ∫ψ⁴ dx = ∫Q² for the hyperbolic interpolant with exponential tails, as a sum of per-interval
+# closed forms. On each interval ψ solves ψ'' = κ²ψ, so u'² − κ²u² = E is constant and
+# d/dx(u³u') = 3u²u'² + κ²u⁴; integrating gives ∫u⁴ = ([u³u']ₖ^{k+1} − 3E ∫u²)/(4κ²). The
+# boundary and energy terms are written through coshθ − 1 = 2 sinh²(θ/2) and the endpoint
+# difference q − p, keeping them accurate for near-coincident points (θ → 0, where the naive
+# csch⁴ forms lose all precision) while staying finite for isolated points (θ → ∞). Used by
+# select_kappa_cv for the ∫Q² term.
+function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+    n = length(x)
+    Q2 = (ψ[1]^4 + ψ[n]^4) / (4κ)       # tails: ∫ψ₁⁴ e^{4κ(x−x₁)} dx and its mirror
+    for k in 1:n-1
+        p, q = ψ[k], ψ[k+1]
+        θ = κ * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        Δ = q - p
+        cm1 = 2 * sinh(θ / 2)^2                              # coshθ − 1
+        boundary = κ * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))   # [u³u']ₖ^{k+1}
+        E = κ^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)             # u'² − κ²u²
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - one(T)) / (2κ)
+        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q      # ∫u² over the interval
+        Q2 += (boundary - 3 * E * Iseg) / (4κ^2)
+    end
+    return Q2
 end
 
 # (d(−M)/dκ) ψ: the κ-derivative of _neg_M's coth/csch entries, applied to ψ. The tails are
@@ -515,6 +541,90 @@ function _invert_monotone(h, target::T) where {T}
         above(exp(m)) ? (lnhi = m) : (lnlo = m)
     end
     return exp((lnlo + lnhi) / 2)
+end
+
+# Diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from the top-down and
+# bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ − aᵢ), with aᵢ the original diagonal.
+function _inv_diag(H::SymTridiagonal{T}) where {T}
+    a, b = H.dv, H.ev
+    n = length(a)
+    d = similar(a); δ = similar(a)
+    d[1] = a[1]
+    for i in 2:n
+        d[i] = a[i] - b[i-1]^2 / d[i-1]
+    end
+    δ[n] = a[n]
+    for i in n-1:-1:1
+        δ[i] = a[i] - b[i]^2 / δ[i+1]
+    end
+    return inv.(d .+ δ .- a)
+end
+
+# Least-squares cross-validation score LSCV(κ) = ∫Q̂² − (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
+# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂−Q)². The
+# leave-one-out density Q̂₋ᵢ(xᵢ) is analytic to first order — dropping one observation at node i
+# decrements wᵢ, perturbing the unnormalised field φ by δφ = −H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
+# ∇²F = (−M) + diag(w/φ²)). Carrying δφ through the normalisation ψ = φ/√Z, with Z = ∫φ² = φᵀBφ
+# and v = H⁻¹Bφ (Bφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 − 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
+    φ = _solve_amplitude(nodes, w, κ)
+    Z, _, Bφ = _norm_sq_grad(nodes, φ, κ)
+    A = _neg_M(nodes, κ)
+    H = SymTridiagonal(A.dv .+ w ./ φ.^2, A.ev)
+    gii = _inv_diag(H)
+    v = ldiv!(ldlt!(H), Bφ)             # H⁻¹Bφ; H is consumed, gii already extracted
+    ψ = φ ./ sqrt(Z)
+    N = sum(w)
+    cross = zero(T)
+    for i in eachindex(nodes, w)
+        looi = ψ[i]^2 * (1 - 2 * gii[i] / φ[i]^2 + 2 * v[i] / (φ[i] * Z))
+        cross += w[i] * looi
+    end
+    return _int_quartic(nodes, ψ, κ) - 2 * cross / N
+end
+
+"""
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+
+Choose the smoothing scale by least-squares cross-validation: return the `κ` minimising
+
+    LSCV(κ) = ∫ Q̂_κ(x)² dx − (2/N) Σᵢ Q̂_{κ,−i}(xᵢ),
+
+an unbiased estimate — up to the `κ`-independent `∫Q²` — of the integrated squared error
+`∫(Q̂_κ − Q)²`, where `Q̂_{κ,−i}` is the density fitted with the `i`-th point left out. Its
+minimiser therefore targets minimum mean integrated squared error (MISE). This generally
+selects a finer scale than [`select_kappa`](@ref) (minimum sensitivity) and
+[`kappa_interval`](@ref) (half-entropy), which resolve information rather than squared error
+and tend to over-resolve smooth densities.
+
+Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
+segments, and each leave-one-out density `Q̂_{−i}(xᵢ)` from a first-order expansion of the fit
+in the dropped point's weight, so no per-point refitting is needed. The score is minimised by a
+golden-section search over `ln κ`, bracketed by the grid `κs` (a geometric range scaled to the
+data's extent by default).
+
+Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
+rounded data instead resemble a discrete distribution, for which `LSCV` decreases without bound
+as `κ → ∞` (finer scales keep resolving the atoms); `select_kappa_cv` then returns a large `κ`.
+Prefer [`select_kappa`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
+
+`κs` must be sorted and positive, with at least three values to bracket the minimum.
+"""
+function select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
+    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+    xs = sort!(T[xi for xi in x])
+    r = T(rtol)
+    # A near-coincident pair left unmerged at very large κ can drive the fit to a non-finite
+    # score; treat those as +∞ so the search never selects a degenerate scale.
+    score(κ) = (v = _lscv(_merge_presorted(xs, r / κ)..., κ); isfinite(v) ? v : typemax(T))
+    lnκ = log.(T.(κs))
+    i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
+    lo = lnκ[max(i - 1, firstindex(lnκ))]
+    hi = lnκ[min(i + 1, lastindex(lnκ))]
+    return exp(_golden_min(l -> score(exp(l)), lo, hi))
 end
 
 end # module

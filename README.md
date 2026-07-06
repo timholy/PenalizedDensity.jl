@@ -24,6 +24,7 @@ using PenalizedDensity
 
 x = randn(500)                       # samples from an unknown distribution
 κ = select_kappa(x)                  # principled smoothing scale (minimum sensitivity)
+                                     # or select_kappa_cv(x) for the MISE-optimal scale
 d = PenalizedDensityEstimate(x; κ)   # callable: d(x) is the density Q(x)
 
 d(0.0)                               # density at a point

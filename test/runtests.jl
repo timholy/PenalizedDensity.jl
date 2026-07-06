@@ -135,6 +135,61 @@ end
         @test slope(κ) < slope(κ * 1.3) && slope(κ) < slope(κ / 1.3)
     end
 
+    @testset "select_kappa_cv: cross-validated (MISE) scale" begin
+        Random.seed!(11)
+        x = randn(1500)
+        κ = select_kappa_cv(x)
+        @test κ > 0
+        # Golden-section refinement ⇒ independent of the bracketing grid.
+        κ10  = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 10)))
+        κ200 = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 200)))
+        @test κ10 ≈ κ200 rtol = 1e-2
+
+        # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
+        # near-coincident points (small θ) that defeat a naive csch⁴ form.
+        d = PenalizedDensityEstimate(x; κ = 4.0)
+        ∫Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ)
+        g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
+        @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
+
+        # LSCV score: the first-order analytic leave-one-out matches brute-force refitting.
+        xs = sort(x); w = ones(length(xs))
+        function lscv_refit(nodes, weights, κ)
+            cross = 0.0
+            for i in eachindex(nodes)
+                if weights[i] > 1
+                    w2 = copy(weights); w2[i] -= 1; n2 = nodes
+                else
+                    keep = [j for j in eachindex(nodes) if j != i]
+                    n2 = nodes[keep]; w2 = weights[keep]
+                end
+                cross += weights[i] * PenalizedDensity._fit(collect(n2), collect(w2), κ)(nodes[i])
+            end
+            di = PenalizedDensity._fit(copy(nodes), copy(weights), κ)
+            return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
+        end
+        for κ0 in (1.5, 4.0, 12.0)
+            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-3
+        end
+
+        # MISE targeting: on smooth data the cross-validated scale is finer than the
+        # minimum-sensitivity scale and gives a smaller integrated squared error.
+        Q(t) = exp(-t^2 / 2) / sqrt(2π)
+        ise(κ0) = (gg = range(-8, 8; length = 6001);
+                   dd = PenalizedDensityEstimate(x; κ = κ0);
+                   step(gg) * sum((dd(t) - Q(t))^2 for t in gg))
+        @test κ < select_kappa(x)
+        @test ise(κ) < ise(select_kappa(x))
+
+        # Generic indexing: OffsetArray input gives an identical result.
+        @test select_kappa_cv(OffsetArray(x, -750)) == κ
+
+        # Input validation (fail fast).
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
+        @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
+    end
+
     @testset "callable on arrays; amplitude² == density" begin
         d = PenalizedDensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
         g = range(-4, 5; length=25)
