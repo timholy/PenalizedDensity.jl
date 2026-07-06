@@ -22,6 +22,7 @@ using PenalizedDensity
 using KernelDensity: kde, pdf, InterpKDE
 using KernelDensitySJ: bwsj, density
 using KernelDensityEstimate: kde!
+using BenchmarkTools: @belapsed
 using Random, Statistics, Printf
 
 # ----------------------------------------------------------------------------------------
@@ -75,8 +76,7 @@ trapz(y, grid) = (sum(y) - (y[1] + y[end]) / 2) * step(grid)
 
 # Minimum elapsed time over `reps` runs after one warm-up (compilation) call.
 function bestof(f, reps)
-    f()
-    minimum(@elapsed(f()) for _ in 1:reps)
+    @belapsed $f()
 end
 
 function runtime_table(; sizes = (1_000, 10_000, 100_000, 1_000_000), ke_cap = 100_000)

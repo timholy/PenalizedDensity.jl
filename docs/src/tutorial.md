@@ -9,8 +9,7 @@ candidate models against the data.
 
 ## A worked example
 
-Consider a mixture of two Gaussians that differ in **both** location and width — a narrow
-component at ``x=-2`` (``\sigma=0.4``) and a broad one at ``x=3`` (``\sigma=1.2``):
+Consider a mixture of two Gaussians with equal weight, a narrow one (``\sigma=0.4``) centered at ``x=-2`` and a broad one (``\sigma=1.2``) at ``x=3``:
 
 ```@example tutorial
 using PenalizedDensity, Random
@@ -28,7 +27,7 @@ d = PenalizedDensityEstimate(x; κ = ki.κ)       # fit at the half-entropy scal
 nothing # hide
 ```
 
-`d` is a callable density: `d(x)` returns ``Q(x)``, and it accepts arrays too. Plotting the
+`d` is a callable density: `d(x)` returns ``Q(x)``. Plotting the
 estimate against the truth — here at the cross-validated scale (see [`select_kappa_cv`](@ref)
 below) and the half-entropy scale ``\kappa`` (the plotting code uses
 [Makie](https://docs.makie.org/), which is not a dependency of the package):
@@ -51,8 +50,7 @@ half-entropy ``\kappa`` sharper, but each resolves the narrow and the broad comp
 once. This is the key point: **`κ` is a resolution scale, not a component width.** Its
 reciprocal ``1/\kappa`` is smaller than either component's ``\sigma``, so the estimator
 resolves features of any larger width; the local width of ``Q`` is set by the data, not by
-``\kappa``. A method that tied the kernel width to a single bandwidth would over-smooth the
-narrow peak or under-smooth the broad one. The two scales come from [`kappa_interval`](@ref)
+``\kappa``. The two scales come from [`kappa_interval`](@ref)
 and [`select_kappa_cv`](@ref), both introduced next.
 
 ## Choosing the smoothing scale
@@ -81,9 +79,7 @@ resolved — and the shaded band is the plausible range:
 [`select_kappa`](@ref) returns a related but distinct scale: the point of *minimum
 sensitivity*, where `|dS/d ln κ|` is smallest. Its derivative is computed analytically, so
 the result is free of the noise that finite-differencing the action curve would introduce.
-The two criteria generally select different scales — the minimum-sensitivity scale is usually
-the coarser (smoother) of the two — so `select_kappa` is a good default when you want a single
-`κ`, while `kappa_interval` additionally reports a plausible band. Both resolve *information*
+The two criteria generally select different scales. Both resolve *information*
 in the data rather than minimizing error, and on smooth densities they tend to over-resolve.
 
 When the goal is instead minimum mean integrated squared error (MISE), use

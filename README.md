@@ -33,3 +33,13 @@ pvalue(d, x -> exp(-x^2/2)/√(2π))    # test a model (here a standard normal)
 
 See the [documentation](https://timholy.github.io/PenalizedDensity.jl/dev/) for a full
 tutorial and the API reference.
+
+## Related packages
+
+- [KernelDensity](https://github.com/JuliaStats/KernelDensity.jl)
+- [KernelDensityEstimate](https://github.com/JuliaRobotics/KernelDensityEstimate.jl)
+- [KerndelDensitySJ](https://github.com/rasmushenningsson/KernelDensitySJ.jl)
+
+Performance-wise, PenalizedDensity is typically on par with the fastest of
+these, and has two other strengths: it is based on a fully-differentiable model
+for which much can be computed analytically, and it does not require binning.
