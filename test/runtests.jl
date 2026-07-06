@@ -21,11 +21,12 @@ end
         @test integrate(d, -30, 30) ≈ 1 atol = 1e-8
     end
 
-    @testset "normalization and shape" begin
+    @testset "normalization, shape, and `show`" begin
         d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         @test integrate(d, -30, 30) ≈ 1 atol = 1e-8
         @test d(0.0) > d(2.0)                  # denser near the data
         @test all(≥(0), d.(range(-5, 5; length=101)))   # Q = ψ² ≥ 0
+        @test startswith(sprint(show, d), "PenalizedDensityEstimate with 3 distinct nodes, 4.0 total weight, κ=1.0, λ=2.8163")
     end
 
     @testset "continuity at the nodes" begin
@@ -73,18 +74,18 @@ end
         d = PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
-        # Stationarity of the normalised amplitude: (−M)ψ = (κ/λ) w ./ ψ (Eq. field equation).
-        negM = PenalizedDensity._neg_M(d.x, d.κ)
-        resid = negM * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
-        @test maximum(abs, resid) < 1e-6 * maximum(abs, negM * d.ψ)
+        # Stationarity of the normalized amplitude: Mψ = (κ/λ) w ./ ψ (Eq. field equation).
+        M = PenalizedDensity.roughness_operator(d.x, d.κ)
+        resid = M * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
+        @test maximum(abs, resid) < 1e-6 * maximum(abs, M * d.ψ)
         PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)           # compile before measuring
         @test (@allocated PenalizedDensityEstimate(x; κ=3.0, rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
     @testset "scale equivariance" begin
         # Q is scale-equivariant: rescaling x → s·x with κ → κ/s gives Q_s(s·x) = Q(x)/s.
-        # −M, the Newton solve, and the convergence test depend on x, κ only through κ·Δx,
-        # so the unnormalised fit and its stopping criterion are invariant under this scaling.
+        # M, the Newton solve, and the convergence test depend on x, κ only through κ·Δx,
+        # so the unnormalized fit and its stopping criterion are invariant under this scaling.
         Random.seed!(11)
         x = randn(2_000)
         d = PenalizedDensityEstimate(x; κ=3.0)
@@ -129,7 +130,7 @@ end
         κ10  = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 10)))
         κ200 = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
-        @test κ ≈ κ200 rtol = 1e-2
+        @test κ ≈ κ200 rtol = 1e-3
         # The returned κ is a local minimum of |dS/dln κ|.
         slope(κ) = abs(last(PenalizedDensity._action_and_slope(sort(x), ones(1500), κ)))
         @test slope(κ) < slope(κ * 1.3) && slope(κ) < slope(κ / 1.3)
@@ -143,7 +144,7 @@ end
         # Golden-section refinement ⇒ independent of the bracketing grid.
         κ10  = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 10)))
         κ200 = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 200)))
-        @test κ10 ≈ κ200 rtol = 1e-2
+        @test κ10 ≈ κ200 rtol = 1e-3
 
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
         # near-coincident points (small θ) that defeat a naive csch⁴ form.
@@ -183,17 +184,11 @@ end
 
         # Generic indexing: OffsetArray input gives an identical result.
         @test select_kappa_cv(OffsetArray(x, -750)) == κ
-
-        # Input validation (fail fast).
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
-        @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
     end
 
-    @testset "callable on arrays; amplitude² == density" begin
+    @testset "amplitude² == density" begin
         d = PenalizedDensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
         g = range(-4, 5; length=25)
-        @test d(collect(g)) ≈ d.(g)
         @test amplitude(d, collect(g)) .^ 2 ≈ d.(g)
     end
 
@@ -209,7 +204,7 @@ end
     @testset "goodness of fit: statistic" begin
         d = PenalizedDensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         @test chisq(d, d) == 0                 # a distribution vs itself
-        @test chisq(d, x -> 0.9 * d(x)) > 0    # a mismatched (here unnormalised) trial
+        @test chisq(d, x -> 0.9 * d(x)) > 0    # a mismatched (here unnormalized) trial
         # matches the defining sum 4 Σ wᵢ (√Q(xᵢ)/ψ_cl(xᵢ) − 1)²
         Q(x) = exp(-x^2 / 2) / sqrt(2π)
         manual = 4 * sum(d.w[i] * (sqrt(Q(d.x[i])) / d.ψ[i] - 1)^2 for i in eachindex(d.x))
@@ -224,7 +219,7 @@ end
         # Eq. 25: ⟨χ²⟩ is 1/√2 per effective bin (κX bins).
         N = sum(d.w); X = sum(d.w ./ d.ψ.^2) / N
         @test μ / (d.κ * X) ≈ 1 / sqrt(2)
-        # Inverse-Gaussian(mean μ, shape μ²): normalised, with mean μ.
+        # Inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
         p = chisq_pdf.(Ref(d), zs)
         trap(f) = (sum(f) - (f[1] + f[end]) / 2) * step(zs)
@@ -279,16 +274,33 @@ end
         @test all(isfinite, amplitude(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
     end
 
-    @testset "input validation (fail fast)" begin
+    @testset "input validation" begin
         @test_throws ArgumentError PenalizedDensityEstimate(Float64[]; κ=1.0)
+        @test_throws "cannot fit a density to zero points" PenalizedDensityEstimate(Float64[]; κ=1.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=0.0)
+        @test_throws "κ must be positive" PenalizedDensityEstimate([1.0]; κ=0.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=-1.0)
+        @test_throws "κ must be positive" PenalizedDensityEstimate([1.0]; κ=-1.0)
         @test_throws ArgumentError PenalizedDensityEstimate([1.0]; κ=1.0, rtol=-1.0)
+        @test_throws "rtol must be nonnegative" PenalizedDensityEstimate([1.0]; κ=1.0, rtol=-1.0)
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa([1.0, 2.0]; κs=[1.0, 2.0])
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=0.0)
+        @test_throws "level must be in (0, 1)" kappa_interval([1.0, 2.0]; level=0.0)
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=1.0)
+        @test_throws "level must be in (0, 1)" kappa_interval([1.0, 2.0]; level=1.0)
         @test_throws ArgumentError kappa_interval([3.0])              # need ≥ 2 distinct
+        @test_throws "need at least two distinct points to select κ" kappa_interval([3.0])
         @test_throws ArgumentError kappa_interval([3.0, 3.0, 3.0])    # all coincident
+        @test_throws "need at least two distinct points to select κ" kappa_interval([3.0, 3.0, 3.0])
+
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
+        @test_throws "need at least two distinct points to select κ" select_kappa_cv([3.0])
     end
 end

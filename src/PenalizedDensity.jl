@@ -7,36 +7,32 @@ export PenalizedDensityEstimate, amplitude, action, select_kappa, select_kappa_c
 export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
 
 """
-    PenalizedDensityEstimate(x; κ, rtol=1e-6)
+    PenalizedDensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
 
-The density is written as `Q(x) = ψ(x)^2`, where the amplitude `ψ` minimises the
+The density is written as `Q(x) = ψ(x)^2`, where the amplitude `ψ` minimizes the
 action
 
-    S[ψ] = ∫ (ℓ²/2) (ψ')² dx − 2 Σᵢ ln ψ(xᵢ)
+    S[ψ] = ∫ (ℓ²/2) (ψ')² dx - 2 Σᵢ ln ψ(xᵢ)
 
 subject to `∫ ψ² dx = 1`. The smoothing scale `κ = √(2λ)/ℓ` (with `λ` the
-normalisation multiplier) sets the width of each point's contribution; larger `κ`
+normalization multiplier) sets the width of each point's contribution; larger `κ`
 gives a rougher estimate. See [`select_kappa`](@ref) for choosing it automatically.
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
-`ψ(xᵢ)` satisfy a symmetric tridiagonal system whose solution is the minimiser of a
-strictly convex potential; normalisation is then a rescaling.
+`ψ(xᵢ)` satisfy a symmetric tridiagonal system whose solution is the minimizer of a
+strictly convex potential; normalization is then a rescaling.
 
 The returned object is callable: `d(x)` evaluates the density `Q(x)` at any real
-`x` (scalar or array). Use [`amplitude`](@ref) for `ψ(x)`.
+`x`, and it can be broadcast over arrays. Use [`amplitude`](@ref) for `ψ(x)`.
 
 Repeated points, and points closer than `rtol / κ` (i.e. within a fraction `rtol` of the
 smoothing length `1 / κ`), are merged into one node carrying the count as its integer
-weight, so weighted data is handled naturally. Points that close carry no independent
-information at resolution `1 / κ`, and a near-coincident pair drives an entry of the
-tridiagonal system toward a singularity; merging bounds both the node count and the
-conditioning. The default `rtol = 1e-6` merges only points far below the resolution, which
-keeps the solve well conditioned without visibly changing the estimate; increase it (e.g.
-`rtol = 1e-3`) to cap the node count and speed up fits on large, densely packed samples.
+weight, so weighted data is handled naturally. Without merging, the resulting
+tridiagonal system can be nearly singular.
 
 # Examples
 ```jldoctest
@@ -52,26 +48,28 @@ julia> round(chisq(d, d); digits=8)   # a distribution fits itself perfectly
 struct PenalizedDensityEstimate{T<:AbstractFloat}
     x::Vector{T}   # sorted, distinct node locations
     w::Vector{T}   # weight (multiplicity) at each node
-    ψ::Vector{T}   # normalised amplitude at the nodes
+    ψ::Vector{T}   # normalized amplitude at the nodes
     κ::T           # smoothing scale
-    λ::T           # normalisation multiplier (diagnostic)
+    λ::T           # normalization multiplier (diagnostic)
 end
 
-function PenalizedDensityEstimate(x::AbstractVector{<:Real}; κ::Real, rtol::Real=1e-6)
+function PenalizedDensityEstimate(x::AbstractVector{R}; κ::Real, rtol::Real=cbrt(eps(R))) where R<:Real
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
-    T = float(promote_type(eltype(x), typeof(κ), typeof(rtol)))
+    T = float(promote_type(R, typeof(κ), typeof(rtol)))
     nodes, weights = _merge_sorted(x, T(rtol) / T(κ), T)
     return _fit(nodes, weights, T(κ))
 end
 
-# Fit from already-merged distinct nodes and their weights.
+Base.show(io::IO, d::PenalizedDensityEstimate) = print(io, "PenalizedDensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, κ=$(d.κ), λ=$(d.λ)")
+
+# Fit from alreadyMerged distinct nodes and their weights.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
     ψ = _solve_amplitude(nodes, weights, κ)
     Z = _norm_sq(nodes, ψ, κ)
     ψ ./= sqrt(Z)
-    λ = κ * Z                       # scaling law: normalised ψ solves (−M)ψ = (κ/λ)/ψ
+    λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
     return PenalizedDensityEstimate{T}(nodes, weights, ψ, κ, λ)
 end
 
@@ -86,82 +84,81 @@ _merge_sorted(x::AbstractVector, atol::T, ::Type{T}) where {T} =
     _merge_presorted(sort!(T[xi for xi in x]), atol)
 
 # Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
-# Factored out so kappa_interval can re-merge one sorted copy at many tolerances.
+# Factored out so kappa_interval can reMerge one sorted copy at many tolerances.
 function _merge_presorted(xs, atol::T) where {T}
     nodes = T[]
     weights = T[]
     for xi in xs
         xk = T(xi)
         if !isempty(nodes) && xk - nodes[end] <= atol
-            weights[end] += one(T)
+            weights[end] += oneunit(T)
         else
             push!(nodes, xk)
-            push!(weights, one(T))
+            push!(weights, oneunit(T))
         end
     end
     return nodes, weights
 end
 
-# Tridiagonal operator −M (SPD) coupling the nodal amplitudes.
-# Off-diagonal e[k] = −csch(κ hₖ); diagonal d[i] accumulates coth(κ hₖ) from each
+# Tridiagonal operator M (SPD) coupling the nodal amplitudes.
+# Off-diagonal e[k] = -csch(κ hₖ); diagonal d[i] accumulates coth(κ hₖ) from each
 # adjacent interval and +1 from each adjacent tail.
-function _neg_M(x::Vector{T}, κ::T) where {T}
+function roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat}
     n = length(x)
+    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
     d = zeros(T, n)
     e = zeros(T, n - 1)
-    d[1] += one(T)                  # left tail
-    d[n] += one(T)                  # right tail
+    d[1] += oneunit(T)              # left tail
+    d[n] += oneunit(T)              # right tail
     for k in 1:n-1
         θ = κ * (x[k+1] - x[k])
         d[k]   += coth(θ)
         d[k+1] += coth(θ)
         e[k]    = -csch(θ)          # coth/csch stay finite as θ → ∞ (isolated points)
     end
-    return SymTridiagonal(d, e)
+    return SymTridiagonal(d, e)     # M
 end
 
-# F(ψ) = ½ ψ'(−M)ψ − Σ wᵢ ln ψᵢ, the potential minimised by _solve_amplitude.
-function _objective(negM::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T}
+# F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
+function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
     s = zero(T)
     for i in eachindex(w, ψ)
-        s += w[i] * log(ψ[i])
+        s += w[i] * log(ψ[i])       # requires ψ > 0, which is enforced by the caller
     end
-    return dot(ψ, negM, ψ) / 2 - s
+    return dot(ψ, M, ψ) / 2 - s
 end
 
 """
+    _solve_amplitude(M, w)    -> ψ
     _solve_amplitude(x, w, κ) -> ψ
 
-Minimise the strictly convex potential `F(ψ) = ½ ψ'(−M)ψ − Σ wᵢ ln ψᵢ` over `ψ > 0`
-by a damped Newton iteration with an SPD tridiagonal Hessian. The minimiser solves
-`(−M)ψ = w ./ ψ`, i.e. the field equation at unit multiplier; the caller rescales it
-to impose normalisation.
+Minimize the strictly convex potential `F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ` over `ψ > 0`
+by a damped Newton iteration with an SPD tridiagonal Hessian. The minimizer solves
+`Mψ = w ./ ψ`, i.e. the field equation at unit multiplier; the caller rescales it
+to impose normalization.
 
-Each step factorises the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
+Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
 along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
 Newton decrement `λ² = ∇FᵀΔ` drops below a relative tolerance, or when the line search can
-no longer decrease `F` — the point where rounding, not the algorithm, limits progress.
-Chasing the decrement below that floor would spin uselessly, so the stalled line search is
-itself the convergence signal. All scratch is allocated once; the iterations do not allocate.
+no longer decrease `F`.
 """
-function _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T) where {T}
-    negM = _neg_M(x, κ)
+function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) where {T<:AbstractFloat}
     n = length(w)
-    ψ = fill(one(T), n)             # strictly positive start
+    ψ = fill(oneunit(T), n)             # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
-    Hdv = similar(ψ); Hev = similar(negM.ev)   # Hessian factorisation scratch
-    ctol = eps(T)^(2 // 3)          # relative Newton-decrement tolerance
-    Fψ = _objective(negM, w, ψ)
-    for _ in 1:100
-        mul!(g, negM, ψ)
-        @. g -= w / ψ                       # ∇F = (−M)ψ − w./ψ
-        @. Hdv = negM.dv + w / ψ^2          # diagonal of ∇²F; off-diagonal equals negM.ev
-        Hev .= negM.ev                      # ldlt! overwrites its arguments; refill each step
+    Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
+    ctol = cbrt(eps(T))^2               # relative Newton-decrement tolerance
+    Fψ = _objective(M, w, ψ)
+    for _ in 1:maxiter
+        mul!(g, M, ψ)
+        @. g -= w / ψ                    # ∇F = Mψ - w./ψ
+        @. Hdv = M.dv + w / ψ^2          # diagonal of ∇²F; off-diagonal equals M.ev
+        Hev .= M.ev                      # ldlt! overwrites its arguments; refill each step
         Δ .= g
         ldiv!(ldlt!(SymTridiagonal(Hdv, Hev)), Δ)   # Δ = (∇²F)⁻¹ ∇F
         decrement = dot(g, Δ)               # Newton decrement λ² = ∇Fᵀ(∇²F)⁻¹∇F ≥ 0
-        decrement <= ctol * max(one(T), abs(Fψ)) && break
-        # Largest α ≤ 1 keeping ψ − αΔ strictly positive, then Armijo backtracking.
+        decrement <= ctol * max(oneunit(T), abs(Fψ)) && break
+        # Largest α ≤ 1 keeping ψ - αΔ strictly positive, then Armijo backtracking.
         α = one(T)
         for i in eachindex(ψ, Δ)
             Δ[i] > 0 && (α = min(α, ψ[i] / Δ[i]))
@@ -171,7 +168,7 @@ function _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T) where {T}
         local Fnew
         while α >= eps(T)
             @. ψnew = ψ - α * Δ
-            Fnew = _objective(negM, w, ψnew)
+            Fnew = _objective(M, w, ψnew)
             if Fnew <= Fψ - α * decrement / 4
                 armijo = true
                 break
@@ -184,6 +181,8 @@ function _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T) where {T}
     end
     return ψ
 end
+_solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:AbstractFloat} =
+    _solve_amplitude(roughness_operator(x, κ), w; kwargs...)
 
 # ∫ ψ² dx for the hyperbolic interpolant with exponential tails, as a tridiagonal
 # quadratic form evaluated at the nodal amplitudes.
@@ -196,54 +195,54 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
         # Endpoint and cross contributions of ∫ψ² over the interval, written with
         # coth/csch so they stay finite as θ → ∞ rather than overflowing via sinh.
         fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - one(T)) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
     end
     return Z
 end
 
-# Z = ∫ψ² together with its κ-derivative at fixed ψ and Bψ = ½ ∂Z/∂ψ, where Z = ψᵀBψ. The
+# Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
 function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     n = length(x)
-    Bψ = zeros(T, n)
+    Gψ = zeros(T, n)
     t = one(T) / (2κ)               # tail coefficient
     Z  = t * (ψ[1]^2 + ψ[n]^2)
     dZ = -(ψ[1]^2 + ψ[n]^2) / (2κ^2)
-    Bψ[1] += t * ψ[1]
-    Bψ[n] += t * ψ[n]
+    Gψ[1] += t * ψ[1]
+    Gψ[n] += t * ψ[n]
     for k in 1:n-1
         h = x[k+1] - x[k]; θ = κ * h; ct = coth(θ); cs = csch(θ)
         fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - one(T)) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-        dfdiag  = h * cs^2 * (θ * ct - 1) / κ - (ct - θ * cs^2) / (2κ^2)
-        dfcross = h * cs * (2ct - θ * (ct^2 + cs^2)) / (2κ) - cs * (θ * ct - 1) / (2κ^2)
+        dfdiag  = h * cs^2 * (θ * ct - oneunit(T)) / κ - (ct - θ * cs^2) / (2κ^2)
+        dfcross = h * cs * (2ct - θ * (ct^2 + cs^2)) / (2κ) - cs * (θ * ct - oneunit(T)) / (2κ^2)
         dZ += dfdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * dfcross * ψ[k] * ψ[k+1]
-        Bψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
-        Bψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
+        Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
+        Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
     end
-    return Z, dZ, Bψ
+    return Z, dZ, Gψ
 end
 
 # ∫ψ⁴ dx = ∫Q² for the hyperbolic interpolant with exponential tails, as a sum of per-interval
-# closed forms. On each interval ψ solves ψ'' = κ²ψ, so u'² − κ²u² = E is constant and
-# d/dx(u³u') = 3u²u'² + κ²u⁴; integrating gives ∫u⁴ = ([u³u']ₖ^{k+1} − 3E ∫u²)/(4κ²). The
-# boundary and energy terms are written through coshθ − 1 = 2 sinh²(θ/2) and the endpoint
-# difference q − p, keeping them accurate for near-coincident points (θ → 0, where the naive
+# closed forms. On each interval ψ solves ψ'' = κ²ψ, so u'² - κ²u² = E is constant and
+# d/dx(u³u') = 3u²u'² + κ²u⁴; integrating gives ∫u⁴ = ([u³u']ₖ^{k+1} - 3E ∫u²)/(4κ²). The
+# boundary and energy terms are written through coshθ - 1 = 2 sinh²(θ/2) and the endpoint
+# difference q - p, keeping them accurate for near-coincident points (θ → 0, where the naive
 # csch⁴ forms lose all precision) while staying finite for isolated points (θ → ∞). Used by
 # select_kappa_cv for the ∫Q² term.
 function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     n = length(x)
-    Q2 = (ψ[1]^4 + ψ[n]^4) / (4κ)       # tails: ∫ψ₁⁴ e^{4κ(x−x₁)} dx and its mirror
+    Q2 = (ψ[1]^4 + ψ[n]^4) / (4κ)       # tails: ∫ψ₁⁴ e^{4κ(x-x₁)} dx and its mirror
     for k in 1:n-1
         p, q = ψ[k], ψ[k+1]
         θ = κ * (x[k+1] - x[k])
         ct, cs = coth(θ), csch(θ)
         Δ = q - p
-        cm1 = 2 * sinh(θ / 2)^2                              # coshθ − 1
+        cm1 = 2 * sinh(θ / 2)^2                              # coshθ - 1
         boundary = κ * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))   # [u³u']ₖ^{k+1}
-        E = κ^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)             # u'² − κ²u²
+        E = κ^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)             # u'² - κ²u²
         fdiag  = (ct - θ * cs^2) / (2κ)
         fcross = cs * (θ * ct - one(T)) / (2κ)
         Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q      # ∫u² over the interval
@@ -252,38 +251,38 @@ function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     return Q2
 end
 
-# (d(−M)/dκ) ψ: the κ-derivative of _neg_M's coth/csch entries, applied to ψ. The tails are
+# (dM/dκ) ψ: the κ-derivative of roughness_operator's coth/csch entries, applied to ψ. The tails are
 # κ-independent and drop out.
-function _dnegM_dκ_mul(x::Vector{T}, κ::T, ψ::Vector{T}) where {T}
+function _dM_dκ_mul(x::Vector{T}, κ::T, ψ::Vector{T}) where {T}
     n = length(x)
     r = zeros(T, n)
     for k in 1:n-1
         h = x[k+1] - x[k]; θ = κ * h; cs = csch(θ); ct = coth(θ)
         dd = -h * cs^2                  # d/dκ coth(θ)
-        de =  h * cs * ct               # d/dκ (−csch(θ))
+        de =  h * cs * ct               # d/dκ (-csch(θ))
         r[k]   += dd * ψ[k]   + de * ψ[k+1]
         r[k+1] += dd * ψ[k+1] + de * ψ[k]
     end
     return r
 end
 
-# S(κ) = action of the fit, and dS/dln κ. ψ minimises the potential, but S also depends on κ
-# through the normalisation, so the sensitivity ψ′ = dψ/dκ contributes; it solves the same
-# SPD Newton system as the fit, `∇²F ψ′ = −(d(−M)/dκ) ψ`.
-function _action_and_slope(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
-    ψ = _solve_amplitude(nodes, w, κ)
-    A = _neg_M(nodes, κ)
-    Z, dZdκ, Bψ = _norm_sq_grad(nodes, ψ, κ)
+# S(κ) = action of the fit, and dS/dln κ. ψ minimizes the potential, but S also depends on κ
+# through the normalization, so the sensitivity ψ′ = dψ/dκ contributes; it solves the same
+# SPD Newton system as the fit, `∇²F ψ′ = -(dM/dκ) ψ`.
+function _action_and_slope(nodes::Vector{T}, w::Vector{T}, κ::T) where {T<:AbstractFloat}
+    A = roughness_operator(nodes, κ)
+    ψ = _solve_amplitude(A, w)
+    Z, dZdκ, Gψ = _norm_sq_grad(nodes, ψ, κ)
     W = sum(w)
     S = W - κ * Z + W * log(Z)
     for i in eachindex(w, ψ)
         S -= 2 * w[i] * log(ψ[i])
     end
     H = SymTridiagonal(A.dv .+ w ./ ψ.^2, copy(A.ev))
-    ψ′ = ldiv!(ldlt!(H), _dnegM_dκ_mul(nodes, κ, ψ))
-    ψ′ .= .-ψ′                          # ψ′ = −H⁻¹ (d(−M)/dκ) ψ
+    ψ′ = ldiv!(ldlt!(H), _dM_dκ_mul(nodes, κ, ψ))
+    ψ′ .= .-ψ′                          # ψ′ = -H⁻¹ (dM/dκ) ψ
     c = W / Z - κ
-    dSdκ = -Z + c * dZdκ + 2 * c * dot(Bψ, ψ′) - 2 * dot(w ./ ψ, ψ′)   # w./ψ = (−M)ψ
+    dSdκ = -Z + c * dZdκ + 2 * c * dot(Gψ, ψ′) - 2 * dot(w ./ ψ, ψ′)   # w./ψ = Mψ
     return S, κ * dSdκ
 end
 
@@ -314,12 +313,11 @@ end
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
 
 (d::PenalizedDensityEstimate)(x::Real) = _amplitude(d, x)^2
-(d::PenalizedDensityEstimate)(x::AbstractArray) = map(d, x)
 
 """
     action(d::PenalizedDensityEstimate) -> S
 
-Classical action `S[ψ_cl] = N − λ − Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
+Classical action `S[ψ_cl] = N - λ - Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
 where `N = Σ wᵢ`. Used by [`select_kappa`](@ref).
 """
 function action(d::PenalizedDensityEstimate)
@@ -334,11 +332,11 @@ Goodness-of-fit statistic between a trial density `Q` and the data underlying th
 fit `d`, the robust field-theoretic analogue of Pearson's χ² (Eqs. 13–14 of the
 paper):
 
-    χ² = 4 Σᵢ wᵢ (√Q(xᵢ) / ψ_cl(xᵢ) − 1)²,
+    χ² = 4 Σᵢ wᵢ (√Q(xᵢ) / ψ_cl(xᵢ) - 1)²,
 
 summed over the data nodes `xᵢ` with multiplicities `wᵢ`, where `ψ_cl = √(d(·))`
 is the fitted amplitude. `Q` is any callable returning density values; it should be
-a normalised density (`∫Q dx = 1`). `chisq(d, d) == 0`. Small χ² means `Q` is close
+a normalized density (`∫Q dx = 1`). `chisq(d, d) == 0`. Small χ² means `Q` is close
 to the data in the (squared Hellinger) sense; see [`pvalue`](@ref) and
 [`chisq_ccdf`](@ref) for significance.
 """
@@ -368,7 +366,7 @@ function expected_chisq(d::PenalizedDensityEstimate{T}) where {T}
     return d.κ * X / sqrt(T(2))
 end
 
-# Standard normal CDF, Φ(t) = ½ erfc(−t/√2).
+# Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 
 """
@@ -378,7 +376,7 @@ Density of the reference χ² distribution at `z ≥ 0` in the large-`N` limit
 (Eq. 26): the inverse-Gaussian (Wald) law with mean `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`
 and shape `⟨χ²⟩²`,
 
-    P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ − z/2 − ⟨χ²⟩²/(2z)].
+    P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)].
 """
 function chisq_pdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
     zT = T(z)
@@ -402,8 +400,8 @@ function chisq_ccdf(d::PenalizedDensityEstimate{T}, z::Real) where {T}
     r = sqrt(λ / zT)
     a = r * (zT / μ - 1)
     b = r * (zT / μ + 1)
-    # Survival = Φ(−a) − e^{2λ/μ} Φ(−b); the second term uses erfcx so the large
-    # positive exponent 2λ/μ cancels against −b²/2 without overflow.
+    # Survival = Φ(-a) - e^{2λ/μ} Φ(-b); the second term uses erfcx so the large
+    # positive exponent 2λ/μ cancels against -b²/2 without overflow.
     term2 = erfcx(b / sqrt(T(2))) * exp(2λ / μ - b^2 / 2) / 2
     return _Φ(-a) - term2
 end
@@ -417,7 +415,7 @@ Significance of the fit of a trial density `Q`: the probability that the referen
 """
 pvalue(d::PenalizedDensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
 
-# Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimiser.
+# Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
 function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
     invφ = (sqrt(T(5)) - 1) / 2      # 1/golden ≈ 0.618
     c = b - invφ * (b - a); fc = f(c)
@@ -446,19 +444,21 @@ end
 """
     select_kappa(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
 
-Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
-the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
-is smallest (Fig. 1 of the paper). The derivative `dS/d ln κ` is evaluated analytically and
-minimised over `κ` by a golden-section search, bracketed by the grid `κs` (which defaults to
-a geometric range scaled to the data's extent).
+Choose the smoothing scale by the principle of minimum sensitivity: return the
+`κ` at which the classical action [`action`](@ref) `S` is least sensitive to the
+scale, i.e. `|dS/d ln κ|` is smallest (Fig. 1 of the paper). The derivative
+`dS/d ln κ` is evaluated analytically and minimized over `κ` by a golden-section
+search, bracketed by the grid `κs` (which defaults to a geometric range scaled
+to the data's extent).
 
-This is a principled convention rather than a unique optimum: `S` has no exact stationary
-point in `κ`, so the flattest point depends on measuring sensitivity in `ln κ`. It generally
-selects a different — usually coarser — scale than the entropy-based [`kappa_interval`](@ref),
-and neither targets minimum integrated squared error; a cross-validated kernel bandwidth is
-more appropriate for that.
+This is a principled convention rather than a unique optimum: `S` has no exact
+stationary point in `κ`, so the flattest point depends on measuring sensitivity
+in `ln κ`. It generally selects a different scale than the entropy-based
+[`kappa_interval`](@ref), and neither targets minimum integrated squared error,
+but see [`select_kappa_cv`](@ref).
 
-`κs` must be sorted and positive, with at least three values to bracket the minimum.
+`κs` must be sorted and positive, with at least three values to bracket the
+minimum.
 """
 function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
@@ -483,10 +483,10 @@ Principled smoothing-scale selection with an interval of plausible values.
 As `κ` sweeps from `0` to `∞` the classical action's reduced form `g(κ) = S(κ) + W ln κ`
 (with `W = Σ wᵢ` the total count) rises monotonically between two exact limits:
 `g → W/2` as `κ → 0` (all points merge into one lump) and `g → W/2 + W H` as `κ → ∞`
-(the `N` points become isolated), where `H = −Σᵢ (wᵢ/W) ln(wᵢ/W)` is the Shannon entropy
-of the multiplicities (`ln N` for distinct points). The normalised quantity
+(the `N` points become isolated), where `H = -Σᵢ (wᵢ/W) ln(wᵢ/W)` is the Shannon entropy
+of the multiplicities (`ln N` for distinct points). The normalized quantity
 
-    h(κ) = (g(κ) − W/2) / (W H) ∈ [0, 1]
+    h(κ) = (g(κ) - W/2) / (W H) ∈ [0, 1]
 
 is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
 `h = 1/2` is returned as `κ`. This entropy criterion is distinct from the minimum-sensitivity
@@ -494,7 +494,7 @@ scale of [`select_kappa`](@ref); one advantage of this function is that it doesn
 computing a noisy numerical derivative.
 
 Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo, hi]`
-bracketing `h ∈ [(1−level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
+bracketing `h ∈ [(1-level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
 Requires at least two distinct points.
 """
 function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1e-6)
@@ -516,7 +516,7 @@ function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1
     end
     lvl = T(level)
     lo = _invert_monotone(h, (1 - lvl) / 2)
-    κ = _invert_monotone(h, one(T) / 2)
+    κ = _invert_monotone(h, oneunit(T) / 2)
     hi = _invert_monotone(h, (1 + lvl) / 2)
     return (; κ, lo, hi)
 end
@@ -544,7 +544,7 @@ function _invert_monotone(h, target::T) where {T}
 end
 
 # Diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from the top-down and
-# bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ − aᵢ), with aᵢ the original diagonal.
+# bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ - aᵢ), with aᵢ the original diagonal.
 function _inv_diag(H::SymTridiagonal{T}) where {T}
     a, b = H.dv, H.ev
     n = length(a)
@@ -560,19 +560,19 @@ function _inv_diag(H::SymTridiagonal{T}) where {T}
     return inv.(d .+ δ .- a)
 end
 
-# Least-squares cross-validation score LSCV(κ) = ∫Q̂² − (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
-# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂−Q)². The
+# Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
+# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)². The
 # leave-one-out density Q̂₋ᵢ(xᵢ) is analytic to first order — dropping one observation at node i
-# decrements wᵢ, perturbing the unnormalised field φ by δφ = −H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
-# ∇²F = (−M) + diag(w/φ²)). Carrying δφ through the normalisation ψ = φ/√Z, with Z = ∫φ² = φᵀBφ
-# and v = H⁻¹Bφ (Bφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 − 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
+# decrements wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
+# ∇²F = M + diag(w/φ²)). Carrying δφ through the normalization ψ = φ/√Z, with Z = ∫φ² = φᵀGφ
+# and v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 - 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
 function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
     φ = _solve_amplitude(nodes, w, κ)
-    Z, _, Bφ = _norm_sq_grad(nodes, φ, κ)
-    A = _neg_M(nodes, κ)
+    Z, _, Gφ = _norm_sq_grad(nodes, φ, κ)
+    A = roughness_operator(nodes, κ)
     H = SymTridiagonal(A.dv .+ w ./ φ.^2, A.ev)
     gii = _inv_diag(H)
-    v = ldiv!(ldlt!(H), Bφ)             # H⁻¹Bφ; H is consumed, gii already extracted
+    v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
     ψ = φ ./ sqrt(Z)
     N = sum(w)
     cross = zero(T)
@@ -586,20 +586,20 @@ end
 """
     select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
 
-Choose the smoothing scale by least-squares cross-validation: return the `κ` minimising
+Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
-    LSCV(κ) = ∫ Q̂_κ(x)² dx − (2/N) Σᵢ Q̂_{κ,−i}(xᵢ),
+    LSCV(κ) = ∫ Q̂_κ(x)² dx - (2/N) Σᵢ Q̂_{κ,-i}(xᵢ),
 
 an unbiased estimate — up to the `κ`-independent `∫Q²` — of the integrated squared error
-`∫(Q̂_κ − Q)²`, where `Q̂_{κ,−i}` is the density fitted with the `i`-th point left out. Its
-minimiser therefore targets minimum mean integrated squared error (MISE). This generally
+`∫(Q̂_κ - Q)²`, where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. Its
+minimizer therefore targets minimum mean integrated squared error (MISE). This generally
 selects a finer scale than [`select_kappa`](@ref) (minimum sensitivity) and
 [`kappa_interval`](@ref) (half-entropy), which resolve information rather than squared error
 and tend to over-resolve smooth densities.
 
 Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
-segments, and each leave-one-out density `Q̂_{−i}(xᵢ)` from a first-order expansion of the fit
-in the dropped point's weight, so no per-point refitting is needed. The score is minimised by a
+segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a first-order expansion of the fit
+in the dropped point's weight, so no per-point refitting is needed. The score is minimized by a
 golden-section search over `ln κ`, bracketed by the grid `κs` (a geometric range scaled to the
 data's extent by default).
 

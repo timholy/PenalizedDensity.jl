@@ -23,7 +23,7 @@ the estimator to a symmetric tridiagonal problem, solved by a convex Newton iter
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/timholy/PenalizedDensity.jl")
+Pkg.add("PenalizedDensity")
 ```
 
 ## Quick start
