@@ -555,9 +555,9 @@ finite-`N` generalized-χ² law from [`chisq_reference`](@ref)`(d)` (pass a preb
 
 with `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`.
 """
-# atol floors the density: deep in the tail the true value underflows to ~0, and a purely
-# relative tolerance would otherwise subdivide the oscillatory integrand without end.
 function chisq_pdf(r::ChisqReference{T}, z::Real; rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
+    # atol floors the density: deep in the tail the true value underflows to ~0, and a purely
+    # relative tolerance would otherwise subdivide the oscillatory integrand without end.
     zT = T(z)
     f(u) = (θ = _logΦ(r, u); cos((θ[1] - zT * u) / 2) / sqrt(θ[2]))
     I, _ = quadgk(f, zero(T), T(Inf); rtol, atol, maxevals=10^4)
