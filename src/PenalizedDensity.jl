@@ -1,10 +1,11 @@
 module PenalizedDensity
 
 using LinearAlgebra
+using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
 
 export DensityEstimate, amplitude, action, select_kappa, select_kappa_cv, kappa_interval
-export chisq, expected_chisq, chisq_pdf, chisq_ccdf, pvalue
+export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 
 """
     DensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
@@ -359,6 +360,8 @@ Mean of the reference χ² distribution in the large-`N` limit (Eq. 25),
 `⟨χ²⟩ = κ X / √2`, where `X = (1/N) Σᵢ wᵢ / Q_cl(xᵢ)` estimates the size of the
 region occupied by the data. With `1/κ` read as an effective bin width this is
 about `1/√2 ≈ 0.7` per degree of freedom.
+
+For the exact finite-`N` mean, use `expected_chisq(`[`chisq_reference`](@ref)`(d))`.
 """
 function expected_chisq(d::DensityEstimate{T}) where {T}
     N = sum(d.w)
@@ -369,30 +372,163 @@ end
 # Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 
-"""
-    chisq_pdf(d::DensityEstimate, z) -> P(z)
+# ── Exact reference distribution of χ² (Holy 1997, Eqs. 16–18) ───────────────
+#
+# χ²(δψ) = 4 Σᵢ wᵢ (δψ(xᵢ)/ψ_cl(xᵢ))² is a quadratic form in the Gaussian
+# fluctuation field of Eq. 16 (precision L = -ℓ²∂² + 2λ + 2Σ wₖδ(x-xₖ)/ψₖ²,
+# constrained by ∫ ψ_cl δψ = 0). Its law is therefore a generalized chi-squared,
+# χ² = Σₖ eₖ Zₖ², the eₖ being the eigenvalues of D^½ C D^½ with D = diag(4wᵢ/ψᵢ²)
+# and C the covariance of the field values at the nodes. Equivalently its Laplace
+# transform is det(I + 2a·DC)^{-1/2}, exactly Eq. 18.
+#
+# Everything is tridiagonal. The unconstrained node covariance obeys
+#   C₀⁻¹ = G₀⁻¹ + S,  (G₀)ᵢⱼ = κ e^{-κ|xᵢ-xⱼ|}/(4λ),  S = diag(2wₖ/ψₖ²),
+# and the exponential kernel is Markov, so G₀⁻¹ = (2λ/κ)·M with M the
+# `roughness_operator`. The ∫ψ_cl δψ = 0 constraint contributes one rank-one term,
+# C = C₀ - b bᵀ/Vφ (Eq. 18's T(g) factor). Tail probabilities come from Imhof's
+# inversion, whose integrand needs only det(I + iuA) per node — an O(N)
+# tridiagonal determinant plus a rank-one correction — so no eigenvalues are formed.
 
-Density of the reference χ² distribution at `z ≥ 0` in the large-`N` limit
-(Eq. 26): the inverse-Gaussian (Wald) law with mean `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`
-and shape `⟨χ²⟩²`,
-
-    P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)].
 """
-function chisq_pdf(d::DensityEstimate{T}, z::Real) where {T}
-    zT = T(z)
-    zT > 0 || return zero(T)
-    μ = expected_chisq(d)
-    return μ / sqrt(2 * T(π) * zT^3) * exp(μ - zT / 2 - μ^2 / (2 * zT))
+    ChisqReference
+
+Precomputed reference distribution of the goodness-of-fit statistic [`chisq`](@ref)
+for one fit, in the exact finite-`N` theory (Holy 1997, Eqs. 16–18). The statistic is
+a quadratic form in the Gaussian fluctuation field, so its law is a generalized
+chi-squared; this object stores the `O(N)` data — a symmetric tridiagonal matrix and a
+rank-one constraint vector — that its density and tail probabilities are computed from.
+
+Build one with [`chisq_reference`](@ref) and reuse it across many evaluations of
+[`chisq_ccdf`](@ref), [`chisq_pdf`](@ref), and [`pvalue`](@ref); its exact mean is
+[`expected_chisq`](@ref)`(ref)`.
+"""
+struct ChisqReference{T<:AbstractFloat}
+    tri::SymTridiagonal{T,Vector{T}}    # D^{-1/2} C₀⁻¹ D^{-1/2}; A = tri⁻¹ - g gᵀ
+    g::Vector{T}                        # rank-one constraint direction, D^{1/2} b / √Vφ
+    mean::T                             # exact ⟨χ²⟩ = tr(A)
+end
+
+Base.show(io::IO, r::ChisqReference) =
+    print(io, "ChisqReference($(length(r.g)) nodes, ⟨χ²⟩=$(r.mean))")
+
+# ∫ over one interval of the amplitude against a unit exponential decaying toward each
+# endpoint: p̃ = ∫ ψ e^{-κ(x_{k+1}-x)}dx, q̃ = ∫ ψ e^{-κ(x-x_k)}dx. The coth/csch forms
+# stay finite as θ → ∞ (isolated points); expm1 keeps S1 accurate as θ → 0.
+function _pq_tilde(ψk::T, ψk1::T, θ::T, κ::T) where {T}
+    cs = csch(θ)
+    S1 = (θ + expm1(-2θ) / 2) / (2κ)                # ∫₀ʰ sinh(κu) e^{-κu} du
+    S2 = (sinh(θ) - θ * exp(-θ)) / (2κ)             # ∫₀ʰ sinh(κ(h-u)) e^{-κu} du
+    return (ψk * S1 + ψk1 * S2) * cs, (ψk * S2 + ψk1 * S1) * cs
+end
+
+# A = (κ²/2λ) ∫ α² dx, α = L₀⁻¹ψ_cl with α(xₖ)=ãₖ; closed-form per interval plus tails.
+function _constraint_A(x, ψ, ã, κ::T, λ) where {T}
+    n = length(x)
+    acc = ψ[1]^2 / (8κ^3)                                        # left tail
+    acc += ã[n]^2 / (2κ) + ã[n] * ψ[n] / (2κ^2) + ψ[n]^2 / (4κ^3) # right tail
+    for k in 1:n-1
+        h = x[k+1] - x[k]; θ = κ * h
+        D = ψ[k+1] * csch(θ) - ψ[k] * coth(θ)
+        Ak = (ψ[k] + D) / 2; Bk = (ψ[k] - D) / 2; ãk = ã[k]
+        α(s) = exp(-κ*s) * ãk + Ak * sinh(κ*s) / κ + Bk * s * exp(-κ*s)
+        acc += quadgk(s -> α(s)^2, zero(h), h; rtol = sqrt(eps(T)))[1]
+    end
+    return (κ^2 / (2λ)) * acc
+end
+
+# Diagonal of the inverse of a symmetric tridiagonal, O(N), from its top-down and
+# bottom-up LDLᵀ pivots.
+function _tridiag_invdiag(tri::SymTridiagonal{T}) where {T}
+    a, β = tri.dv, tri.ev; n = length(a)
+    p = similar(a); q = similar(a)
+    p[1] = a[1]
+    for i in 2:n; p[i] = a[i] - β[i-1]^2 / p[i-1]; end
+    q[n] = a[n]
+    for i in n-1:-1:1; q[i] = a[i] - β[i]^2 / q[i+1]; end
+    return sum(inv(p[i] + q[i] - a[i]) for i in 1:n)
 end
 
 """
-    chisq_ccdf(d::DensityEstimate, z) -> P(χ² ≥ z)
+    chisq_reference(d::DensityEstimate) -> ChisqReference
 
-Upper-tail (complementary CDF, i.e. survival) probability of the reference χ²
-distribution [`chisq_pdf`](@ref). Evaluating it at an observed statistic gives a
-p-value; see [`pvalue`](@ref).
+Assemble the exact reference distribution of [`chisq`](@ref) for the fit `d`, following
+Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
+[`chisq_ccdf`](@ref)/[`chisq_pdf`](@ref)/[`pvalue`](@ref) rather than rebuilding it.
 """
-function chisq_ccdf(d::DensityEstimate{T}, z::Real) where {T}
+function chisq_reference(d::DensityEstimate{T}) where {T}
+    x, ψ, w, κ, λ = d.x, d.ψ, d.w, d.κ, d.λ
+    n = length(x)
+    # m_k = ∫ ψ_cl(x) G₀(xₖ,x) dx via forward/backward exponential accumulations.
+    ã = similar(ψ); b̃ = similar(ψ)
+    ã[1] = ψ[1] / (2κ)
+    for k in 1:n-1
+        θ = κ * (x[k+1] - x[k])
+        p, _ = _pq_tilde(ψ[k], ψ[k+1], θ, κ)
+        ã[k+1] = exp(-θ) * ã[k] + p
+    end
+    b̃[n] = ψ[n] / (2κ)
+    for k in n-1:-1:1
+        θ = κ * (x[k+1] - x[k])
+        _, q = _pq_tilde(ψ[k], ψ[k+1], θ, κ)
+        b̃[k] = q + exp(-θ) * b̃[k+1]
+    end
+    m = (κ / (4λ)) .* (ã .+ b̃)
+    # C₀⁻¹ = (2λ/κ) M + diag(2 wᵢ/ψᵢ²);  b = (I + G₀S)⁻¹ m solves C₀⁻¹ b = G₀⁻¹ m.
+    M = roughness_operator(x, κ)
+    C0inv = SymTridiagonal((2λ/κ) .* M.dv .+ 2 .* w ./ ψ.^2, (2λ/κ) .* M.ev)
+    b = C0inv \ ((2λ/κ) .* (M * m))
+    Vφ = _constraint_A(x, ψ, ã, κ, λ) - sum(m .* (2 .* w ./ ψ.^2) .* b)   # Var(∫ψ_cl δψ)
+    # Reduced tridiagonal tri = D^{-1/2} C₀⁻¹ D^{-1/2} and rank-one direction g.
+    D = 4 .* w ./ ψ.^2; sq = sqrt.(D)
+    tri = SymTridiagonal(C0inv.dv ./ D, C0inv.ev ./ (sq[1:n-1] .* sq[2:n]))
+    g = sq .* b ./ sqrt(Vφ)
+    return ChisqReference{T}(tri, g, _tridiag_invdiag(tri) - sum(abs2, g))
+end
+
+expected_chisq(r::ChisqReference) = r.mean
+
+# (unwrapped arg, modulus) of Φ(u) = det(I + iuA), A = tri⁻¹ - g gᵀ. The determinant of
+# I+iu·tri⁻¹ is a ratio of tridiagonal determinants (continuant recurrence, accumulated in
+# log space so the phase unwraps past π); the rank-one term is one complex tridiagonal
+# solve. Both O(N).
+function _logΦ(r::ChisqReference, u::Real)
+    a, β = r.tri.dv, r.tri.ev; n = length(a); iu = im * u
+    r0 = complex(a[1]); rr = a[1] + iu
+    s = log(rr) - log(r0)
+    for k in 2:n
+        r0 = a[k] - β[k-1]^2 / r0
+        rr = (a[k] + iu) - β[k-1]^2 / rr
+        s += log(rr) - log(r0)
+    end
+    y = SymTridiagonal(complex.(a) .+ iu, complex.(β)) \ (r.tri * r.g)
+    rank1 = 1 - iu * dot(r.g, y)
+    return imag(s) + angle(rank1), exp(real(s)) * abs(rank1)
+end
+
+"""
+    chisq_ccdf(d::DensityEstimate, z; method=:exact) -> P(χ² ≥ z)
+    chisq_ccdf(ref::ChisqReference, z)               -> P(χ² ≥ z)
+
+Upper-tail (survival) probability of the reference χ² distribution at `z`. Evaluated at an
+observed statistic it is a p-value; see [`pvalue`](@ref).
+
+`method=:exact` (default) uses the finite-`N` generalized-χ² law via Imhof inversion of
+[`chisq_reference`](@ref)`(d)`; pass a prebuilt [`ChisqReference`](@ref) to avoid
+reassembling it. `method=:largeN` uses the large-`N` inverse-Gaussian (Wald) approximation
+of Eq. 26, with mean `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`; it is cheap but overstates tail
+probabilities at the scales `select_kappa` and `select_kappa_cv` typically choose.
+"""
+function chisq_ccdf(r::ChisqReference{T}, z::Real; rtol=sqrt(eps(T))) where {T}
+    zT = T(z)
+    f(u) = u == 0 ? (r.mean - zT) / 2 :
+        (θ = _logΦ(r, u); sin((θ[1] - zT * u) / 2) / (u * sqrt(θ[2])))
+    I, _ = quadgk(f, zero(T), T(Inf); rtol)      # I ∈ [-π/2, π/2]; no tiny-value churn
+    return clamp(one(T)/2 + I / T(π), zero(T), one(T))
+end
+chisq_ccdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
+    _dispatch_chisq(chisq_ccdf, _chisq_ccdf_largeN, d, z, method)
+
+function _chisq_ccdf_largeN(d::DensityEstimate{T}, z::Real) where {T}
     zT = T(z)
     zT > 0 || return one(T)
     μ = expected_chisq(d)
@@ -407,13 +543,59 @@ function chisq_ccdf(d::DensityEstimate{T}, z::Real) where {T}
 end
 
 """
-    pvalue(d::DensityEstimate, Q) -> p
+    chisq_pdf(d::DensityEstimate, z; method=:exact) -> P(z)
+    chisq_pdf(ref::ChisqReference, z)               -> P(z)
 
-Significance of the fit of a trial density `Q`: the probability that the reference
-χ² distribution exceeds the observed [`chisq`](@ref)`(d, Q)`, i.e.
-`chisq_ccdf(d, chisq(d, Q))`. Valid in the large-`N` limit.
+Density of the reference χ² distribution at `z ≥ 0`. `method=:exact` (default) is the
+finite-`N` generalized-χ² law from [`chisq_reference`](@ref)`(d)` (pass a prebuilt
+[`ChisqReference`](@ref) to reuse it). `method=:largeN` is the large-`N` inverse-Gaussian
+(Wald) density of Eq. 26,
+
+    P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)],
+
+with `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`.
 """
-pvalue(d::DensityEstimate, Q) = chisq_ccdf(d, chisq(d, Q))
+# atol floors the density: deep in the tail the true value underflows to ~0, and a purely
+# relative tolerance would otherwise subdivide the oscillatory integrand without end.
+function chisq_pdf(r::ChisqReference{T}, z::Real; rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
+    zT = T(z)
+    f(u) = (θ = _logΦ(r, u); cos((θ[1] - zT * u) / 2) / sqrt(θ[2]))
+    I, _ = quadgk(f, zero(T), T(Inf); rtol, atol, maxevals=10^4)
+    return max(I / (2 * T(π)), zero(T))
+end
+chisq_pdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
+    _dispatch_chisq(chisq_pdf, _chisq_pdf_largeN, d, z, method)
+
+function _chisq_pdf_largeN(d::DensityEstimate{T}, z::Real) where {T}
+    zT = T(z)
+    zT > 0 || return zero(T)
+    μ = expected_chisq(d)
+    return μ / sqrt(2 * T(π) * zT^3) * exp(μ - zT / 2 - μ^2 / (2 * zT))
+end
+
+function _dispatch_chisq(exact, largeN, d::DensityEstimate, z, method::Symbol)
+    method === :exact  && return exact(chisq_reference(d), z)
+    method === :largeN && return largeN(d, z)
+    throw(ArgumentError("method must be :exact or :largeN, got :$method"))
+end
+
+"""
+    pvalue(d::DensityEstimate, Q; method=:exact) -> p
+    pvalue(ref::ChisqReference, χ²)              -> p
+
+Significance of the fit of a trial density `Q`: the probability that the reference χ²
+distribution exceeds the observed [`chisq`](@ref)`(d, Q)`, i.e. `chisq_ccdf(d, chisq(d, Q))`.
+
+`method=:exact` (default) uses the finite-`N` generalized-χ² law; `method=:largeN` uses the
+Eq. 26 approximation. To test several trial densities against one fit, build the reference
+once with [`chisq_reference`](@ref) and call `pvalue(ref, chisq(d, Q))`.
+"""
+pvalue(r::ChisqReference, χ²::Real) = chisq_ccdf(r, χ²)
+function pvalue(d::DensityEstimate, Q; method::Symbol=:exact)
+    method === :exact  && return chisq_ccdf(chisq_reference(d), chisq(d, Q))
+    method === :largeN && return _chisq_ccdf_largeN(d, chisq(d, Q))
+    throw(ArgumentError("method must be :exact or :largeN, got :$method"))
+end
 
 # Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
 function _golden_min(f, a::T, b::T; iters::Int=60) where {T}

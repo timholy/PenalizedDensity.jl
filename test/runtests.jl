@@ -1,6 +1,7 @@
 using PenalizedDensity
 using OffsetArrays
 using Random, Statistics
+using Random: randn!
 using Test
 
 # Trapezoidal integral of a callable over a wide, fine grid.
@@ -8,6 +9,39 @@ function integrate(f, a, b; n=2_000_001)
     xs = range(a, b; length=n)
     ys = f.(xs)
     return (sum(ys) - (ys[1] + ys[end]) / 2) * step(xs)
+end
+
+# Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
+# field δψ from the constrained Gaussian on a fine grid and evaluate χ²(δψ). This is the
+# ground truth the exact reference distribution must reproduce. Returns the χ² samples.
+function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
+    κ, λ = d.κ, d.λ; ℓ2 = 2λ / κ^2
+    xlo = first(d.x) - pad / κ; xhi = last(d.x) + pad / κ
+    m = ceil(Int, (xhi - xlo) / ((1 / κ) / per_len)) + 1
+    y = range(xlo, xhi; length=m); δ = step(y)
+    ψc = amplitude(d, collect(y))
+    nearest(xi) = (i = searchsortedfirst(y, xi); i == 1 ? 1 : i > m ? m : (xi - y[i-1] < y[i] - xi ? i - 1 : i))
+    gid = nearest.(d.x)
+    p = fill(2λ * δ, m); q = fill(-ℓ2 / δ, m - 1)
+    p[1] += ℓ2 / δ; p[m] += ℓ2 / δ; for j in 2:m-1; p[j] += 2ℓ2 / δ; end
+    for (gi, s) in zip(gid, 2 .* d.w ./ d.ψ.^2); p[gi] += s; end
+    # Cholesky P = RᵀR of the tridiagonal precision, R upper-bidiagonal (c diag, b super).
+    c = similar(p); b = similar(q); c[1] = sqrt(p[1])
+    for j in 2:m; b[j-1] = q[j-1] / c[j-1]; c[j] = sqrt(p[j] - b[j-1]^2); end
+    solveR!(v, ξ) = (v[m] = ξ[m] / c[m]; for j in m-1:-1:1; v[j] = (ξ[j] - b[j] * v[j+1]) / c[j]; end; v)
+    solveP!(v, a) = (u = similar(a); u[1] = a[1] / c[1];
+        for j in 2:m; u[j] = (a[j] - b[j-1] * u[j-1]) / c[j]; end;
+        v[m] = u[m] / c[m]; for j in m-1:-1:1; v[j] = (u[j] - b[j] * v[j+1]) / c[j]; end; v)
+    v = solveP!(similar(ψc), ψc); aPa = sum(ψc .* v)     # for the ∫ψ_cl δψ = 0 constraint
+    rng = MersenneTwister(seed)
+    z = similar(ψc); ξ = similar(ψc); h = similar(ψc); iψ2 = d.w ./ d.ψ.^2
+    chis = Vector{Float64}(undef, nsamp)
+    for s in 1:nsamp
+        randn!(rng, ξ); solveR!(z, ξ)
+        proj = sum(ψc .* z) / aPa; @. h = z - proj * v
+        chis[s] = 4 * sum(iψ2[k] * h[gid[k]]^2 for k in eachindex(gid))
+    end
+    return chis
 end
 
 @testset "PenalizedDensity.jl" begin
@@ -212,33 +246,77 @@ end
         @test_throws ArgumentError chisq(d, x -> -1.0)   # negative trial density
     end
 
-    @testset "goodness of fit: reference distribution" begin
+    @testset "goodness of fit: large-N (Eq. 26) reference" begin
         d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
         μ = expected_chisq(d)
         @test μ > 0
         # Eq. 25: ⟨χ²⟩ is 1/√2 per effective bin (κX bins).
         N = sum(d.w); X = sum(d.w ./ d.ψ.^2) / N
         @test μ / (d.κ * X) ≈ 1 / sqrt(2)
-        # Inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
+        # method=:largeN is the inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
-        p = chisq_pdf.(Ref(d), zs)
+        p = chisq_pdf.(Ref(d), zs; method=:largeN)
         trap(f) = (sum(f) - (f[1] + f[end]) / 2) * step(zs)
         @test trap(p) ≈ 1 atol = 1e-4
         @test trap(zs .* p) ≈ μ rtol = 1e-4
-        @test chisq_pdf(d, -1.0) == 0 && chisq_pdf(d, 0.0) == 0
+        @test chisq_pdf(d, -1.0; method=:largeN) == 0 && chisq_pdf(d, 0.0; method=:largeN) == 0
         # ccdf is the pdf's upper tail and its negative derivative is the pdf.
         z0 = 1.3μ
-        @test chisq_ccdf(d, z0) ≈ trap(p .* (zs .≥ z0)) atol = 1e-4
-        @test chisq_ccdf(d, 0.0) == 1
+        @test chisq_ccdf(d, z0; method=:largeN) ≈ trap(p .* (zs .≥ z0)) atol = 1e-4
+        @test chisq_ccdf(d, 0.0; method=:largeN) == 1
         h = 1e-5
-        @test -(chisq_ccdf(d, z0 + h) - chisq_ccdf(d, z0 - h)) / 2h ≈ chisq_pdf(d, z0) rtol = 1e-4
-        # ccdf stays in [0,1] and monotone decreasing.
-        grid = range(0.01μ, 10μ; length=200)
-        c = chisq_ccdf.(Ref(d), grid)
-        @test all(0 .≤ c .≤ 1) && issorted(c; rev=true)
-        # pvalue is the ccdf at the observed statistic.
+        @test -(chisq_ccdf(d, z0 + h; method=:largeN) - chisq_ccdf(d, z0 - h; method=:largeN)) / 2h ≈
+              chisq_pdf(d, z0; method=:largeN) rtol = 1e-4
+        # pvalue(...; method=:largeN) is the large-N ccdf at the observed statistic.
         Q(x) = exp(-x^2 / 2) / sqrt(2π)
-        @test pvalue(d, Q) == chisq_ccdf(d, chisq(d, Q))
+        @test pvalue(d, Q; method=:largeN) == chisq_ccdf(d, chisq(d, Q); method=:largeN)
+    end
+
+    @testset "goodness of fit: exact reference distribution" begin
+        # A single point: χ² is exactly a scaled χ²₁ (one generalized-χ² weight = the mean).
+        d1 = DensityEstimate([0.7]; κ=1.5); r1 = chisq_reference(d1)
+        e1 = expected_chisq(r1)
+        @test chisq_ccdf(r1, e1) ≈ 0.3173105 rtol = 1e-3       # P(Z² ≥ 1)
+        @test chisq_ccdf(r1, 4 * e1) ≈ 0.0455003 rtol = 1e-3   # P(Z² ≥ 4)
+        @test chisq_ccdf(r1, 0.0) ≈ 1 atol = 1e-6
+
+        # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
+        Random.seed!(1)
+        x = randn(150); d = DensityEstimate(x; κ=select_kappa(x))
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=7)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.02
+        for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        # The exact tail differs substantially from the large-N approximation.
+        zt = quantile(chis, 0.99)
+        @test chisq_ccdf(d, zt; method=:largeN) > 1.3 * chisq_ccdf(r, zt)
+
+        # ccdf ∈ [0,1] and monotone; pdf ≥ 0, integrates to ~1, and is −d(ccdf)/dz.
+        μ = expected_chisq(r)
+        grid = range(0.05μ, 4μ; length=60)
+        c = chisq_ccdf.(Ref(r), grid)
+        @test all(0 .≤ c .≤ 1) && issorted(c; rev=true)
+        @test chisq_ccdf(r, 0.0) ≈ 1 atol = 1e-4    # full mass ⇒ normalized
+        @test all(≥(0), chisq_pdf.(Ref(r), grid))
+        h = 1e-3
+        @test -(chisq_ccdf(r, μ + h) - chisq_ccdf(r, μ - h)) / 2h ≈ chisq_pdf(r, μ) rtol = 1e-4
+
+        # Reference reuse and default-exact wiring.
+        Q(x) = exp(-x^2 / 2) / sqrt(2π)
+        @test pvalue(d, Q) == chisq_ccdf(chisq_reference(d), chisq(d, Q))
+        @test pvalue(r, chisq(d, Q)) == chisq_ccdf(r, chisq(d, Q))
+        @test chisq_ccdf(d, μ) ≈ chisq_ccdf(chisq_reference(d), μ)   # :exact is the default
+
+        # Method validation.
+        @test_throws ArgumentError chisq_ccdf(d, 1.0; method=:bogus)
+        @test_throws ArgumentError chisq_pdf(d, 1.0; method=:bogus)
+        @test_throws ArgumentError pvalue(d, Q; method=:bogus)
+
+        # Generic indexing: OffsetArray input gives an identical reference.
+        ro = chisq_reference(DensityEstimate(OffsetArray(x, -75); κ=d.κ))
+        @test ro.tri.dv ≈ r.tri.dv && ro.g ≈ r.g && expected_chisq(ro) ≈ μ
     end
 
     @testset "kappa_interval: principled range" begin
