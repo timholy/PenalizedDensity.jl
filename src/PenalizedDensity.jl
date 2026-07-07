@@ -4,7 +4,7 @@ using LinearAlgebra
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
 
-export DensityEstimate, amplitude, action, select_kappa, select_kappa_cv, kappa_interval
+export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, kappa_interval
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 
 """
@@ -20,7 +20,9 @@ action
 
 subject to `∫ ψ² dx = 1`. The smoothing scale `κ = √(2λ)/ℓ` (with `λ` the
 normalization multiplier) sets the width of each point's contribution; larger `κ`
-gives a rougher estimate. See [`select_kappa`](@ref) for choosing it automatically.
+gives a rougher estimate. See [`select_kappa_kl`](@ref) for choosing it automatically
+(the recommended default; [`select_kappa_cv`](@ref), [`select_kappa_ms`](@ref), and
+[`kappa_interval`](@ref) are alternatives).
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
@@ -319,7 +321,7 @@ _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
     action(d::DensityEstimate) -> S
 
 Classical action `S[ψ_cl] = N - λ - Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
-where `N = Σ wᵢ`. Used by [`select_kappa`](@ref).
+where `N = Σ wᵢ`. Used by [`select_kappa_ms`](@ref).
 """
 function action(d::DensityEstimate)
     N = sum(d.w)
@@ -516,7 +518,7 @@ observed statistic it is a p-value; see [`pvalue`](@ref).
 [`chisq_reference`](@ref)`(d)`; pass a prebuilt [`ChisqReference`](@ref) to avoid
 reassembling it. `method=:largeN` uses the large-`N` inverse-Gaussian (Wald) approximation
 of Eq. 26, with mean `⟨χ²⟩ =` [`expected_chisq`](@ref)`(d)`; it is cheap but overstates tail
-probabilities at the scales `select_kappa` and `select_kappa_cv` typically choose.
+probabilities at the scales `select_kappa_ms` and `select_kappa_cv` typically choose.
 """
 function chisq_ccdf(r::ChisqReference{T}, z::Real; rtol=sqrt(eps(T))) where {T}
     zT = T(z)
@@ -624,7 +626,7 @@ function _default_κs(x::AbstractVector{<:Real})
 end
 
 """
-    select_kappa(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+    select_kappa_ms(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the
 `κ` at which the classical action [`action`](@ref) `S` is least sensitive to the
@@ -636,13 +638,16 @@ to the data's extent).
 This is a principled convention rather than a unique optimum: `S` has no exact
 stationary point in `κ`, so the flattest point depends on measuring sensitivity
 in `ln κ`. It generally selects a different scale than the entropy-based
-[`kappa_interval`](@ref), and neither targets minimum integrated squared error,
-but see [`select_kappa_cv`](@ref).
+[`kappa_interval`](@ref); both resolve *information* and over-resolve smooth
+densities. To target estimation error instead, prefer [`select_kappa_kl`](@ref)
+(the recommended default) or [`select_kappa_cv`](@ref). The information-resolving
+scales here and in `kappa_interval` are the better choice only for heavily tied or
+discrete data, where the cross-validation scores are unbounded.
 
 `κs` must be sorted and positive, with at least three values to bracket the
 minimum.
 """
-function select_kappa(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
@@ -672,7 +677,7 @@ of the multiplicities (`ln N` for distinct points). The normalized quantity
 
 is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
 `h = 1/2` is returned as `κ`. This entropy criterion is distinct from the minimum-sensitivity
-scale of [`select_kappa`](@ref); one advantage of this function is that it doesn't require
+scale of [`select_kappa_ms`](@ref); one advantage of this function is that it doesn't require
 computing a noisy numerical derivative.
 
 Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo, hi]`
@@ -742,13 +747,12 @@ function _inv_diag(H::SymTridiagonal{T}) where {T}
     return inv.(d .+ δ .- a)
 end
 
-# Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
-# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)². The
-# leave-one-out density Q̂₋ᵢ(xᵢ) is analytic to first order — dropping one observation at node i
-# decrements wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
+# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). The
+# leave-one-out density is analytic to first order — dropping one observation at node i decrements
+# wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
 # ∇²F = M + diag(w/φ²)). Carrying δφ through the normalization ψ = φ/√Z, with Z = ∫φ² = φᵀGφ
 # and v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 - 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
     φ = _solve_amplitude(nodes, w, κ)
     Z, _, Gφ = _norm_sq_grad(nodes, φ, κ)
     A = roughness_operator(nodes, κ)
@@ -756,13 +760,34 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
     gii = _inv_diag(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
     ψ = φ ./ sqrt(Z)
+    looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
+    return ψ, looi
+end
+
+# Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
+# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)².
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
+    ψ, looi = _loo_density(nodes, w, κ)
     N = sum(w)
     cross = zero(T)
-    for i in eachindex(nodes, w)
-        looi = ψ[i]^2 * (1 - 2 * gii[i] / φ[i]^2 + 2 * v[i] / (φ[i] * Z))
-        cross += w[i] * looi
+    for i in eachindex(w, looi)
+        cross += w[i] * looi[i]
     end
     return _int_quartic(nodes, ψ, κ) - 2 * cross / N
+end
+
+# Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
+# -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ): an estimate, up to a κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses
+# the same first-order leave-one-out densities as _lscv. A non-positive Q̂₋ᵢ (possible where the
+# first-order expansion overshoots) makes the log undefined; return NaN so the search rejects κ.
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
+    _, looi = _loo_density(nodes, w, κ)
+    s = zero(T)
+    for i in eachindex(w, looi)
+        looi[i] > 0 || return T(NaN)
+        s += w[i] * log(looi[i])
+    end
+    return -s / sum(w)
 end
 
 """
@@ -775,7 +800,7 @@ Choose the smoothing scale by least-squares cross-validation: return the `κ` mi
 an unbiased estimate — up to the `κ`-independent `∫Q²` — of the integrated squared error
 `∫(Q̂_κ - Q)²`, where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. Its
 minimizer therefore targets minimum mean integrated squared error (MISE). This generally
-selects a finer scale than [`select_kappa`](@ref) (minimum sensitivity) and
+selects a finer scale than [`select_kappa_ms`](@ref) (minimum sensitivity) and
 [`kappa_interval`](@ref) (half-entropy), which resolve information rather than squared error
 and tend to over-resolve smooth densities.
 
@@ -788,20 +813,61 @@ data's extent by default).
 Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
 rounded data instead resemble a discrete distribution, for which `LSCV` decreases without bound
 as `κ → ∞` (finer scales keep resolving the atoms); `select_kappa_cv` then returns a large `κ`.
-Prefer [`select_kappa`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
+Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
 
 `κs` must be sorted and positive, with at least three values to bracket the minimum.
 """
-function select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6) =
+    _select_by_score(_lscv, x, κs, rtol)
+
+"""
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+
+Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
+minimizing the mean negative leave-one-out log-likelihood
+
+    KLCV(κ) = -(1/N) Σᵢ wᵢ ln Q̂_{κ,-i}(xᵢ),
+
+where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. This estimates, up to a
+`κ`-independent constant, the Kullback–Leibler divergence `KL(Q ‖ Q̂_κ)`; minimizing it is
+maximum-likelihood cross-validation. It is the criterion native to the estimator, whose action
+`-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-likelihood, and to leading order it selects the same
+error-optimal scale as [`select_kappa_cv`](@ref) while being cheaper: the `∫Q̂²` roughness term is
+not needed. Like `select_kappa_cv` it generally selects a finer scale than [`select_kappa_ms`](@ref)
+and [`kappa_interval`](@ref), which resolve information rather than divergence.
+
+This is the **recommended default** selector: on a range of test densities it tracks the
+error-optimal scale most closely of the four (see `benchmarks/`), and it is the cheapest of the
+cross-validation scores to evaluate.
+
+Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a first-order expansion of the fit in the
+dropped point's weight, so no per-point refitting is needed and the score costs `O(N)`. The score
+is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs` (a geometric
+range scaled to the data's extent by default).
+
+Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
+rounded data instead resemble a discrete distribution, for which the leave-one-out log-likelihood
+increases without bound as `κ → ∞` (leaving out one of many coincident copies barely perturbs the
+fit); `select_kappa_kl` then returns a large `κ`. Prefer [`select_kappa_ms`](@ref) or
+[`kappa_interval`](@ref), which stay bounded, in that regime.
+
+`κs` must be sorted and positive, with at least three values to bracket the minimum.
+"""
+select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6) =
+    _select_by_score(_klcv, x, κs, rtol)
+
+# Minimize a per-κ score over ln κ, bracketed by the grid κs. `scorefun(nodes, w, κ)` returns the
+# score for the merged nodes/weights at scale κ. A near-coincident pair left unmerged at very large
+# κ can drive the fit to a non-finite score; those are treated as +∞ so the search never selects a
+# degenerate scale.
+function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
     xs = sort!(T[xi for xi in x])
     r = T(rtol)
-    # A near-coincident pair left unmerged at very large κ can drive the fit to a non-finite
-    # score; treat those as +∞ so the search never selects a degenerate scale.
-    score(κ) = (v = _lscv(_merge_presorted(xs, r / κ)..., κ); isfinite(v) ? v : typemax(T))
+    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ); isfinite(v) ? v : typemax(T))
     lnκ = log.(T.(κs))
     i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
     lo = lnκ[max(i - 1, firstindex(lnκ))]

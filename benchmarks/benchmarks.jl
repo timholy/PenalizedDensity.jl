@@ -38,7 +38,7 @@ kd_fixed(x, grid) = pdf(InterpKDE(kde(x; bandwidth = H)), grid)
 sj_fixed(x, grid) = density(x, H, grid)
 ke_fixed(x, grid) = vec(kde!(x, [H])(reshape(collect(grid), 1, :)))
 
-pd_auto(x, grid) = (κ = kappa_interval(x; rtol = 1e-3).κ;
+pd_auto(x, grid) = (κ = select_kappa_kl(x; rtol = 1e-3);      # KL cross-validation (see shootout)
                     DensityEstimate(x; κ, rtol = 1e-3).(grid))
 kd_auto(x, grid) = pdf(InterpKDE(kde(x)), grid)                 # default (Silverman) bandwidth
 sj_auto(x, grid) = density(x, bwsj(x), grid)                    # Sheather–Jones bandwidth
@@ -150,34 +150,63 @@ function accuracy_table(; N = 2_000, trials = 25)
 end
 
 # ----------------------------------------------------------------------------------------
-# Scale-selection diagnostic
+# Bandwidth-selector shootout (within PenalizedDensity)
 # ----------------------------------------------------------------------------------------
 
-# Separate the estimator's accuracy from its automatic scale choice: compare the κ that
-# kappa_interval selects against the κ on a scan that minimises L1 against the true density.
-# A large gap means the method could be more accurate than its out-of-the-box selection is.
-function selection_diagnostic(; N = 2_000, trials = 15, κscan = range(0.5, 40; length = 80))
-    println("\nPenalizedDensity scale selection: kappa_interval vs L1-optimal κ, N = $N")
-    @printf("  %-22s %10s %10s %10s %10s\n", "density", "auto κ", "auto L1", "best κ", "best L1")
+# PenalizedDensity offers several automatic scale selectors. Hold the estimator fixed and pit
+# them head-to-head. The action-based selectors (minimum sensitivity, half-entropy) resolve
+# information and scale like √N; the cross-validation selectors (LSCV, KL) target error and
+# scale like N^{1/5}. For each selector report the mean selected κ and the resulting L1/ISE,
+# alongside the oracle κ that minimises L1 on a scan — the best the estimator can do at any
+# fixed scale. The selector whose error sits closest to the oracle wins.
+const SELECTORS = [
+    ("select_kappa_ms (min-sensitivity)", x -> select_kappa_ms(x; rtol = 1e-3)),
+    ("kappa_interval (half-entropy)",  x -> kappa_interval(x; rtol = 1e-3).κ),
+    ("select_kappa_cv (LSCV/MISE)",    x -> select_kappa_cv(x; rtol = 1e-3)),
+    ("select_kappa_kl (KL)",           x -> select_kappa_kl(x; rtol = 1e-3)),
+]
+
+function selector_shootout(; N = 2_000, trials = 25, κscan = range(0.5, 40; length = 80))
+    println("\nSelector shootout: PenalizedDensity automatic scales head-to-head, N = $N, $trials trials")
+    nsel = length(SELECTORS)
+    winsL1 = zeros(Int, nsel)
     for case in CASES
         grid = range(case.lo, case.hi; length = 4000)
         gridv = collect(grid)
         ptrue = case.pdf.(grid)
-        aκ = 0.0; aL = 0.0; bκ = 0.0; bL = 0.0
-        Random.seed!(3)
+        sumκ = zeros(nsel); sumL1 = zeros(nsel); sumISE = zeros(nsel)
+        oκ = 0.0; oL1 = 0.0; oISE = 0.0
+        Random.seed!(4)
         for _ in 1:trials
             x = case.sample(N)
-            aκ += (κ = kappa_interval(x; rtol = 1e-3).κ)
-            aL += trapz(abs.(DensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
-            bestκ = first(κscan); bestL = Inf
-            for κ in κscan
-                L = trapz(abs.(DensityEstimate(x; κ, rtol = 1e-3).(gridv) .- ptrue), grid)
-                L < bestL && (bestL = L; bestκ = κ)
+            for (j, (_, sel)) in enumerate(SELECTORS)
+                κ = sel(x)
+                q = DensityEstimate(x; κ, rtol = 1e-3).(gridv)
+                sumκ[j] += κ
+                sumL1[j] += trapz(abs.(q .- ptrue), grid)
+                sumISE[j] += trapz((q .- ptrue) .^ 2, grid)
             end
-            bκ += bestκ; bL += bestL
+            bestκ = first(κscan); bestL1 = Inf; bestISE = 0.0
+            for κ in κscan
+                q = DensityEstimate(x; κ, rtol = 1e-3).(gridv)
+                L = trapz(abs.(q .- ptrue), grid)
+                L < bestL1 && (bestL1 = L; bestκ = κ; bestISE = trapz((q .- ptrue) .^ 2, grid))
+            end
+            oκ += bestκ; oL1 += bestL1; oISE += bestISE
         end
-        @printf("  %-22s %10.2f %10.5f %10.2f %10.5f\n",
-                case.name, aκ / trials, aL / trials, bκ / trials, bL / trials)
+        winsL1[argmin(sumL1)] += 1
+        println("\n  ", case.name)
+        @printf("    %-32s %10s %12s %12s\n", "selector", "mean κ", "L1", "ISE")
+        for (j, (name, _)) in enumerate(SELECTORS)
+            @printf("    %-32s %10.2f %12.5f %12.6f\n",
+                    name, sumκ[j] / trials, sumL1[j] / trials, sumISE[j] / trials)
+        end
+        @printf("    %-32s %10.2f %12.5f %12.6f\n",
+                "oracle (L1-optimal κ)", oκ / trials, oL1 / trials, oISE / trials)
+    end
+    println("\n  L1 wins across the ", length(CASES), " densities:")
+    for (j, (name, _)) in enumerate(SELECTORS)
+        @printf("    %-32s %d\n", name, winsL1[j])
     end
 end
 
@@ -185,4 +214,4 @@ end
 
 runtime_table()
 accuracy_table()
-selection_diagnostic()
+selector_shootout()

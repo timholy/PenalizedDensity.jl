@@ -134,7 +134,7 @@ end
     @testset "λ ≈ N near the optimal κ (Eq. 10 asymptotics)" begin
         Random.seed!(1)
         x = randn(400)
-        κ = select_kappa(x; κs=exp.(range(log(0.05), log(20); length=40)))
+        κ = select_kappa_ms(x; κs=exp.(range(log(0.05), log(20); length=40)))
         d = DensityEstimate(x; κ)
         @test 0.75 < d.λ / length(x) < 1.25    # paper: λ ≈ N
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
@@ -155,14 +155,14 @@ end
         end
     end
 
-    @testset "select_kappa: analytic, grid-independent" begin
+    @testset "select_kappa_ms: analytic, grid-independent" begin
         Random.seed!(2)
         x = randn(1500)
-        κ = select_kappa(x)                                       # data-scaled default grid
+        κ = select_kappa_ms(x)                                       # data-scaled default grid
         @test κ > 0
         # Golden-section refinement makes the result independent of the bracketing grid.
-        κ10  = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 10)))
-        κ200 = select_kappa(x; κs = exp.(range(log(0.5), log(60); length = 200)))
+        κ10  = select_kappa_ms(x; κs = exp.(range(log(0.5), log(60); length = 10)))
+        κ200 = select_kappa_ms(x; κs = exp.(range(log(0.5), log(60); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
         @test κ ≈ κ200 rtol = 1e-3
         # The returned κ is a local minimum of |dS/dln κ|.
@@ -213,11 +213,55 @@ end
         ise(κ0) = (gg = range(-8, 8; length = 6001);
                    dd = DensityEstimate(x; κ = κ0);
                    step(gg) * sum((dd(t) - Q(t))^2 for t in gg))
-        @test κ < select_kappa(x)
-        @test ise(κ) < ise(select_kappa(x))
+        @test κ < select_kappa_ms(x)
+        @test ise(κ) < ise(select_kappa_ms(x))
 
         # Generic indexing: OffsetArray input gives an identical result.
         @test select_kappa_cv(OffsetArray(x, -750)) == κ
+    end
+
+    @testset "select_kappa_kl: likelihood (KL) scale" begin
+        Random.seed!(11)
+        x = randn(1500)
+        κ = select_kappa_kl(x)
+        @test κ > 0
+        # Golden-section refinement ⇒ independent of the bracketing grid.
+        κ10  = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 10)))
+        κ200 = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 200)))
+        @test κ10 ≈ κ200 rtol = 1e-3
+
+        # KLCV score: the mean negative leave-one-out log-likelihood built from the first-order
+        # analytic leave-one-out densities matches one built by brute-force refitting. The
+        # tolerance is looser than the LSCV analog above: taking the log gives every node equal
+        # weight, including tail nodes where the first-order expansion is least accurate, whereas
+        # LSCV's cross term downweights them by the density value.
+        xs = sort(x); w = ones(length(xs))
+        function klcv_refit(nodes, weights, κ)
+            s = 0.0
+            for i in eachindex(nodes)
+                keep = [j for j in eachindex(nodes) if j != i]
+                s += weights[i] * log(PenalizedDensity._fit(nodes[keep], weights[keep], κ)(nodes[i]))
+            end
+            return -s / sum(weights)
+        end
+        for κ0 in (1.5, 4.0, 12.0)
+            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 2e-2
+        end
+
+        # Divergence targeting: on smooth data the KL scale is finer than the minimum-sensitivity
+        # scale and gives a smaller Kullback–Leibler divergence to the truth.
+        Q(t) = exp(-t^2 / 2) / sqrt(2π)
+        kl(κ0) = (gg = range(-8, 8; length = 6001);
+                  dd = DensityEstimate(x; κ = κ0);
+                  step(gg) * sum(Q(t) * log(Q(t) / dd(t)) for t in gg))
+        @test κ < select_kappa_ms(x)
+        @test kl(κ) < kl(select_kappa_ms(x))
+
+        # Tracks the least-squares (MISE) scale to leading order.
+        @test select_kappa_kl(x) ≈ select_kappa_cv(x) rtol = 0.5
+
+        # Generic indexing: OffsetArray input gives an identical result.
+        @test select_kappa_kl(OffsetArray(x, -750)) == κ
     end
 
     @testset "amplitude² == density" begin
@@ -282,7 +326,7 @@ end
 
         # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
         Random.seed!(1)
-        x = randn(150); d = DensityEstimate(x; κ=select_kappa(x))
+        x = randn(150); d = DensityEstimate(x; κ=select_kappa_ms(x))
         r = chisq_reference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=7)
         @test expected_chisq(r) ≈ mean(chis) rtol = 0.02
@@ -325,7 +369,7 @@ end
         ki = kappa_interval(x)
         @test ki.lo < ki.κ < ki.hi
         # h = ½ point agrees with the minimum-sensitivity scale within a small factor.
-        κms = select_kappa(x; κs = exp.(range(log(0.05), log(50); length = 60)))
+        κms = select_kappa_ms(x; κs = exp.(range(log(0.05), log(50); length = 60)))
         @test 0.5 < ki.κ / κms < 2.0
         # A wider band brackets a narrower one around the same central κ.
         wide = kappa_interval(x; level = 0.6)
@@ -361,10 +405,10 @@ end
         @test_throws "κ must be positive" DensityEstimate([1.0]; κ=-1.0)
         @test_throws ArgumentError DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
         @test_throws "rtol must be nonnegative" DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
-        @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws "κs must be sorted and positive" select_kappa([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
-        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa([1.0, 2.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_ms([1.0, 2.0]; κs=[1.0, 2.0])
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=0.0)
         @test_throws "level must be in (0, 1)" kappa_interval([1.0, 2.0]; level=0.0)
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=1.0)
@@ -380,5 +424,12 @@ end
         @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])
         @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
         @test_throws "need at least two distinct points to select κ" select_kappa_cv([3.0])
+
+        @test_throws ArgumentError select_kappa_kl([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_kappa_kl([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_kl([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_kl([1.0, 2.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_kl([3.0])                        # need ≥ 2 distinct
+        @test_throws "need at least two distinct points to select κ" select_kappa_kl([3.0])
     end
 end
