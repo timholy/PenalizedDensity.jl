@@ -110,17 +110,26 @@ wrong(x) = exp(-((x - 0.5) / 2.5)^2 / 2) / (2.5 * sqrt(2π))   # a single broad 
 ```
 
 The true mixture yields a far smaller ``\chi^2`` than the mismatched single Gaussian.
-[`pvalue`](@ref) turns the statistic into a significance under the known large-``N``
-reference distribution:
+[`pvalue`](@ref) turns the statistic into a significance under the reference distribution of
+``\chi^2`` — the exact finite-``N`` law (a generalized chi-squared), computed by default:
 
 ```@example tutorial
 (p_correct = round(pvalue(d, truepdf); digits = 3),
  p_incorrect = round(pvalue(d, wrong); digits = 6))
 ```
 
-The single Gaussian is decisively rejected; the true mixture is not. (The large-``N``
-p-value is conservative for an accepted model, so the headline discriminator is the
-``\chi^2`` value itself.) [`expected_chisq`](@ref) gives the mean of the reference
-distribution (about ``0.7`` per effective bin), and [`chisq_pdf`](@ref) /
-[`chisq_ccdf`](@ref) give its full density and upper-tail probability — an inverse-Gaussian
-law.
+The single Gaussian is decisively rejected; the true mixture is not. [`chisq_pdf`](@ref) /
+[`chisq_ccdf`](@ref) give the reference density and upper-tail probability, and
+[`expected_chisq`](@ref) its mean. To test many trial densities against one fit, build the
+reference once with [`chisq_reference`](@ref) and reuse it:
+
+```@example tutorial
+ref = chisq_reference(d)
+(mean = round(expected_chisq(ref); digits = 2),
+ p_correct = round(pvalue(ref, chisq(d, truepdf)); digits = 3))
+```
+
+Passing `method = :largeN` selects instead the closed-form large-``N`` approximation of the
+original paper (an inverse-Gaussian law with mean ``\kappa X/\sqrt2 \approx 0.7`` per
+effective bin); it is cheaper but overstates tail probabilities at the scales the selectors
+above typically choose.
