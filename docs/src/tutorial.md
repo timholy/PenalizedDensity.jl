@@ -22,41 +22,68 @@ N = 2000
 x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
                            comps[2].μ + comps[2].σ * randn() for _ in 1:N]
 
-ki = kappa_interval(x)                          # a principled scale + range (see below)
-d = DensityEstimate(x; κ = ki.κ)       # fit at the half-entropy scale
+κ = select_kappa_kl(x)                          # recommended scale (KL cross-validation)
+d = DensityEstimate(x; κ)              # fit at the recommended scale
 nothing # hide
 ```
 
 `d` is a callable density: `d(x)` returns ``Q(x)``. Plotting the
-estimate against the truth — here at the cross-validated scale (see [`select_kappa_cv`](@ref)
-below) and the half-entropy scale ``\kappa`` (the plotting code uses
+estimate against the truth — here at the recommended KL scale (see [`select_kappa_kl`](@ref)
+below) and, for contrast, the sharper half-entropy scale ``\kappa`` (the plotting code uses
 [Makie](https://docs.makie.org/), which is not a dependency of the package):
 
 ```julia
 using CairoMakie
-κcv = select_kappa_cv(x)
-d_cv = DensityEstimate(x; κ = κcv)
+ki = kappa_interval(x)
+d_half = DensityEstimate(x; κ = ki.κ)
 g = range(-4.5, 7.5; length = 800)
 lines(g, truepdf.(g); linestyle = :dash, label = "true density")
-lines!(g, d_cv.(g); label = "κ = $(round(κcv, digits=1)) (cross-validated)")
-lines!(g, d.(g); label = "κ = $(round(ki.κ, digits=1)) (half-entropy)")
+lines!(g, d.(g); label = "κ = $(round(κ, digits=1)) (KL, recommended)")
+lines!(g, d_half.(g); label = "κ = $(round(ki.κ, digits=1)) (half-entropy)")
 axislegend()
 ```
 
 ![Two-Gaussian mixture recovered with a single κ](assets/mixture_example.png)
 
-Both scales recover both peaks: the cross-validated ``\kappa`` is visibly smoother, the
+Both scales recover both peaks: the recommended KL ``\kappa`` is visibly smoother, the
 half-entropy ``\kappa`` sharper, but each resolves the narrow and the broad component at
 once. This is the key point: **`κ` is a resolution scale, not a component width.** Its
 reciprocal ``1/\kappa`` is smaller than either component's ``\sigma``, so the estimator
 resolves features of any larger width; the local width of ``Q`` is set by the data, not by
-``\kappa``. The two scales come from [`kappa_interval`](@ref)
-and [`select_kappa_cv`](@ref), both introduced next.
+``\kappa``. The selectors that produced these two scales — [`select_kappa_kl`](@ref) and
+[`kappa_interval`](@ref) — are introduced next.
 
 ## Choosing the smoothing scale
 
-To pick ``\kappa`` automatically, [`kappa_interval`](@ref) returns a principled scale with
-a plausible range. Its basis is that the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa``
+PenalizedDensity offers four automatic selectors. They split into two families: two that
+target *estimation error* (recommended for smooth data) and two that resolve *information*
+in the data (the right choice for heavily tied or discrete data). The **recommended
+default** is [`select_kappa_kl`](@ref), which minimizes a likelihood (Kullback–Leibler)
+cross-validation score:
+
+```@example tutorial
+κ_kl = select_kappa_kl(x)       # recommended: error-optimal, likelihood cross-validation
+```
+
+Its score is the leave-one-out log-likelihood ``-\tfrac1N\sum_i \ln \hat Q_{-i}(x_i)``, an
+estimate of ``\mathrm{KL}(Q \,\|\, \hat Q_\kappa)`` up to a constant; it is the criterion
+native to the estimator, whose action is itself a log-likelihood. A close relative,
+[`select_kappa_cv`](@ref), instead minimizes a least-squares (MISE) cross-validation score:
+
+```@example tutorial
+κ_cv = select_kappa_cv(x)       # least-squares cross-validation (MISE)
+```
+
+Both are evaluated analytically — each leave-one-out density comes from a first-order
+expansion of the fit, so no point-by-point refitting is needed — and to leading order they
+select the same ``\kappa \propto N^{1/5}``. Across a range of test densities `select_kappa_kl`
+tracks the error-optimal scale most closely (see `benchmarks/`) and is the cheaper of the
+two, which is why it is the default. Both assume a *continuous* underlying density; on
+heavily tied or coarsely rounded data their scores are unbounded as ``\kappa\to\infty``, and
+the two information-resolving selectors below are the better choice.
+
+The first information-resolving selector, [`kappa_interval`](@ref), returns a principled
+scale with a plausible range. Its basis is that the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa``
 (``W`` = total count) rises monotonically between two *exact* limits — ``W/2`` as
 ``\kappa\to0`` (all points merge into one lump) and ``W/2 + W H`` as ``\kappa\to\infty``
 (the ``N`` points become isolated), where ``H`` is the Shannon entropy of the data. The
@@ -76,29 +103,25 @@ resolved — and the shaded band is the plausible range:
 
 ![Reduced action rising between its two entropy limits](assets/action_entropy.png)
 
-[`select_kappa`](@ref) returns a related but distinct scale: the point of *minimum
-sensitivity*, where `|dS/d ln κ|` is smallest. Its derivative is computed analytically, so
-the result is free of the noise that finite-differencing the action curve would introduce.
-The two criteria generally select different scales. Both resolve *information*
-in the data rather than minimizing error, and on smooth densities they tend to over-resolve.
-
-When the goal is instead minimum mean integrated squared error (MISE), use
-[`select_kappa_cv`](@ref), which minimizes a least-squares cross-validation score:
+The second information-resolving selector, [`select_kappa_ms`](@ref), returns a related but
+distinct scale: the point of *minimum sensitivity*, where `|dS/d ln κ|` is smallest. Its
+derivative is computed analytically, so the result is free of the noise that
+finite-differencing the action curve would introduce.
 
 ```@example tutorial
-κ_cv = select_kappa_cv(x)       # error-optimal scale, usually finer than select_kappa
+κ_ms = select_kappa_ms(x)       # minimum-sensitivity scale
 ```
 
-Its score is an unbiased estimate of the integrated squared error `∫(Q̂ − Q)²`, evaluated
-analytically — the `∫Q̂²` term in closed form and each leave-one-out density from a first-order
-expansion, so no point-by-point refitting is needed. Cross-validation assumes a continuous
-underlying density; on heavily tied or coarsely rounded data it undersmooths, and the
-action-based selectors are the better choice there.
+`select_kappa_ms` and `kappa_interval` generally select different scales, but both resolve
+*information* in the data rather than minimizing error, and on smooth densities they tend to
+over-resolve — which is why the cross-validation selectors are recommended by default. Their
+value is on heavily tied or discrete data, where they stay bounded and the cross-validation
+scores do not.
 
 ## Goodness of fit
 
 Because the estimate is a genuine likelihood fit, you can ask how well a *specific* model
-distribution describes the data. Using the half-entropy fit `d`, [`chisq`](@ref) is a
+distribution describes the data. Using the fit `d` from above, [`chisq`](@ref) is a
 robust, binning-free ``\chi^2`` (the squared Hellinger distance between a trial density and
 the data):
 

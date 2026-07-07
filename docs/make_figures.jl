@@ -24,11 +24,11 @@ N = 2000
 x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
                            comps[2].μ + comps[2].σ * randn() for _ in 1:N]
 
-# Fit at the cross-validated (MISE) scale and at the half-entropy scale.
+# Fit at the recommended KL cross-validation scale and at the half-entropy scale.
 ki = kappa_interval(x)
-κcv = select_kappa_cv(x)
+κkl = select_kappa_kl(x)
 d_half = DensityEstimate(x; κ=ki.κ)
-d_cv = DensityEstimate(x; κ=κcv)
+d_kl = DensityEstimate(x; κ=κkl)
 
 g = range(-4.5, 7.5; length=800)
 fig = Figure(size=(760, 420), fontsize=15)
@@ -36,8 +36,8 @@ ax = Axis(fig[1, 1]; xlabel="x", ylabel="probability density",
           title="Two Gaussians, σ = 0.4 and 1.2, recovered with a single κ")
 hist!(ax, x; bins=60, normalization=:pdf, color=(:gray, 0.22), strokewidth=0, label="data")
 lines!(ax, g, truepdf.(g); color=:black, linestyle=:dash, linewidth=2, label="true density")
-lines!(ax, g, d_cv.(g); color=:steelblue, linewidth=2.5,
-       label="κ = $(round(κcv; digits=1)) (cross-validated)")
+lines!(ax, g, d_kl.(g); color=:steelblue, linewidth=2.5,
+       label="κ = $(round(κkl; digits=1)) (KL, recommended)")
 lines!(ax, g, d_half.(g); color=:crimson, linewidth=2.5,
        label="κ = $(round(ki.κ; digits=1)) (half-entropy)")
 axislegend(ax; position=:rt, framevisible=false)
