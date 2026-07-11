@@ -1,5 +1,6 @@
 using PenalizedDensity
 using OffsetArrays
+using QuadGK: quadgk
 using Random, Statistics
 using Random: randn!
 using Test
@@ -270,6 +271,108 @@ end
         d = DensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
         g = range(-4, 5; length=25)
         @test amplitude(d, collect(g)) .^ 2 ≈ d.(g)
+    end
+
+    @testset "cdf and quantile" begin
+        # Single point: exactly Laplace(x₀, rate 2κ), where cdf and quantile are elementary.
+        κ = 1.5; x0 = 2.0
+        d = DensityEstimate([x0]; κ)
+        lap_cdf(x) = x <= x0 ? exp(2κ * (x - x0)) / 2 : 1 - exp(-2κ * (x - x0)) / 2
+        lap_q(q) = q <= 1/2 ? x0 + log(2q) / (2κ) : x0 - log(2 * (1 - q)) / (2κ)
+        for x in (-3.0, 0.0, 2.0, 2.5, 7.0)
+            @test cdf(d, x) ≈ lap_cdf(x) rtol = 1e-14
+        end
+        for q in (1e-9, 0.1, 0.5, 0.9, 1 - 1e-9)
+            @test quantile(d, q) ≈ lap_q(q) atol = 1e-13
+        end
+
+        # Limits, NaN, and domain errors.
+        @test cdf(d, -Inf) == 0 && cdf(d, Inf) == 1
+        @test quantile(d, 0) == -Inf && quantile(d, 1) == Inf
+        @test isnan(cdf(d, NaN))
+        @test_throws DomainError quantile(d, -0.1)
+        @test_throws DomainError quantile(d, 1.1)
+        @test_throws DomainError quantile(d, NaN)
+
+        # Multi-node fits: the closed-form cdf matches quadrature of the density (nodes
+        # passed as breakpoints so the quadrature resolves every narrow feature), across
+        # smoothing regimes from smooth (θ ≪ 1) to isolated points (θ ≫ 1).
+        Random.seed!(21)
+        x = randn(60)
+        for κ in (0.5, 3.0, 40.0)
+            d = DensityEstimate(x; κ)
+            lo, hi = d.x[1], d.x[end]
+            for t in range(lo - 8 / κ, hi + 8 / κ; length = 41)
+                ref = quadgk(d, -Inf, filter(<(t), d.x)..., t; rtol = 1e-13)[1]
+                @test cdf(d, t) ≈ ref atol = 1e-12
+            end
+            # Probability round trip: cdf ∘ quantile is the identity to roundoff, with
+            # relative accuracy maintained deep into both tails.
+            for q in vcat(exp10.(-14:2:-2), 0.1:0.1:0.9, 1 .- exp10.(-14:2:-2))
+                @test cdf(d, quantile(d, q)) ≈ q rtol = 1e-12
+            end
+            # x round trip wherever the density is not vanishingly small (where the CDF
+            # is numerically flat, x cannot be recovered from it).
+            for t in range(lo - 5 / κ, hi + 5 / κ; length = 101)
+                d(t) > 1e-8 || continue
+                @test quantile(d, cdf(d, t)) ≈ t atol = 1e-9
+            end
+            # Monotone: nondecreasing cdf on a fine grid, nondecreasing quantiles.
+            g = collect(range(lo - 10 / κ, hi + 10 / κ; length = 2001))
+            @test issorted(cdf(d, g))
+            @test issorted(quantile(d, collect(0.0:0.0005:1.0)))
+            # Continuity across the nodes.
+            for xk in d.x
+                @test cdf(d, prevfloat(xk)) ≈ cdf(d, xk) atol = 32eps()
+                @test cdf(d, nextfloat(xk)) ≈ cdf(d, xk) atol = 32eps()
+            end
+        end
+
+        # An isolated far node (θ = κ·Δx = 240): every branch stays finite and the
+        # probability round trip survives the numerically flat valley.
+        di = DensityEstimate([0.0, 1.0, 2.0, 50.0]; κ = 5.0)
+        @test all(isfinite, quantile(di, collect(0.001:0.001:0.999)))
+        for q in (1e-9, 0.01, 0.3, 0.7, 0.99, 1 - 1e-9)
+            @test cdf(di, quantile(di, q)) ≈ q rtol = 1e-12
+        end
+
+        # Near-coincident nodes (θ ≈ 1e-3, kept unmerged with rtol = 0).
+        dn = DensityEstimate([0.0, 1e-3, 1.0, 2.0]; κ = 1.0, rtol = 0.0)
+        for t in range(-2, 4; length = 41)
+            ref = quadgk(dn, -Inf, filter(<(t), dn.x)..., t; rtol = 1e-13)[1]
+            @test cdf(dn, t) ≈ ref atol = 1e-12
+        end
+
+        # Affine equivariance: x → s·x + b with κ → κ/s maps the fit onto itself, so cdf
+        # values are preserved and quantiles transform affinely.
+        Random.seed!(33)
+        xa = randn(500)
+        d0 = DensityEstimate(xa; κ = 2.5)
+        for (s, b) in ((1e-8, 3.0), (1e6, -20.0))
+            ds = DensityEstimate(s .* xa .+ b; κ = 2.5 / s)
+            for t in range(-3, 3; length = 21)
+                @test cdf(ds, s * t + b) ≈ cdf(d0, t) atol = 1e-7
+            end
+            for q in (0.01, 0.2, 0.5, 0.8, 0.99)
+                @test quantile(ds, q) ≈ s * quantile(d0, q) + b rtol = 1e-9
+            end
+        end
+
+        # Float32 fits give Float32 results that agree with the Float64 fit.
+        d32 = DensityEstimate(Float32[-1, 0, 1]; κ = 1.0f0)
+        d64 = DensityEstimate([-1.0, 0.0, 1.0]; κ = 1.0)
+        @test @inferred(cdf(d32, 0.5f0)) isa Float32
+        @test @inferred(quantile(d32, 0.5f0)) isa Float32
+        @test cdf(d32, 0.5f0) ≈ cdf(d64, 0.5) atol = 1e-5
+        @test quantile(d32, 0.25f0) ≈ quantile(d64, 0.25) atol = 1e-4
+
+        # Generic indexing: array methods preserve the argument's axes.
+        xo = OffsetArray([-0.5, 0.0, 0.5], -2)
+        @test axes(cdf(d64, xo)) == axes(xo)
+        @test parent(cdf(d64, xo)) == cdf(d64, [-0.5, 0.0, 0.5])
+        qo = OffsetArray([0.1, 0.5, 0.9], 7)
+        @test axes(quantile(d64, qo)) == axes(qo)
+        @test parent(quantile(d64, qo)) == quantile(d64, [0.1, 0.5, 0.9])
     end
 
     @testset "generic indexing: OffsetArray input" begin

@@ -3,9 +3,11 @@ module PenalizedDensity
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, dot, ldiv!, ldlt!, mul!
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
+using Statistics: Statistics, quantile
 
 export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, kappa_interval
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
+export cdf, quantile
 
 """
     DensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
@@ -315,7 +317,198 @@ end
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
 
+# cosh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ (companion to
+# _sinh_ratio). With u = θ it is coth θ, also overflow-safe.
+_cosh_ratio(u::T, θ::T) where {T} = -exp(u - θ) * (1 + exp(-2u)) / expm1(-2θ)
+
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
+
+# sinh(v) - v, accurate for small v where the direct difference loses all precision.
+function _sinhm(v::T) where {T<:AbstractFloat}
+    abs(v) >= 1 && return sinh(v) - v
+    v2 = v * v
+    term = v * v2 / 6
+    s = term
+    k = 2
+    while true
+        term *= v2 / ((2k) * (2k + 1))
+        snew = s + term
+        snew == s && return snew
+        s = snew
+        k += 1
+    end
+end
+
+# cosh(v) - 1, accurate for small v.
+_coshm(v) = 2 * sinh(v / 2)^2
+
+# Cumulative masses at the nodes, F[k] = ∫_{-∞}^{x[k]} ψ² dt, accumulated from the
+# per-interval closed forms (the same integrals as _norm_sq), together with the grand
+# total F[n] + right-tail mass. ψ is normalized so the total is 1 up to roundoff; cdf and
+# quantile divide by the recomputed total rather than assuming 1, which pins
+# cdf(d, ±Inf) to exactly 0 and 1 and keeps the CDF monotone across the last node.
+# For θ < 1 the coth/csch coefficient forms cancel catastrophically (relative error
+# ~eps/θ²); the _sinhm/_coshm forms are algebraically identical and cancellation-free.
+function _node_cdf(d::DensityEstimate{T}) where {T}
+    x, ψ, κ = d.x, d.ψ, d.κ
+    n = length(x)
+    F = Vector{T}(undef, n)
+    F[1] = ψ[1]^2 / (2κ)                # left tail
+    for k in 1:n-1
+        θ = κ * (x[k+1] - x[k])
+        if θ < 1
+            s2 = 2 * sinh(θ)^2
+            fdiag  = _sinhm(2θ) / (2 * s2)
+            fcross = (θ * _coshm(θ) - _sinhm(θ)) / s2
+        else
+            ct, cs = coth(θ), csch(θ)
+            fdiag  = (ct - θ * cs^2) / 2
+            fcross = cs * (θ * ct - oneunit(T)) / 2
+        end
+        F[k+1] = F[k] + (fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]) / κ
+    end
+    return F, F[n] + ψ[n]^2 / (2κ)
+end
+
+# Unnormalized cumulative mass ∫_{-∞}^{x} ψ² dt, given the node cumulatives F. The tails
+# are elementary exponential integrals; interior intervals use _cdf_mass_interior.
+function _cdf_mass(d::DensityEstimate{T}, F::Vector{T}, x::Real) where {T}
+    xs, ψ, κ = d.x, d.ψ, d.κ
+    n = length(xs)
+    isnan(x) && return T(NaN) * one(x)
+    if x <= xs[1]
+        return ψ[1]^2 / (2κ) * exp(2κ * (x - xs[1]))
+    elseif x >= xs[n]
+        return F[n] + ψ[n]^2 / (2κ) * (-expm1(-2κ * (x - xs[n])))
+    end
+    k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
+    return _cdf_mass_interior(d, F, k, x)
+end
+
+# Unnormalized cumulative mass at x within interval k (xs[k] ≤ x ≤ xs[k+1]). The partial
+# mass is integrated from the nearer node — subtracting from F[k+1] when x lies in the
+# right half — so its absolute error vanishes toward both nodes and the CDF stays
+# continuous and monotone through every node.
+function _cdf_mass_interior(d::DensityEstimate{T}, F::Vector{T}, k::Int, x::Real) where {T}
+    xs, ψ, κ = d.x, d.ψ, d.κ
+    a = κ * (xs[k+1] - x)               # a, b ≥ 0 and a + b = θ
+    b = κ * (x - xs[k])
+    θ = a + b
+    if b <= θ / 2
+        return F[k] + _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
+    else
+        return F[k+1] - _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
+    end
+end
+
+# ∫₀ʷ ψ̂(u)² du for the unit-coordinate interval field ψ̂(u) = (p sinh(θ-u) + q sinh(u))/sinh(θ),
+# with 0 ≤ w ≤ θ/2 and arem = θ - w; the physical mass over [x[k], x[k]+w/κ] is _segmass/κ.
+# Two algebraically identical forms of the exact antiderivative:
+# - θ < 1: expanded per-power integrals ∫sinh²(θ-u), ∫sinh(θ-u)sinh(u), ∫sinh²(u), written
+#   through _sinhm/_coshm so the small-θ cancellation (relative error ~eps/θ² in the naive
+#   coth/csch forms) never occurs;
+# - θ ≥ 1: ψ̂'' = ψ̂ makes C = ψ̂'² - ψ̂² constant and (ψ̂ψ̂')' = 2ψ̂² + C, so
+#   ∫ψ̂² du = (Δ(ψ̂ψ̂') - C·w)/2, with C and ψ̂' written through coth/csch/_sinh_ratio/
+#   _cosh_ratio so everything stays finite for isolated points (large θ).
+function _segmass(p, q, arem, w, θ)
+    if θ < 1
+        Ipp = 2 * sinh((θ + arem) / 2)^2 * sinh(w) + _sinhm(w)      # ∫₀ʷ sinh²(θ-u) du
+        Ipq = w * _coshm(θ) - _coshm(arem) * sinh(w) - _sinhm(w)    # ∫₀ʷ sinh(θ-u) sinh(u) du
+        Iqq = _sinhm(2w) / 2                                        # ∫₀ʷ sinh²(u) du
+        return (p^2 * Ipp + 2 * p * q * Ipq + q^2 * Iqq) / (2 * sinh(θ)^2)
+    end
+    ct, cs = coth(θ), csch(θ)
+    C = cs^2 * (p^2 + q^2) - 2 * p * q * cs * ct    # ψ̂'² - ψ̂², constant on the interval
+    ψ0′ = q * cs - p * ct                           # ψ̂'(0)
+    ψw  = p * _sinh_ratio(arem, θ) + q * _sinh_ratio(w, θ)
+    ψw′ = q * _cosh_ratio(w, θ) - p * _cosh_ratio(arem, θ)
+    return (ψw * ψw′ - p * ψ0′ - C * w) / 2
+end
+
+"""
+    cdf(d::DensityEstimate, x)
+
+Cumulative distribution function of the fitted density: `F(x) = ∫_{-∞}^x Q(t) dt` with
+`Q = ψ²`, evaluated in closed form (no quadrature). The tails are pure exponentials;
+on each inter-node interval `ψ'' = κ²ψ` makes `ψ'² - κ²ψ²` constant, which yields the
+exact antiderivative of the hyperbolic interpolant.
+
+`F` is nondecreasing with `F(-Inf) == 0` and `F(Inf) == 1` exactly: the few ulps of
+normalization roundoff in the fitted amplitudes are absorbed by a global rescaling.
+
+`x` may be a scalar or an array. Each call assembles the per-node cumulative masses at
+`O(length(d.x))` cost; the array method assembles them once and shares them across all
+evaluations. See [`quantile`](@ref Statistics.quantile) for the inverse.
+
+# Examples
+```jldoctest
+julia> d = DensityEstimate([0.0]; κ=0.5);   # a Laplace density centered at 0
+
+julia> cdf(d, 0.0)
+0.5
+
+julia> quantile(d, 0.5)
+0.0
+```
+"""
+function cdf(d::DensityEstimate, x::Real)
+    F, total = _node_cdf(d)
+    return _cdf_mass(d, F, x) / total
+end
+function cdf(d::DensityEstimate, x::AbstractArray)
+    F, total = _node_cdf(d)
+    return map(xi -> _cdf_mass(d, F, xi) / total, x)
+end
+
+"""
+    quantile(d::DensityEstimate, q)
+
+Quantile function of the fitted density, the inverse of [`cdf`](@ref):
+`cdf(d, quantile(d, q)) ≈ q` for `q ∈ [0, 1]`, with `quantile(d, 0) == -Inf` and
+`quantile(d, 1) == Inf`; `q` outside `[0, 1]` (including `NaN`) throws a
+`DomainError`. In the exponential tails the inversion is in closed form; on interior
+intervals a Newton iteration on the closed-form CDF, bracketed by the enclosing nodes,
+converges to floating-point accuracy. The right tail is solved through `1 - q`, so
+upper quantiles lose no more precision than `q` itself carries.
+
+`q` may be a scalar or an array; the array method assembles the per-node cumulative
+masses once and shares them across all evaluations.
+
+Extends `Statistics.quantile`.
+"""
+function Statistics.quantile(d::DensityEstimate, q::Real)
+    F, total = _node_cdf(d)
+    return _quantile(d, F, total, q)
+end
+function Statistics.quantile(d::DensityEstimate, q::AbstractArray)
+    F, total = _node_cdf(d)
+    return map(qi -> _quantile(d, F, total, qi), q)
+end
+
+function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
+    0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
+    xs, ψ, κ = d.x, d.ψ, d.κ
+    n = length(xs)
+    target = q * total
+    if target <= F[1]                   # left tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}
+        return xs[1] + log(2κ * target / ψ[1]^2) / (2κ)
+    elseif target >= F[n]               # right tail, through the complement 1 - q
+        return xs[n] - log(2κ * (total * (1 - q)) / ψ[n]^2) / (2κ)
+    end
+    k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
+    lo, hi = xs[k], xs[k+1]
+    y = lo + (target - F[k]) / (F[k+1] - F[k]) * (hi - lo)  # linear-in-mass start
+    for _ in 1:200
+        r = _cdf_mass_interior(d, F, k, y) - target
+        r == 0 && return y
+        r < 0 ? (lo = y) : (hi = y)
+        ynew = y - r / _amplitude(d, y)^2       # Newton: the CDF's derivative is ψ²
+        lo < ynew < hi || (ynew = (lo + hi) / 2)  # bisect when Newton leaves the bracket
+        ynew == y && return y
+        y = ynew
+    end
+    error("quantile: safeguarded Newton failed to converge at q = $q — please report this")
+end
 
 """
     action(d::DensityEstimate) -> S
