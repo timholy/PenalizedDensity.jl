@@ -2,7 +2,7 @@ module PenalizedDensity
 
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
 using QuadGK: quadgk
-using SpecialFunctions: erfc, erfcx
+using SpecialFunctions: erfc, erfcinv, erfcx
 using Statistics: Statistics, quantile
 
 export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
@@ -11,6 +11,7 @@ export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_
 export entropy, negentropy
 export logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile
+export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
 
 """
     DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
@@ -890,13 +891,27 @@ end
 # cosh(v) - 1, accurate for small v.
 _coshm(v) = 2 * sinh(v / 2)^2
 
-# Cumulative masses at the nodes, F[k] = ∫_{-∞}^{x[k]} ψ² dt, accumulated from the
-# per-interval closed forms (the same integrals as _norm_sq), together with the grand
+# κ ∫ ψ² dt over one full inter-node interval, from the per-interval closed forms (the
+# same integrals as _norm_sq); the physical mass is the returned value divided by κ.
+# For θ < 1 the coth/csch coefficient forms cancel catastrophically (relative error
+# ~eps/θ²); the _sinhm/_coshm forms are algebraically identical and cancellation-free.
+function _interval_mass(ψk::T, ψk1::T, θ::T) where {T}
+    if θ < 1
+        s2 = 2 * sinh(θ)^2
+        fdiag  = _sinhm(2θ) / (2 * s2)
+        fcross = (θ * _coshm(θ) - _sinhm(θ)) / s2
+    else
+        ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / 2
+        fcross = cs * (θ * ct - oneunit(T)) / 2
+    end
+    return fdiag * (ψk^2 + ψk1^2) + 2 * fcross * ψk * ψk1
+end
+
+# Cumulative masses at the nodes, F[k] = ∫_{-∞}^{x[k]} ψ² dt, together with the grand
 # total F[n] + right-tail mass. ψ is normalized so the total is 1 up to roundoff; cdf and
 # quantile divide by the recomputed total rather than assuming 1, which pins
 # cdf(d, ±Inf) to exactly 0 and 1 and keeps the CDF monotone across the last node.
-# For θ < 1 the coth/csch coefficient forms cancel catastrophically (relative error
-# ~eps/θ²); the _sinhm/_coshm forms are algebraically identical and cancellation-free.
 function _node_cdf(d::DensityEstimate{T}) where {T}
     x, ψ = d.x, d.ψ
     n = length(x)
@@ -904,17 +919,7 @@ function _node_cdf(d::DensityEstimate{T}) where {T}
     F[1] = _tail_mass(ψ[1], d.κL, x[1] - d.lo)      # left tail (or boundary segment)
     for k in 1:n-1
         κ = _kappa(d, k)
-        θ = κ * (x[k+1] - x[k])
-        if θ < 1
-            s2 = 2 * sinh(θ)^2
-            fdiag  = _sinhm(2θ) / (2 * s2)
-            fcross = (θ * _coshm(θ) - _sinhm(θ)) / s2
-        else
-            ct, cs = coth(θ), csch(θ)
-            fdiag  = (ct - θ * cs^2) / 2
-            fcross = cs * (θ * ct - oneunit(T)) / 2
-        end
-        F[k+1] = F[k] + (fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]) / κ
+        F[k+1] = F[k] + _interval_mass(ψ[k], ψ[k+1], κ * (x[k+1] - x[k])) / κ
     end
     return F, F[n] + _tail_mass(ψ[n], d.κR, d.hi - x[n])
 end
@@ -948,6 +953,39 @@ end
 # cosh-arc segment from whichever end (wall or node) is nearer x, so its absolute error vanishes
 # toward both ends and the CDF stays continuous through the boundary node — the same discipline
 # `_cdf_mass_interior` applies at interior nodes. Interior intervals use `_cdf_mass_interior`.
+
+# Node cumulatives from both ends: F[k] = mass below x[k], G[k] = mass above x[k], and the
+# grand total. Each is accumulated from its own end, so both carry full relative precision;
+# forming total - F[k] instead would cancel wherever F[k] ≈ total, and it is the smaller of
+# the two sides that Φ⁻¹ needs at full precision (see _gaussianize). Restricted to the
+# single-rate unbounded fit the Gaussianizing transport supports.
+function _node_cumulatives(d::DensityEstimate{T,T}) where {T}
+    (isinf(d.lo) && isinf(d.hi)) ||
+        throw(ArgumentError("the Gaussianizing transport supports only unbounded fits; " *
+                            "got support=[$(d.lo), $(d.hi)]"))
+    x, ψ, κ = d.x, d.ψ, d.κ
+    n = length(x)
+    m = Vector{T}(undef, n - 1)
+    for k in 1:n-1
+        m[k] = _interval_mass(ψ[k], ψ[k+1], κ * (x[k+1] - x[k])) / κ
+    end
+    F = Vector{T}(undef, n)
+    F[1] = ψ[1]^2 / (2κ)                # left tail
+    for k in 1:n-1
+        F[k+1] = F[k] + m[k]
+    end
+    G = Vector{T}(undef, n)
+    G[n] = ψ[n]^2 / (2κ)                # right tail
+    for k in n-1:-1:1
+        G[k] = G[k+1] + m[k]
+    end
+    return F, G, F[n] + G[n]
+end
+
+# The transport's tail inversions are those of a single exponential rate per side.
+_node_cumulatives(::DensityEstimate{T,Vector{T}}) where {T} =
+    throw(ArgumentError("the Gaussianizing transport supports only a single-rate (scalar κ) fit"))
+
 function _cdf_mass(d::DensityEstimate{T}, F::Vector{T}, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
@@ -986,6 +1024,22 @@ function _cdf_mass_interior(d::DensityEstimate{T}, F::Vector{T}, k::Int, x::Real
         return F[k] + _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
     else
         return F[k+1] - _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
+    end
+end
+
+# Unnormalized mass above x within interval k (xs[k] ≤ x ≤ xs[k+1]): the complement-side
+# companion of _cdf_mass_interior, integrated from the nearer node so that its absolute
+# error vanishes toward both nodes. G holds the mass above each node (_node_cumulatives).
+function _ccdf_mass_interior(d::DensityEstimate{T}, G::Vector{T}, k::Int, x::Real) where {T}
+    xs, ψ = d.x, d.ψ
+    κ = _kappa(d, k)
+    a = κ * (xs[k+1] - x)               # a, b ≥ 0 and a + b = θ
+    b = κ * (x - xs[k])
+    θ = a + b
+    if a <= θ / 2
+        return G[k+1] + _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
+    else
+        return G[k] - _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
     end
 end
 
@@ -1142,6 +1196,210 @@ function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where
     lok, hik = xs[k], xs[k+1]
     y = lok + (target - F[k]) / (F[k+1] - F[k]) * (hik - lok)  # linear-in-mass start
     return _invert_cdf_mass(d, y -> _cdf_mass_interior(d, F, k, y), lok, hik, y, target)
+end
+
+# ln Φ(t), through erfcx so it stays exact into the deep lower tail (Φ itself underflows
+# below t ≈ -38.6): ln Φ(t) = ln(erfcx(-t/√2)/2) - t²/2. Use only for t < ∞ (the two
+# infinite terms collide at t = +∞); callers needing the upper tail pass -t.
+_logΦ(t::T) where {T} = log(erfcx(-t / sqrt(T(2))) / 2) - t^2 / 2
+
+# Φ⁻¹(p) from ℓ = ln p (the upper half enters by symmetry: Φ⁻¹(p) = -Φ⁻¹-from-ln(1-p)).
+# Wherever p = e^ℓ is comfortably a normal float, erfcinv delivers full precision directly.
+# Deeper, solve ln Φ(-t) = ℓ for t > 0 by Newton in log space: _logΦ is exact there, its
+# derivative is -φ(t)/Φ(-t) = -√(2/π)/erfcx(t/√2), and the asymptotic seed
+# t² ≈ -2ℓ - ln(2π·(-2ℓ)) puts the quadratically-convergent iteration within a few steps
+# of machine precision. Non-convergence indicates a bug, not a data property: fail fast.
+function _probit_from_log(ℓ::T) where {T<:AbstractFloat}
+    ℓ == T(-Inf) && return T(-Inf)
+    ℓ > log(floatmin(T)) / 2 && return -sqrt(T(2)) * erfcinv(2 * exp(ℓ))
+    u = -2 * ℓ
+    t = sqrt(u - log(2 * T(π) * u))
+    for _ in 1:12
+        f = log(erfcx(t / sqrt(T(2)))) - t^2 / 2 - log(T(2)) - ℓ
+        Δ = f * erfcx(t / sqrt(T(2))) * sqrt(T(π) / 2)
+        t += Δ
+        abs(Δ) <= 2 * eps(t) && return -t
+    end
+    error("gaussianize: probit iteration failed to converge at ln(p) = $ℓ — please report this")
+end
+
+# y = Φ⁻¹(F(x)), assembled from whichever side of the distribution is smaller so Φ⁻¹ is
+# always fed a probability at full relative precision. Beyond the extreme nodes ln F and
+# ln(1-F) are exactly linear in x (the tails are pure exponentials), so the composition
+# runs in log space and never saturates for finite x.
+function _gaussianize(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, total::T, x::Real) where {T}
+    xs, ψ, κ = d.x, d.ψ, d.κ
+    n = length(xs)
+    isnan(x) && return T(NaN) * one(x)
+    if x <= xs[1]
+        return _probit_from_log(2κ * (x - xs[1]) + log(ψ[1]^2 / (2κ * total)))
+    elseif x >= xs[n]
+        return -_probit_from_log(-2κ * (x - xs[n]) + log(ψ[n]^2 / (2κ * total)))
+    end
+    k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
+    mlo = _cdf_mass_interior(d, F, k, x)
+    mhi = _ccdf_mass_interior(d, G, k, x)
+    if mlo <= mhi
+        return -sqrt(T(2)) * erfcinv(2 * (mlo / total))
+    else
+        return sqrt(T(2)) * erfcinv(2 * (mhi / total))
+    end
+end
+
+# x = F⁻¹(Φ(y)), branched on the sign of y so the smaller of Φ(y), 1-Φ(y) is the one
+# computed (each exactly, via _logΦ). In the exponential tails the inversion is the
+# closed form of _quantile written in log space, so deep |y| maps to the finite x whose
+# tail mass matches e^{lnΦ} rather than saturating to ±Inf.
+function _ungaussianize(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, total::T, y::Real) where {T}
+    xs, ψ, κ = d.x, d.ψ, d.κ
+    n = length(xs)
+    isnan(y) && return T(NaN) * one(y)
+    if y <= 0
+        ℓ = _logΦ(y)
+        if ℓ <= log(F[1] / total)       # left tail: ln F is linear in x
+            return xs[1] + (ℓ + log(2κ * total / ψ[1]^2)) / (2κ)
+        end
+        return _quantile(d, F, total, exp(ℓ))
+    else
+        r = _logΦ(-y)                   # ln(1 - Φ(y)), exact
+        if r <= log(G[n] / total)       # right tail: ln(1-F) is linear in x
+            return xs[n] - (r + log(2κ * total / ψ[n]^2)) / (2κ)
+        end
+        return _quantile(d, F, total, 1 - exp(r))
+    end
+end
+
+# (y, ln y′): the map together with the log-Jacobian ln Q̂(x) - ln φ(y), Q̂ = ψ²/total.
+# Interior, both terms are moderate (|y| stays small wherever a node cumulative bounds the
+# probability away from 0 and 1) and the direct formula is accurate. In the tails the
+# direct form cancels — ln Q̂ and -y²/2 grow together — but there F = Q̂/(2κ) exactly, and
+# eliminating ln Q̂ via ln φ(y) = ln Φ(y) + ln(φ/Φ) collapses the log-Jacobian to
+# ln(2κ) + ½ln(π/2) + ln erfcx(∓y/√2), cancellation-free.
+function _gaussianize_logjac(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, total::T, x::Real) where {T}
+    xs, κ = d.x, d.κ
+    n = length(xs)
+    y = _gaussianize(d, F, G, total, x)
+    isnan(x) && return (; y, logjac = y)
+    if x <= xs[1]
+        return (; y, logjac = log(2κ) + log(T(π) / 2) / 2 + log(erfcx(-y / sqrt(T(2)))))
+    elseif x >= xs[n]
+        return (; y, logjac = log(2κ) + log(T(π) / 2) / 2 + log(erfcx(y / sqrt(T(2)))))
+    end
+    logq = 2 * log(_amplitude(d, x)) - log(total)
+    return (; y, logjac = logq + y^2 / 2 + log(2 * T(π)) / 2)
+end
+
+"""
+    gaussianize(d::DensityEstimate, x)
+
+Gaussianizing transport of the fitted density: `y = Φ⁻¹(F(x))`, where `F = `[`cdf`](@ref)`(d, ·)`
+and `Φ` is the standard normal CDF. If `X` is distributed with density `d`, then
+`gaussianize(d, X)` is distributed `N(0, 1)`; the map is strictly increasing wherever the
+density is positive.
+
+Beyond the extreme nodes the composition is evaluated in log space (`ln F` is exactly
+linear in `x` in the exponential tails), so `y` remains finite and fully accurate
+arbitrarily far into the tails instead of saturating to `±Inf` where `F` would round to
+0 or 1. `gaussianize(d, ±Inf) == ±Inf`, and `NaN` propagates.
+
+`x` may be a scalar or an array. Each call assembles the per-node cumulative masses at
+`O(length(d.x))` cost; the array method assembles them once and shares them across all
+evaluations.
+
+See [`ungaussianize`](@ref) for the inverse, [`gaussianize_logjacobian`](@ref) for the map
+together with its log-Jacobian, and [`gaussianize_gradient`](@ref) for its derivative.
+
+# Examples
+```jldoctest
+julia> d = DensityEstimate([0.0]; κ=0.5);   # a Laplace density centered at 0
+
+julia> y = gaussianize(d, 1.0);
+
+julia> ungaussianize(d, y) ≈ 1.0
+true
+```
+"""
+function gaussianize(d::DensityEstimate, x::Real)
+    F, G, total = _node_cumulatives(d)
+    return _gaussianize(d, F, G, total, x)
+end
+function gaussianize(d::DensityEstimate, x::AbstractArray)
+    F, G, total = _node_cumulatives(d)
+    return map(xi -> _gaussianize(d, F, G, total, xi), x)
+end
+
+"""
+    ungaussianize(d::DensityEstimate, y)
+
+Inverse of [`gaussianize`](@ref): `x = F⁻¹(Φ(y))` with `F⁻¹ = `[`quantile`](@ref Statistics.quantile)`(d, ·)`,
+so that `ungaussianize(d, gaussianize(d, x)) ≈ x`. If `Y ~ N(0, 1)`, then
+`ungaussianize(d, Y)` is distributed with density `d` — drawing standard normal variates
+and mapping them through this function samples from the fit.
+
+The probability `Φ(y)` is never formed on its losing side: for `y > 0` the complement
+`1 - Φ(y)` is computed directly, and deep tails run in log space through the closed-form
+exponential-tail inverse, so large `|y|` maps to the corresponding finite `x` rather than
+saturating to `±Inf`. `ungaussianize(d, ±Inf) == ±Inf`, and `NaN` propagates (every real
+`y` is in the domain, unlike `quantile`, whose out-of-domain `q` throws).
+
+`y` may be a scalar or an array; the array method assembles the per-node cumulative
+masses once and shares them across all evaluations.
+"""
+function ungaussianize(d::DensityEstimate, y::Real)
+    F, G, total = _node_cumulatives(d)
+    return _ungaussianize(d, F, G, total, y)
+end
+function ungaussianize(d::DensityEstimate, y::AbstractArray)
+    F, G, total = _node_cumulatives(d)
+    return map(yi -> _ungaussianize(d, F, G, total, yi), y)
+end
+
+"""
+    gaussianize_logjacobian(d::DensityEstimate, x) -> (; y, logjac)
+
+The Gaussianizing map `y = `[`gaussianize`](@ref)`(d, x)` together with the log-Jacobian
+of the transport,
+
+    logjac = ln Q̂(x) - ln φ(y),
+
+where `Q̂` is the fitted density and `φ` the standard normal density — i.e.
+`logjac = ln(dy/dx)`, the change-of-variables term that makes
+`ln φ(y) + logjac` the exact log-likelihood `ln Q̂(x)`. In the tails the difference is
+evaluated in a cancellation-free closed form (both terms grow like `y²/2`), so `logjac`
+stays accurate arbitrarily far out.
+
+`x` may be a scalar or an array; for an array the result holds two arrays sharing the
+argument's axes, and the `O(length(d.x))` node-cumulative assembly is shared across all
+evaluations. See [`gaussianize_gradient`](@ref) for the plain derivative `exp(logjac)`.
+"""
+function gaussianize_logjacobian(d::DensityEstimate, x::Real)
+    F, G, total = _node_cumulatives(d)
+    return _gaussianize_logjac(d, F, G, total, x)
+end
+function gaussianize_logjacobian(d::DensityEstimate, x::AbstractArray)
+    F, G, total = _node_cumulatives(d)
+    yl = map(xi -> _gaussianize_logjac(d, F, G, total, xi), x)
+    return (; y = map(first, yl), logjac = map(t -> t.logjac, yl))
+end
+
+"""
+    gaussianize_gradient(d::DensityEstimate, x)
+
+Derivative `dy/dx` of the Gaussianizing map [`gaussianize`](@ref) with respect to the
+evaluation coordinate: `Q̂(x) / φ(y)`, the fitted density over the standard normal density
+at the image point. Always positive; it tends to `0` in the tails (like `2κ/|y|`) and can
+be arbitrarily large where the fit is much denser than the matched normal. Computed as
+`exp(logjac)` from [`gaussianize_logjacobian`](@ref), which see for stability notes.
+
+`x` may be a scalar or an array; the array method shares the node-cumulative assembly.
+"""
+function gaussianize_gradient(d::DensityEstimate, x::Real)
+    F, G, total = _node_cumulatives(d)
+    return exp(_gaussianize_logjac(d, F, G, total, x).logjac)
+end
+function gaussianize_gradient(d::DensityEstimate, x::AbstractArray)
+    F, G, total = _node_cumulatives(d)
+    return map(xi -> exp(_gaussianize_logjac(d, F, G, total, xi).logjac), x)
 end
 
 """
