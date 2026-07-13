@@ -436,8 +436,7 @@ end
         @testset "cross-validation on a varying scale" begin
             xs = sort!(randn(Xoshiro(23), 500))
             κfun(t) = 3.0 + 2.0 * exp(-t^2 / 2)
-            nodes, w = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)), κfun)
-            κs, κL, κR = PenalizedDensity._kappa_profile(nodes, κfun, Float64)
+            nodes, w, κs, κL, κR = PenalizedDensity._merge_and_realize(xs, κfun, cbrt(eps(Float64)))
             W = sum(w)
 
             # A constant profile scores what the scalar path scores.
@@ -500,6 +499,83 @@ end
                 @test_throws "smoothing scale must be finite and positive" DensityEstimate(x, bad)
             end
             @test_throws "cannot be given as a vector" DensityEstimate(x, fill(2.0, length(x) - 1))
+        end
+    end
+
+    @testset "adaptive κ: the plug-in selector" begin
+        # χ²₁: a divergent edge at 0, the regularity limit a constant scale cannot resolve.
+        chisq1 = sort!(randn(Xoshiro(19), 3000).^2)
+        rtol = cbrt(eps(Float64))
+        klcv_const(x, κ) = PenalizedDensity._klcv(PenalizedDensity._merge_presorted(x, rtol / κ)..., κ)
+        klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol)
+
+        @testset "AdaptiveScale evaluates c·(p̂/ḡ)^α" begin
+            κ0 = select_kappa_kl(chisq1)
+            p = DensityEstimate(chisq1, κ0)
+            k = AdaptiveScale(3.0, 0.5, p)
+            lgbar = mean(log(p(xi)) for xi in chisq1)     # ln of the geometric mean of p̂
+            for t in (0.05, 0.3, 1.0, 2.5, 6.0)
+                @test k(t) ≈ 3.0 * (p(t) / exp(lgbar))^0.5
+            end
+            # Where the scale equals c, the pilot density equals its geometric mean.
+            @test k(chisq1[argmin(abs.(log.(p.(chisq1)) .- lgbar))]) ≈ 3.0 rtol=1e-3
+
+            # The batch path the selector uses must agree with the scalar rule exactly: it
+            # walks the pilot's nodes once instead of searching for each position.
+            ts = sort!(vcat(chisq1[1:50:end], range(1e-4, 9.0; length=97)))
+            @test PenalizedDensity._kappa_sorted(k, ts, Float64) == k.(ts)
+
+            # Far out in the tail the pilot density underflows to zero; the rule floors there
+            # rather than producing a zero (and an infinite) smoothing length.
+            far = last(chisq1) + 1e4
+            @test p(far) == 0
+            @test k(far) == k.κmin == 1e-6 * k.c
+        end
+
+        @testset "adaptivity is used only when it wins" begin
+            κ = select_kappa_adaptive(chisq1)
+            @test κ isa AdaptiveScale
+            @test κ.α > 0
+            # The selector's own guarantee: the chosen scale beats the constant one on the
+            # score that chose it.
+            @test klcv_scale(chisq1, κ) < klcv_const(chisq1, select_kappa_kl(chisq1))
+
+            d = DensityEstimate(chisq1, κ)
+            @test length(d.κ) == length(d.x) - 1
+            # The scale follows the density: finest at the divergent edge, coarsest in the tail.
+            @test argmax(d.κ) < length(d.κ) ÷ 10
+            @test extrema(d.κ)[2] / extrema(d.κ)[1] > 100
+            @test cdf(d, Inf) == 1
+
+            # Uniform data has no density contrast to exploit — κ ∝ p̂^α is already constant —
+            # so the α = 0 candidate wins and a plain scalar comes back, keeping the fast path
+            # and the goodness-of-fit machinery.
+            u = sort!(rand(Xoshiro(5), 3000))
+            κu = select_kappa_adaptive(u)
+            @test κu isa Real
+            @test DensityEstimate(u, κu).κ isa Real
+            @test chisq_reference(DensityEstimate(u, κu)) isa ChisqReference
+        end
+
+        @testset "alphas and pilot are honored" begin
+            κ = select_kappa_adaptive(chisq1; alphas=(1.0,))
+            @test κ isa AdaptiveScale && κ.α == 1.0
+            # A pilot hook: any callable returning a positive scale from the sample.
+            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot=select_kappa_ms)
+            @test κms isa AdaptiveScale
+            @test κms.pilot.κ == select_kappa_ms(chisq1)
+            # Offset input is merged and sorted like any other vector.
+            @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
+        end
+
+        @testset "input validation" begin
+            @test_throws "at least one exponent" select_kappa_adaptive(chisq1; alphas=())
+            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
+            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
+            @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
+            p = DensityEstimate(chisq1, 10.0)
+            @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
+            @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
         end
     end
 

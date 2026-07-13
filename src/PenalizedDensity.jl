@@ -1,11 +1,12 @@
 module PenalizedDensity
 
-using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, dot, ldiv!, ldlt!, mul!
+using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
 using Statistics: Statistics, quantile
 
 export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, kappa_interval
+export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export cdf, quantile
 
@@ -106,7 +107,7 @@ end
 function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real) where {R<:Real}
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     T = float(promote_type(R, typeof(κ), typeof(rtol)))
-    nodes, weights = _merge_sorted(x, T(rtol) / T(κ), T)
+    nodes, weights = _merge_presorted(_sorted_sample(x, T), T(rtol) / T(κ))
     return _fit(nodes, weights, T(κ))
 end
 
@@ -122,9 +123,7 @@ function _estimate(x::AbstractVector{R}, κfun, rtol::Real) where {R<:Real}
     # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
     # data point is the only way to see it.
     T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x)))))
-    nodes, weights = _merge_sorted(x, T(rtol), κfun, T)
-    κs, κL, κR = _kappa_profile(nodes, κfun, T)
-    return _fit(nodes, weights, κs, κL, κR)
+    return _fit(_merge_and_realize(_sorted_sample(x, T), κfun, T(rtol))...)
 end
 
 # The scale on the interval between nodes k and k+1. Constant and piecewise-constant fits
@@ -169,20 +168,27 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR:
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, κ̄ * Z)
 end
 
-# Evaluate a user-supplied scale function, rejecting values a fit cannot use.
-function _checked_kappa(κfun, x, ::Type{T}) where {T}
-    κ = T(κfun(x))
-    isfinite(κ) && κ > 0 ||
-        throw(ArgumentError("the smoothing scale must be finite and positive, got κ($x) = $κ"))
-    return κ
-end
+# Reject scale values a fit cannot use.
+_check_kappa(κ, x) =
+    isfinite(κ) && κ > 0 ? κ :
+    throw(ArgumentError("the smoothing scale must be finite and positive, got κ($x) = $κ"))
+
+# Evaluate a user-supplied scale function at one point.
+_checked_kappa(κfun, x, ::Type{T}) where {T} = _check_kappa(T(κfun(x)), x)
+
+# The scale at each position of the *sorted* vector `ts`. A general callable is asked
+# pointwise; `AdaptiveScale` overrides this with a single walk of its pilot (see below).
+_kappa_sorted(κfun, ts::AbstractVector, ::Type{T}) where {T} =
+    T[_checked_kappa(κfun, t, T) for t in ts]
 
 # Realize `κfun` on the node geometry: one rate per inter-node interval (from its
-# midpoint), and one per tail (from the outermost node it decays away from).
+# midpoint), and one per tail (from the outermost node it decays away from). The midpoints
+# inherit the nodes' order, so they are realized as a sorted batch.
 function _kappa_profile(nodes::Vector{T}, κfun, ::Type{T}) where {T}
     n = length(nodes)
-    κs = T[_checked_kappa(κfun, (nodes[k] + nodes[k+1]) / 2, T) for k in 1:n-1]
-    return κs, _checked_kappa(κfun, first(nodes), T), _checked_kappa(κfun, last(nodes), T)
+    mids = T[(nodes[k] + nodes[k+1]) / 2 for k in 1:n-1]
+    return _kappa_sorted(κfun, mids, T),
+           _checked_kappa(κfun, first(nodes), T), _checked_kappa(κfun, last(nodes), T)
 end
 
 # Geometric mean of the interval rates: the overall scale the operator is expressed in.
@@ -190,14 +196,22 @@ _reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
     isempty(κs) ? sqrt(κL * κR) : exp(sum(log, κs) / length(κs))
 
 """
-    _merge_sorted(x, atol, T) -> (nodes, weights)
+    _sorted_sample(x, T) -> xs::Vector{T}
 
-Sort `x` and collapse runs of points within `atol` of the run's first member into a
-single node carrying the count as its weight. Returns distinct, strictly increasing
-`nodes::Vector{T}` and matching `weights`, regardless of the axes of `x`.
+A sorted, one-based working copy of the sample `x`, whatever its axes. Every index the fit
+takes afterwards — into the sample, into a scale realized on it, into the merged nodes —
+is an index into this copy, and none of them escape, so the caller's axes have nothing to
+propagate to.
 """
-_merge_sorted(x::AbstractVector, atol::T, ::Type{T}) where {T} =
-    _merge_presorted(sort!(T[xi for xi in x]), atol)
+function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
+    xs = Vector{T}(undef, length(x))
+    i = firstindex(xs)
+    for xi in x                     # iterate, rather than index, to stay axis-agnostic
+        xs[i] = xi
+        i += 1
+    end
+    return sort!(xs)
+end
 
 # Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
 # Factored out so kappa_interval can reMerge one sorted copy at many tolerances.
@@ -216,25 +230,34 @@ function _merge_presorted(xs, atol::T) where {T}
     return nodes, weights
 end
 
-_merge_sorted(x::AbstractVector, rtol::T, κfun, ::Type{T}) where {T} =
-    _merge_presorted(sort!(T[xi for xi in x]), rtol, κfun)
-
-# As above, but with a tolerance `rtol / κfun(x)` local to the run's first member: the
-# merge threshold is a fraction `rtol` of the smoothing length there, so no vector of
-# per-node tolerances can be supplied ahead of the merge that produces the nodes.
-function _merge_presorted(xs, rtol::T, κfun) where {T}
+# As above, but with a tolerance `rtol / κ` local to the run's first member, whose scale is
+# `κx[i]` for the point `xs[i]`: the merge threshold is a fraction `rtol` of the smoothing
+# length there. The scales come in already realized on `xs` because the merge threshold is
+# what *produces* the nodes — a caller has no node geometry to align a per-node vector to.
+function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}) where {T}
     nodes = T[]
     weights = T[]
-    for xi in xs
-        xk = T(xi)
-        if !isempty(nodes) && _checked_kappa(κfun, nodes[end], T) * (xk - nodes[end]) <= rtol
+    κrun = zero(T)                  # scale at the run's first member, which sets its tolerance
+    for i in eachindex(xs, κx)
+        xk = T(xs[i])
+        if !isempty(nodes) && κrun * (xk - nodes[end]) <= rtol
             weights[end] += oneunit(T)
         else
             push!(nodes, xk)
             push!(weights, oneunit(T))
+            κrun = κx[i]
         end
     end
     return nodes, weights
+end
+
+# Merge the sample at the tolerance a scale implies, then realize that scale on the nodes the
+# merge produced. This pairing is the whole entry into a piecewise-constant fit: the merge
+# needs the scale at the sample points, and the fit needs it on the nodes and tails.
+function _merge_and_realize(xs::Vector{T}, κfun, rtol::T) where {T}
+    nodes, weights = _merge_presorted(xs, rtol, _kappa_sorted(κfun, xs, T))
+    κs, κL, κR = _kappa_profile(nodes, κfun, T)
+    return nodes, weights, κs, κL, κR
 end
 
 # Tridiagonal operator M (SPD) coupling the nodal amplitudes.
@@ -515,18 +538,43 @@ amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
 amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
 function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
-    xs, ψ = d.x, d.ψ
+    xs = d.x
     n = length(xs)
-    if x <= xs[1]
-        return ψ[1] * exp(d.κL * (x - xs[1]))
-    elseif x >= xs[n]
-        return ψ[n] * exp(-d.κR * (x - xs[n]))
-    end
-    k = searchsortedlast(xs, x)     # xs[k] <= x < xs[k+1]
+    x <= xs[1] && return d.ψ[1] * exp(d.κL * (x - xs[1]))
+    x >= xs[n] && return d.ψ[n] * exp(-d.κR * (x - xs[n]))
+    return _amplitude(d, searchsortedlast(xs, x), x)    # xs[k] <= x < xs[k+1]
+end
+
+# ψ(x) inside interval k, i.e. for xs[k] ≤ x ≤ xs[k+1]. Split out so a caller that already
+# knows which interval x falls in — a sorted sweep — need not search for it.
+function _amplitude(d::DensityEstimate{T}, k::Integer, x::Real) where {T}
+    xs, ψ = d.x, d.ψ
     κ = _kappa(d, k)
     a = κ * (xs[k+1] - x)           # a, b ≥ 0 and a + b = θ
     b = κ * (x - xs[k])
     return ψ[k] * _sinh_ratio(a, a + b) + ψ[k+1] * _sinh_ratio(b, a + b)
+end
+
+# ln Q(t) = 2 ln ψ(t) at every position of the sorted vector `ts`, advancing through the
+# nodes alongside `ts` in one pass. Evaluating pointwise would binary-search for each
+# position, and a plug-in scale is realized on O(N) positions for every candidate it scores.
+# The logarithm keeps the far tails informative where Q itself underflows to zero.
+function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
+    xs = d.x
+    n = length(xs)
+    out = Vector{T}(undef, length(ts))
+    k = 1
+    for i in eachindex(out, ts)
+        t = T(ts[i])
+        while k < n - 1 && xs[k+1] <= t
+            k += 1
+        end
+        ψt = t <= xs[1] ? d.ψ[1] * exp(d.κL * (t - xs[1])) :
+             t >= xs[n] ? d.ψ[n] * exp(-d.κR * (t - xs[n])) :
+             _amplitude(d, k, t)
+        out[i] = 2 * log(ψt)
+    end
+    return out
 end
 
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
@@ -1082,7 +1130,7 @@ function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
-    xs = sort!(T[xi for xi in x])
+    xs = _sorted_sample(x, T)
     r = T(rtol)
     absslope(κ) = abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
     lnκ = log.(T.(κs))
@@ -1118,7 +1166,7 @@ function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
-    xs = sort!(T[xi for xi in x])
+    xs = _sorted_sample(x, T)
     nodes0, w0 = _merge_presorted(xs, zero(T))      # exact duplicates fix the entropy baseline
     length(nodes0) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
     W = sum(w0)
@@ -1304,7 +1352,7 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
-    xs = sort!(T[xi for xi in x])
+    xs = _sorted_sample(x, T)
     r = T(rtol)
     score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ); isfinite(v) ? v : typemax(T))
     lnκ = log.(T.(κs))
@@ -1312,6 +1360,223 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     lo = lnκ[max(i - 1, firstindex(lnκ))]
     hi = lnκ[min(i + 1, lastindex(lnκ))]
     return exp(_golden_min(l -> score(exp(l)), lo, hi))
+end
+
+"""
+    AdaptiveScale(c, α, pilot)
+
+A spatially varying smoothing scale of the plug-in form
+
+    κ(x) = c · (p̂(x) / ḡ)^α,
+
+where `p̂` is the `pilot` density estimate and `ḡ` the geometric mean of `p̂` over the
+sample it was fitted to. [`select_kappa_adaptive`](@ref) constructs one by choosing `c`
+and `α`; the result is callable, and is passed straight to [`DensityEstimate`](@ref) as
+the smoothing scale.
+
+Dividing by `ḡ` puts `c` on the same footing as a constant scale: where `p̂` equals its
+geometric mean, `κ(x) = c`. The exponent `α > 0` sets how strongly the scale follows the
+density — larger `α` resolves the peaks more finely and smooths the tails more heavily.
+
+The scale is floored at `1e-6 c`, which intercepts underflow of `(p̂/ḡ)^α` at points where
+the pilot density is negligible; the floor sits far below any scale the rule would
+otherwise choose, so it never shapes the fit.
+"""
+struct AdaptiveScale{T<:AbstractFloat,D}
+    c::T           # scale where the pilot density equals its geometric mean
+    α::T           # exponent coupling the scale to the pilot density
+    pilot::D       # the pilot density estimate p̂
+    loggbar::T     # ln ḡ, the mean of ln p̂ over the pilot's sample
+    κmin::T        # underflow floor
+
+    function AdaptiveScale{T,D}(c, α, pilot, loggbar, κmin) where {T<:AbstractFloat,D}
+        return new{T,D}(c, α, pilot, loggbar, κmin)
+    end
+end
+
+AdaptiveScale{T}(c, α, pilot::D, loggbar, κmin) where {T,D} =
+    AdaptiveScale{T,D}(c, α, pilot, loggbar, κmin)
+
+# The pilot density underflows to zero between two far-separated tail nodes, sending
+# (p̂/ḡ)^α there to zero; the floor keeps the assembled operator's coth(θ)/κ entries finite.
+const _KAPPA_FLOOR = 1e-6
+
+"""
+    AdaptiveScale(c, α, pilot::DensityEstimate)
+
+Build the scale from `c`, `α`, and a pilot fit, with `ḡ` the geometric mean of the pilot
+density over the sample the pilot was fitted to.
+"""
+function AdaptiveScale(c::Real, α::Real, pilot::DensityEstimate{T}) where {T}
+    α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
+    c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
+    return AdaptiveScale{T}(T(c), T(α), pilot, _log_geomean(pilot), T(_KAPPA_FLOOR) * T(c))
+end
+
+# ln ḡ = (1/N) Σᵢ ln p̂(xᵢ) over the pilot's sample. Merged points share their node's density,
+# so the node weights carry the sample's multiplicities.
+function _log_geomean(d::DensityEstimate{T}) where {T}
+    s = zero(T)
+    for i in eachindex(d.x, d.w)
+        s += d.w[i] * 2 * log(d.ψ[i])
+    end
+    return s / sum(d.w)
+end
+
+# The rule itself, from ln p̂(x): κ = c·(p̂/ḡ)^α, floored.
+_scale_from_logdensity(k::AdaptiveScale, lnp) = max(k.c * exp(k.α * (lnp - k.loggbar)), k.κmin)
+
+# ln p̂ rather than p̂: the pilot density underflows to zero between far-separated tail nodes,
+# where its logarithm is still perfectly finite.
+(k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, 2 * log(_amplitude(k.pilot, x)))
+
+# One walk of the pilot for the whole sorted batch, instead of a binary search per position.
+function _kappa_sorted(k::AdaptiveScale{T}, ts::AbstractVector, ::Type{T}) where {T}
+    κ = _logdensity_sorted(k.pilot, ts)
+    for i in eachindex(κ, ts)
+        κ[i] = _check_kappa(_scale_from_logdensity(k, κ[i]), ts[i])
+    end
+    return κ
+end
+
+Base.show(io::IO, k::AdaptiveScale) =
+    print(io, "AdaptiveScale(c=", k.c, ", α=", k.α, ") over a pilot with ",
+          length(k.pilot.x), " nodes")
+
+# Score a candidate scale end to end: merge at the local tolerance it implies, realize it on
+# the resulting nodes, and cross-validate. A κ profile spanning many orders of magnitude can
+# drive the LDLᵀ factorization of the assembled tridiagonal to an exact zero pivot; that
+# candidate is unresolvable, which is what a non-finite score already means to the searches
+# here, so it reports NaN rather than aborting the whole selection.
+function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T) where {T}
+    nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
+    length(nodes) >= 2 || return T(NaN)
+    try
+        return scorefun(nodes, w, κs, κL, κR)
+    catch e
+        e isa ZeroPivotException && return T(NaN)
+        rethrow()
+    end
+end
+
+const _CSPAN = 20.0    # the c bracket runs ×/÷ this factor about its center
+const _CGRID = 13      # grid points across it, to bracket the minimum
+const _CITERS = 20     # golden-section refinements: pins ln c to ~1e-4 of the bracket, far
+                       # below the scale on which the score itself varies
+const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum before giving up
+
+# Minimize `score(c)` over ln c, bracketed by a geometric grid about `c0` and recentered on
+# the best edge until the minimum falls strictly inside. Unresolvable candidates score
+# non-finite; treating those as +∞ lets the search step over them.
+function _select_c(score, c0::T) where {T}
+    f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
+    lnspan = log(T(_CSPAN))
+    for _ in 0:_CSHIFTS
+        lncs = range(log(c0) - lnspan, log(c0) + lnspan; length=_CGRID)
+        scores = f.(lncs)
+        all(==(typemax(T)), scores) &&
+            error("no resolvable smoothing scale anywhere in the search bracket around c = $c0")
+        i = argmin(scores)
+        if i != firstindex(lncs) && i != lastindex(lncs)
+            return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters=_CITERS))
+        end
+        c0 = exp(lncs[i])                       # recenter on the winning edge and search on
+    end
+    error("the smoothing scale kept running off its search bracket after $_CSHIFTS expansions")
+end
+
+"""
+    select_kappa_adaptive(x; alphas=(0.25, 0.5, 0.75, 1.0), pilot=select_kappa_kl, rtol=cbrt(eps(T)))
+        -> κ
+
+Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
+return it ready to pass to [`DensityEstimate`](@ref).
+
+A single scale must trade resolution in the bulk against noise in the tails. Letting `κ`
+follow the density lifts that trade-off, and buys the most where a constant scale is limited
+not by noise but by the density's own irregularity: a divergent or discontinuous edge, a
+kink, or heavy tails. On smooth densities there is nothing to buy, and this selector says so
+— it returns a plain number, the constant scale, whenever adaptivity does not earn its
+keep by the same cross-validation score that chose it.
+
+The rule is a plug-in: fit a pilot density `p̂` at the constant scale `pilot(x)` (by default
+[`select_kappa_kl`](@ref)), then consider the family
+
+    κ(x; c, α) = c · (p̂(x) / ḡ)^α,     ḡ = geometric mean of p̂ over the sample
+
+(an [`AdaptiveScale`](@ref)). For each exponent `α` in `alphas`, `c` is chosen by
+golden-section search on the leave-one-out score `KLCV(κ) = -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ)`
+generalized to a varying scale — the same criterion [`select_kappa_kl`](@ref) minimizes,
+and, like it, evaluated in closed form and `O(N)`, with no refitting. The constant scale
+competes as the `α = 0` member of the same family and on the same score, so the returned
+scale is adaptive only if adaptivity wins.
+
+Returns an [`AdaptiveScale`](@ref) when some `α` in `alphas` beats the constant scale, and
+the constant scale itself (a number, so the fit takes the constant-`κ` path and its
+goodness-of-fit machinery stays available) otherwise. Selection costs a small multiple of
+one [`select_kappa_kl`](@ref) call; shorten `alphas` to trade capture for speed.
+
+The `alphas` must be positive: `α = 0` is the constant scale, which is always in the
+comparison. They are searched in increasing order, whatever order they are given in. `rtol`
+is the node-merging tolerance, as a fraction of the local smoothing length, matching
+[`DensityEstimate`](@ref)'s.
+
+# Examples
+```jldoctest
+julia> x = -log.(1 .- (0.5:999.5) ./ 1000);   # exponential: a jump at the left edge
+
+julia> κ = select_kappa_adaptive(x);          # adaptivity wins here
+
+julia> κ.α                                    # the selected exponent
+0.5
+
+julia> d = DensityEstimate(x, κ);
+
+julia> extrema(d.κ)[2] / extrema(d.κ)[1] > 100   # far finer at the edge than in the tail
+true
+
+julia> select_kappa_adaptive(range(0, 1; length=1000)) isa Real   # uniform: nothing to buy
+true
+```
+"""
+function select_kappa_adaptive(x::AbstractVector{<:Real};
+                               alphas=(0.25, 0.5, 0.75, 1.0),
+                               pilot=select_kappa_kl,
+                               rtol::Real=cbrt(eps(float(eltype(x)))))
+    isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
+    all(>(0), alphas) ||
+        throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
+                            "(α = 0) is always compared against them"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    T = float(promote_type(eltype(x), eltype(alphas), typeof(rtol)))
+    xs = _sorted_sample(x, T)
+    r = T(rtol)
+
+    κ0 = T(pilot(xs))
+    κ0 > 0 || throw(ArgumentError("the pilot must return a positive scale, got $κ0"))
+    p = DensityEstimate(xs, κ0; rtol=r)
+    loggbar = _log_geomean(p)
+
+    # The constant scale, scored on the same footing as the adaptive candidates.
+    best_c, best_α = κ0, zero(T)
+    best_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0)
+    isfinite(best_score) || (best_score = typemax(T))
+
+    # The exponents are searched in increasing order, each bracket centered on the previous
+    # exponent's optimum. The optimal c climbs steeply with α — a scale falling off as p̂^α
+    # needs a larger c to keep the same resolution where the data actually are — and by α = 1
+    # it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
+    # every optimum comfortably inside its bracket.
+    c0 = κ0
+    for α in sort!(collect(T, alphas))
+        scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
+        c0 = _select_c(c -> _score_kappa(_klcv, xs, scale(c), r), c0)
+        s = _score_kappa(_klcv, xs, scale(c0), r)
+        if isfinite(s) && s < best_score
+            best_score, best_c, best_α = s, c0, α
+        end
+    end
+    return best_α == 0 ? best_c : AdaptiveScale(best_c, best_α, p)
 end
 
 end # module
