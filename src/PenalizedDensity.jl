@@ -133,6 +133,12 @@ end
 _kappa(d::DensityEstimate{T,T}, k::Integer) where {T} = d.κ
 _kappa(d::DensityEstimate{T,Vector{T}}, k::Integer) where {T} = d.κ[k]
 
+# The same accessor for a bare scale — one rate, or one per interval — as passed around
+# before a `DensityEstimate` exists (the cross-validation scores work on nodes and weights,
+# not on a fit).
+_kappa(κ::Real, k::Integer) = κ
+_kappa(κs::AbstractVector, k::Integer) = κs[k]
+
 _show_kappa(d::DensityEstimate{T,T}) where {T} = "κ=$(d.κ)"
 function _show_kappa(d::DensityEstimate{T,Vector{T}}) where {T}
     # A one-node fit has no intervals, only the two tails, so both extrema fold them in.
@@ -279,6 +285,13 @@ function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::
     return SymTridiagonal(d, e)
 end
 
+# M for a bare scale, whichever form it takes. A constant κ is its own reference scale, so
+# this reduces to `roughness_operator(x, κ)` entry for entry; a per-interval κ is assembled
+# in units of the geometric-mean rate, as the fit does.
+_operator(x::Vector{T}, κ::T, κL::T, κR::T) where {T} = roughness_operator(x, κ)
+_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
+    roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR))
+
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
 function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
     s = zero(T)
@@ -378,8 +391,32 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) w
     return Z
 end
 
+# Z = ∫ψ² and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ: the mass and the action of its Gram operator,
+# from one pass over the per-interval coth/csch coefficients. The leave-one-out expansion
+# needs both. Each tail decays at its own rate, and each interval integrates at its own.
+function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
+    n = length(x)
+    Gψ = zeros(T, n)
+    Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
+    Gψ[1] += ψ[1] / (2κL)
+    Gψ[n] += ψ[n] / (2κR)
+    for k in 1:n-1
+        κk = _kappa(κ, k)
+        θ = κk * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κk)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κk)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
+        Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
+    end
+    return Z, Gψ
+end
+
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
+# Differentiating in κ presupposes a single rate: this serves the scalar-κ sensitivity
+# `_action_and_slope`, not the piecewise fit.
 function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     n = length(x)
     Gψ = zeros(T, n)
@@ -409,24 +446,29 @@ end
 # difference q - p, keeping them accurate for near-coincident points (θ → 0, where the naive
 # csch⁴ forms lose all precision) while staying finite for isolated points (θ → ∞). Used by
 # select_kappa_cv for the ∫Q² term.
-function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+#
+# The derivation is local to one interval, so a piecewise-constant scale changes nothing but
+# which κ each term carries.
+function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
     n = length(x)
-    Q2 = (ψ[1]^4 + ψ[n]^4) / (4κ)       # tails: ∫ψ₁⁴ e^{4κ(x-x₁)} dx and its mirror
+    Q2 = ψ[1]^4 / (4κL) + ψ[n]^4 / (4κR)    # tails: ∫ψ₁⁴ e^{4κL(x-x₁)} dx and its mirror
     for k in 1:n-1
+        κk = _kappa(κ, k)
         p, q = ψ[k], ψ[k+1]
-        θ = κ * (x[k+1] - x[k])
+        θ = κk * (x[k+1] - x[k])
         ct, cs = coth(θ), csch(θ)
         Δ = q - p
         cm1 = 2 * sinh(θ / 2)^2                              # coshθ - 1
-        boundary = κ * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))   # [u³u']ₖ^{k+1}
-        E = κ^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)             # u'² - κ²u²
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - one(T)) / (2κ)
+        boundary = κk * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))  # [u³u']ₖ^{k+1}
+        E = κk^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)            # u'² - κ²u²
+        fdiag  = (ct - θ * cs^2) / (2κk)
+        fcross = cs * (θ * ct - one(T)) / (2κk)
         Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q      # ∫u² over the interval
-        Q2 += (boundary - 3 * E * Iseg) / (4κ^2)
+        Q2 += (boundary - 3 * E * Iseg) / (4κk^2)
     end
     return Q2
 end
+_int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _int_quartic(x, ψ, κ, κ, κ)
 
 # (dM/dκ) ψ: the κ-derivative of roughness_operator's coth/csch entries, applied to ψ. The tails are
 # κ-independent and drop out.
@@ -1140,36 +1182,44 @@ end
 # wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
 # ∇²F = M + diag(w/φ²)). Carrying δφ through the normalization ψ = φ/√Z, with Z = ∫φ² = φᵀGφ
 # and v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 - 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
-function _loo_density(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
-    φ = _solve_amplitude(nodes, w, κ)
-    Z, _, Gφ = _norm_sq_grad(nodes, φ, κ)
-    A = roughness_operator(nodes, κ)
-    H = SymTridiagonal(A.dv .+ w ./ φ.^2, A.ev)
+#
+# Nothing in that expansion uses M's entries, only that it is the fixed SPD operator whose mass
+# functional is Z — so it holds for a piecewise-constant scale unchanged. The overall factor the
+# adaptive operator carries (see `roughness_operator`) leaves ψ and the leave-one-out densities
+# invariant: under M → cM the pieces move as φ → φ/√c, Z → Z/c, H → cH, (H⁻¹)ᵢᵢ → (H⁻¹)ᵢᵢ/c,
+# Gφ → Gφ/√c and v → v/c^{3/2}, and every term above is a ratio in which c cancels.
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
+    M = _operator(nodes, κ, κL, κR)
+    φ = _solve_amplitude(M, w)
+    Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR)
+    H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
     gii = _inv_diag(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
     ψ = φ ./ sqrt(Z)
     looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
     return ψ, looi
 end
+_loo_density(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _loo_density(nodes, w, κ, κ, κ)
 
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
 # estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)².
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
-    ψ, looi = _loo_density(nodes, w, κ)
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
+    ψ, looi = _loo_density(nodes, w, κ, κL, κR)
     N = sum(w)
     cross = zero(T)
     for i in eachindex(w, looi)
         cross += w[i] * looi[i]
     end
-    return _int_quartic(nodes, ψ, κ) - 2 * cross / N
+    return _int_quartic(nodes, ψ, κ, κL, κR) - 2 * cross / N
 end
+_lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ): an estimate, up to a κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses
 # the same first-order leave-one-out densities as _lscv. A non-positive Q̂₋ᵢ (possible where the
 # first-order expansion overshoots) makes the log undefined; return NaN so the search rejects κ.
-function _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
-    _, looi = _loo_density(nodes, w, κ)
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
+    _, looi = _loo_density(nodes, w, κ, κL, κR)
     s = zero(T)
     for i in eachindex(w, looi)
         looi[i] > 0 || return T(NaN)
@@ -1177,6 +1227,7 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T}
     end
     return -s / sum(w)
 end
+_klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
 
 """
     select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6) -> κ

@@ -433,6 +433,48 @@ end
             @test cdf(a, quantile(a, collect(qs))) ≈ qs atol=1e-12
         end
 
+        @testset "cross-validation on a varying scale" begin
+            xs = sort!(randn(Xoshiro(23), 500))
+            κfun(t) = 3.0 + 2.0 * exp(-t^2 / 2)
+            nodes, w = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)), κfun)
+            κs, κL, κR = PenalizedDensity._kappa_profile(nodes, κfun, Float64)
+            W = sum(w)
+
+            # A constant profile scores what the scalar path scores.
+            for κ0 in (1.5, 4.0, 12.0)
+                cn, cw = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)) / κ0)
+                flat = fill(κ0, length(cn) - 1)
+                @test PenalizedDensity._klcv(cn, cw, flat, κ0, κ0) ≈
+                      PenalizedDensity._klcv(cn, cw, κ0) rtol=1e-11
+                @test PenalizedDensity._lscv(cn, cw, flat, κ0, κ0) ≈
+                      PenalizedDensity._lscv(cn, cw, κ0) rtol=1e-11
+            end
+
+            # ∫Q̂², the LSCV roughness term, against quadrature over the segments the varying
+            # scale defines.
+            a = PenalizedDensity._fit(nodes, w, κs, κL, κR)
+            ∫Q2 = PenalizedDensity._int_quartic(a.x, a.ψ, a.κ, a.κL, a.κR)
+            num = quadgk(t -> a(t)^2, -Inf, first(a.x); rtol=1e-10)[1] +
+                  quadgk(t -> a(t)^2, last(a.x), Inf; rtol=1e-10)[1] +
+                  sum(quadgk(t -> a(t)^2, a.x[k], a.x[k+1]; rtol=1e-10)[1] for k in 1:length(a.x)-1)
+            @test ∫Q2 ≈ num rtol=1e-8
+
+            # The first-order leave-one-out densities match brute-force refitting, which drops
+            # the node and re-realizes the scale on the reduced node set. Tolerances as in the
+            # constant-κ scores above: KLCV's log weights the tail nodes, where the expansion is
+            # least accurate, as heavily as the bulk.
+            loo = map(eachindex(nodes)) do i
+                keep = [j for j in eachindex(nodes) if j != i]
+                n2, w2 = nodes[keep], w[keep]
+                κs2, κL2, κR2 = PenalizedDensity._kappa_profile(n2, κfun, Float64)
+                PenalizedDensity._fit(n2, w2, κs2, κL2, κR2)(nodes[i])
+            end
+            @test PenalizedDensity._klcv(nodes, w, κs, κL, κR) ≈
+                  -sum(w .* log.(loo)) / W rtol=2e-2
+            @test PenalizedDensity._lscv(nodes, w, κs, κL, κR) ≈
+                  ∫Q2 - 2 * sum(w .* loo) / W rtol=5e-3
+        end
+
         @testset "a one-node fit has only tails" begin
             a = DensityEstimate([0.3], t -> 0.5 + t)
             @test isempty(a.κ)
