@@ -3,6 +3,8 @@ using OffsetArrays
 using Random, Statistics
 using Random: randn!
 using Test
+using Aqua
+using ExplicitImports
 
 # Trapezoidal integral of a callable over a wide, fine grid.
 function integrate(f, a, b; n=2_000_001)
@@ -432,4 +434,15 @@ end
         @test_throws ArgumentError select_kappa_kl([3.0])                        # need ≥ 2 distinct
         @test_throws "need at least two distinct points to select κ" select_kappa_kl([3.0])
     end
+end
+
+@testset "code quality (Aqua)" begin
+    Aqua.test_all(PenalizedDensity)
+end
+
+@testset "explicit imports" begin
+    @test ExplicitImports.check_no_implicit_imports(PenalizedDensity) === nothing
+    @test ExplicitImports.check_no_stale_explicit_imports(PenalizedDensity) === nothing
+    @test ExplicitImports.check_all_explicit_imports_via_owners(PenalizedDensity) === nothing
+    @test ExplicitImports.check_no_self_qualified_accesses(PenalizedDensity) === nothing
 end

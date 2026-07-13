@@ -1,6 +1,6 @@
 module PenalizedDensity
 
-using LinearAlgebra
+using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, dot, ldiv!, ldlt!, mul!
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
 
