@@ -4,3 +4,4 @@ PenalizedDensity = "a53fa1a1-8a2d-4fe0-8d35-d78a1429f885"
 
 [compat]
 Documenter = "1.17.0"
+PenalizedDensity = "1.0.0"
