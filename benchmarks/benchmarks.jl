@@ -33,13 +33,13 @@ using Random, Statistics, Printf
 const Κ = 3.0      # PenalizedDensity smoothing scale for the runtime comparison
 const H = 0.3      # kernel bandwidth for the runtime comparison (comparable resolution)
 
-pd_fixed(x, grid; rtol = 0.0) = DensityEstimate(x; κ = Κ, rtol).(grid)
+pd_fixed(x, grid; rtol = 0.0) = DensityEstimate(x, Κ; rtol).(grid)
 kd_fixed(x, grid) = pdf(InterpKDE(kde(x; bandwidth = H)), grid)
 sj_fixed(x, grid) = density(x, H, grid)
 ke_fixed(x, grid) = vec(kde!(x, [H])(reshape(collect(grid), 1, :)))
 
 pd_auto(x, grid) = (κ = select_kappa_kl(x; rtol = 1e-3);      # KL cross-validation (see shootout)
-                    DensityEstimate(x; κ, rtol = 1e-3).(grid))
+                    DensityEstimate(x, κ; rtol = 1e-3).(grid))
 kd_auto(x, grid) = pdf(InterpKDE(kde(x)), grid)                 # default (Silverman) bandwidth
 sj_auto(x, grid) = density(x, bwsj(x), grid)                    # Sheather–Jones bandwidth
 ke_auto(x, grid) = vec(kde!(x)(reshape(collect(grid), 1, :)))   # leave-one-out likelihood
@@ -181,14 +181,14 @@ function selector_shootout(; N = 2_000, trials = 25, κscan = range(0.5, 40; len
             x = case.sample(N)
             for (j, (_, sel)) in enumerate(SELECTORS)
                 κ = sel(x)
-                q = DensityEstimate(x; κ, rtol = 1e-3).(gridv)
+                q = DensityEstimate(x, κ; rtol = 1e-3).(gridv)
                 sumκ[j] += κ
                 sumL1[j] += trapz(abs.(q .- ptrue), grid)
                 sumISE[j] += trapz((q .- ptrue) .^ 2, grid)
             end
             bestκ = first(κscan); bestL1 = Inf; bestISE = 0.0
             for κ in κscan
-                q = DensityEstimate(x; κ, rtol = 1e-3).(gridv)
+                q = DensityEstimate(x, κ; rtol = 1e-3).(gridv)
                 L = trapz(abs.(q .- ptrue), grid)
                 L < bestL1 && (bestL1 = L; bestκ = κ; bestISE = trapz((q .- ptrue) .^ 2, grid))
             end

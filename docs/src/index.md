@@ -33,7 +33,7 @@ using PenalizedDensity
 
 x = [-2.1, -0.4, -0.4, 0.3, 1.2, 1.9]     # samples from an unknown distribution
 
-d = DensityEstimate(x; κ = 1.0)  # callable: d(x) is the density Q(x)
+d = DensityEstimate(x, 1.0)  # callable: d(x) is the density Q(x)
 (d(0.0), d(2.0))
 ```
 

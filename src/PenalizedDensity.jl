@@ -10,7 +10,7 @@ export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_
 export cdf, quantile
 
 """
-    DensityEstimate(x::AbstractVector{T}; κ, rtol=cbrt(eps(T)))
+    DensityEstimate(x::AbstractVector{T}, κ; rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -18,13 +18,23 @@ using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
 The density is written as `Q(x) = ψ(x)^2`, where the amplitude `ψ` minimizes the
 action
 
-    S[ψ] = ∫ (ℓ²/2) (ψ')² dx - 2 Σᵢ ln ψ(xᵢ)
+    S[ψ] = ∫ (λ/κ(x)²) (ψ')² dx - 2 Σᵢ ln ψ(xᵢ)
 
-subject to `∫ ψ² dx = 1`. The smoothing scale `κ = √(2λ)/ℓ` (with `λ` the
-normalization multiplier) sets the width of each point's contribution; larger `κ`
-gives a rougher estimate. See [`select_kappa_kl`](@ref) for choosing it automatically
-(the recommended default; [`select_kappa_cv`](@ref), [`select_kappa_ms`](@ref), and
-[`kappa_interval`](@ref) are alternatives).
+subject to `∫ ψ² dx = 1`, with `λ` the normalization multiplier. The smoothing scale
+`κ` sets the width of each point's contribution; larger `κ` gives a rougher estimate.
+See [`select_kappa_kl`](@ref) for choosing it automatically (the recommended default;
+[`select_kappa_cv`](@ref), [`select_kappa_ms`](@ref), and [`kappa_interval`](@ref) are
+alternatives).
+
+`κ` is either a positive number, giving one scale everywhere, or a callable `κ(x)`
+returning the scale local to `x`. A callable is evaluated at the midpoint of each
+inter-node interval, and at the outermost nodes for the two tails, so the fit resolves
+a piecewise-constant scale: `d.κ[k]` is the rate on `(d.x[k], d.x[k+1])`, and `d.κL`,
+`d.κR` the tail rates. Making `κ` large where the density is high and small where it is
+low buys resolution where the data can pay for it. The penalty weight is `1/κ(x)²` on
+`(ψ')²`, which keeps the pressure to normalize spatially uniform; the goodness-of-fit
+machinery ([`chisq_reference`](@ref) and everything built on it) is derived only for a
+constant `κ` and throws on a spatially varying one.
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
@@ -34,49 +44,144 @@ strictly convex potential; normalization is then a rescaling.
 The returned object is callable: `d(x)` evaluates the density `Q(x)` at any real
 `x`, and it can be broadcast over arrays. Use [`amplitude`](@ref) for `ψ(x)`.
 
-Repeated points, and points closer than `rtol / κ` (i.e. within a fraction `rtol` of the
-smoothing length `1 / κ`), are merged into one node carrying the count as its integer
+Repeated points, and points closer than `rtol / κ(x)` (i.e. within a fraction `rtol` of
+the local smoothing length), are merged into one node carrying the count as its integer
 weight, so weighted data is handled naturally. Without merging, the resulting
 tridiagonal system can be nearly singular.
 
+Passing `κ` as a keyword, `DensityEstimate(x; κ)`, is deprecated in favor of the
+positional form.
+
 # Examples
 ```jldoctest
-julia> d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0);
+julia> d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0);
 
 julia> d(0.0) > d(2.0)   # denser near the data
 true
 
 julia> round(chisq(d, d); digits=8)   # a distribution fits itself perfectly
 0.0
+
+julia> a = DensityEstimate([-1.0, 0.0, 0.0, 1.0], x -> 1 + exp(-x^2));  # sharper near 0
+
+julia> a.κ                                # one rate per inter-node interval
+2-element Vector{Float64}:
+ 1.778800783071405
+ 1.778800783071405
 ```
 """
-struct DensityEstimate{T<:AbstractFloat}
+struct DensityEstimate{T<:AbstractFloat,K}
     x::Vector{T}   # sorted, distinct node locations
     w::Vector{T}   # weight (multiplicity) at each node
     ψ::Vector{T}   # normalized amplitude at the nodes
-    κ::T           # smoothing scale
+    κ::K           # smoothing scale: one number, or one per inter-node interval
+    κL::T          # decay rate of the left tail
+    κR::T          # decay rate of the right tail
     λ::T           # normalization multiplier (diagnostic)
+
+    function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, λ) where {T<:AbstractFloat,K}
+        return new{T,K}(x, w, ψ, κ, κL, κR, λ)
+    end
 end
 
-function DensityEstimate(x::AbstractVector{R}; κ::Real, rtol::Real=cbrt(eps(R))) where R<:Real
-    κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
+DensityEstimate{T}(x, w, ψ, κ::Real, κL, κR, λ) where {T} =
+    DensityEstimate{T,T}(x, w, ψ, κ, κL, κR, λ)
+DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, λ) where {T} =
+    DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, λ)
+
+function DensityEstimate(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(R))) where R<:Real
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
+    return _estimate(x, κ, rtol)
+end
+
+function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) where R<:Real
+    κ isa Real || throw(ArgumentError("a callable smoothing scale must be passed positionally: " *
+                                      "`DensityEstimate(x, κ)`"))
+    Base.depwarn("`DensityEstimate(x; κ)` is deprecated, pass the scale positionally as " *
+                 "`DensityEstimate(x, κ)`.", :DensityEstimate)
+    return DensityEstimate(x, κ; rtol)
+end
+
+function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real) where {R<:Real}
+    κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     T = float(promote_type(R, typeof(κ), typeof(rtol)))
     nodes, weights = _merge_sorted(x, T(rtol) / T(κ), T)
     return _fit(nodes, weights, T(κ))
 end
 
-Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, κ=$(d.κ), λ=$(d.λ)")
+# The nodes are not known until the data has been merged, and the merge tolerance is itself
+# rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
+# to. The scale has to arrive as a function of position.
+_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real) =
+    throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
+                        "on the local scale, so the nodes it would index do not exist yet. Pass a " *
+                        "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
 
-# Fit from alreadyMerged distinct nodes and their weights.
+function _estimate(x::AbstractVector{R}, κfun, rtol::Real) where {R<:Real}
+    # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
+    # data point is the only way to see it.
+    T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x)))))
+    nodes, weights = _merge_sorted(x, T(rtol), κfun, T)
+    κs, κL, κR = _kappa_profile(nodes, κfun, T)
+    return _fit(nodes, weights, κs, κL, κR)
+end
+
+# The scale on the interval between nodes k and k+1. Constant and piecewise-constant fits
+# differ only here, so every evaluation routine below is written once and specializes to
+# the constant case at no cost.
+_kappa(d::DensityEstimate{T,T}, k::Integer) where {T} = d.κ
+_kappa(d::DensityEstimate{T,Vector{T}}, k::Integer) where {T} = d.κ[k]
+
+_show_kappa(d::DensityEstimate{T,T}) where {T} = "κ=$(d.κ)"
+function _show_kappa(d::DensityEstimate{T,Vector{T}}) where {T}
+    # A one-node fit has no intervals, only the two tails, so both extrema fold them in.
+    lo = min(d.κL, d.κR, minimum(d.κ; init=typemax(T)))
+    hi = max(d.κL, d.κR, maximum(d.κ; init=typemin(T)))
+    return "κ ∈ [$lo, $hi]"
+end
+Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)")
+
+# Fit from already-merged distinct nodes and their weights.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
     ψ = _solve_amplitude(nodes, weights, κ)
     Z = _norm_sq(nodes, ψ, κ)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
-    return DensityEstimate{T}(nodes, weights, ψ, κ, λ)
+    return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, λ)
 end
+
+# Piecewise-constant scale. The assembled operator carries an arbitrary overall factor κ̄
+# (see `roughness_operator`), which cancels from the normalized amplitude and leaves the
+# multiplier λ = κ̄ Z well defined: the stationarity condition of the unscaled operator is
+# Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the scaling law above.
+function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
+    κ̄ = _reference_scale(κs, κL, κR)
+    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄), weights)
+    Z = _norm_sq(nodes, ψ, κs, κL, κR)
+    ψ ./= sqrt(Z)
+    return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, κ̄ * Z)
+end
+
+# Evaluate a user-supplied scale function, rejecting values a fit cannot use.
+function _checked_kappa(κfun, x, ::Type{T}) where {T}
+    κ = T(κfun(x))
+    isfinite(κ) && κ > 0 ||
+        throw(ArgumentError("the smoothing scale must be finite and positive, got κ($x) = $κ"))
+    return κ
+end
+
+# Realize `κfun` on the node geometry: one rate per inter-node interval (from its
+# midpoint), and one per tail (from the outermost node it decays away from).
+function _kappa_profile(nodes::Vector{T}, κfun, ::Type{T}) where {T}
+    n = length(nodes)
+    κs = T[_checked_kappa(κfun, (nodes[k] + nodes[k+1]) / 2, T) for k in 1:n-1]
+    return κs, _checked_kappa(κfun, first(nodes), T), _checked_kappa(κfun, last(nodes), T)
+end
+
+# Geometric mean of the interval rates: the overall scale the operator is expressed in.
+_reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
+    isempty(κs) ? sqrt(κL * κR) : exp(sum(log, κs) / length(κs))
 
 """
     _merge_sorted(x, atol, T) -> (nodes, weights)
@@ -105,6 +210,27 @@ function _merge_presorted(xs, atol::T) where {T}
     return nodes, weights
 end
 
+_merge_sorted(x::AbstractVector, rtol::T, κfun, ::Type{T}) where {T} =
+    _merge_presorted(sort!(T[xi for xi in x]), rtol, κfun)
+
+# As above, but with a tolerance `rtol / κfun(x)` local to the run's first member: the
+# merge threshold is a fraction `rtol` of the smoothing length there, so no vector of
+# per-node tolerances can be supplied ahead of the merge that produces the nodes.
+function _merge_presorted(xs, rtol::T, κfun) where {T}
+    nodes = T[]
+    weights = T[]
+    for xi in xs
+        xk = T(xi)
+        if !isempty(nodes) && _checked_kappa(κfun, nodes[end], T) * (xk - nodes[end]) <= rtol
+            weights[end] += oneunit(T)
+        else
+            push!(nodes, xk)
+            push!(weights, oneunit(T))
+        end
+    end
+    return nodes, weights
+end
+
 # Tridiagonal operator M (SPD) coupling the nodal amplitudes.
 # Off-diagonal e[k] = -csch(κ hₖ); diagonal d[i] accumulates coth(κ hₖ) from each
 # adjacent interval and +1 from each adjacent tail.
@@ -122,6 +248,35 @@ function roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat}
         e[k]    = -csch(θ)          # coth/csch stay finite as θ → ∞ (isolated points)
     end
     return SymTridiagonal(d, e)     # M
+end
+
+# The same operator for a piecewise-constant scale: interval k (rate κs[k], θ = κs[k]·hₖ)
+# contributes coth(θ)/κs[k] to each adjacent diagonal entry and -csch(θ)/κs[k] off-diagonal,
+# and each tail 1/κ_edge to its own. Dividing through by one κ no longer cancels the entries,
+# so the rates survive explicitly.
+#
+# Everything is scaled by the reference rate κ̄. That factor is arbitrary — it rescales the
+# unnormalized amplitude by κ̄^{-1/2} and drops out of both the normalized fit and λ = κ̄ Z —
+# but it fixes the magnitude the Newton solve sees. Taking κ̄ to be the typical rate keeps the
+# entries O(1), and at a constant κ (where κ̄ = κ) reproduces `roughness_operator(x, κ)` entry
+# for entry.
+function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T) where {T<:AbstractFloat}
+    n = length(x)
+    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
+    length(κs) == n - 1 ||
+        throw(DimensionMismatch("$n nodes bound $(n-1) intervals, but got $(length(κs)) scales"))
+    d = zeros(T, n)
+    e = zeros(T, n - 1)
+    d[1] += κ̄ / κL                  # left tail
+    d[n] += κ̄ / κR                  # right tail
+    for k in 1:n-1
+        θ = κs[k] * (x[k+1] - x[k])
+        u = κ̄ / κs[k]
+        d[k]   += u * coth(θ)
+        d[k+1] += u * coth(θ)
+        e[k]    = -u * csch(θ)      # coth/csch stay finite as θ → ∞ (isolated points)
+    end
+    return SymTridiagonal(d, e)
 end
 
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
@@ -199,6 +354,23 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
         ct, cs = coth(θ), csch(θ)
         # Endpoint and cross contributions of ∫ψ² over the interval, written with
         # coth/csch so they stay finite as θ → ∞ rather than overflowing via sinh.
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+    end
+    return Z
+end
+
+# ∫ ψ² dx for a piecewise-constant scale. The interpolant on interval k and the tail decays
+# are set by the rates themselves, not by the operator's overall factor, so this is the
+# physical mass whatever κ̄ the amplitude was solved in.
+function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
+    n = length(x)
+    Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
+    for k in 1:n-1
+        κ = κs[k]
+        θ = κ * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
         fdiag  = (ct - θ * cs^2) / (2κ)
         fcross = cs * (θ * ct - oneunit(T)) / (2κ)
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
@@ -301,14 +473,15 @@ amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
 amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
 function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
-    xs, ψ, κ = d.x, d.ψ, d.κ
+    xs, ψ = d.x, d.ψ
     n = length(xs)
     if x <= xs[1]
-        return ψ[1] * exp(κ * (x - xs[1]))
+        return ψ[1] * exp(d.κL * (x - xs[1]))
     elseif x >= xs[n]
-        return ψ[n] * exp(-κ * (x - xs[n]))
+        return ψ[n] * exp(-d.κR * (x - xs[n]))
     end
     k = searchsortedlast(xs, x)     # xs[k] <= x < xs[k+1]
+    κ = _kappa(d, k)
     a = κ * (xs[k+1] - x)           # a, b ≥ 0 and a + b = θ
     b = κ * (x - xs[k])
     return ψ[k] * _sinh_ratio(a, a + b) + ψ[k+1] * _sinh_ratio(b, a + b)
@@ -350,11 +523,12 @@ _coshm(v) = 2 * sinh(v / 2)^2
 # For θ < 1 the coth/csch coefficient forms cancel catastrophically (relative error
 # ~eps/θ²); the _sinhm/_coshm forms are algebraically identical and cancellation-free.
 function _node_cdf(d::DensityEstimate{T}) where {T}
-    x, ψ, κ = d.x, d.ψ, d.κ
+    x, ψ = d.x, d.ψ
     n = length(x)
     F = Vector{T}(undef, n)
-    F[1] = ψ[1]^2 / (2κ)                # left tail
+    F[1] = ψ[1]^2 / (2 * d.κL)          # left tail
     for k in 1:n-1
+        κ = _kappa(d, k)
         θ = κ * (x[k+1] - x[k])
         if θ < 1
             s2 = 2 * sinh(θ)^2
@@ -367,18 +541,20 @@ function _node_cdf(d::DensityEstimate{T}) where {T}
         end
         F[k+1] = F[k] + (fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]) / κ
     end
-    return F, F[n] + ψ[n]^2 / (2κ)
+    return F, F[n] + ψ[n]^2 / (2 * d.κR)
 end
 
 # Unnormalized cumulative mass ∫_{-∞}^{x} ψ² dt, given the node cumulatives F. The tails
 # are elementary exponential integrals; interior intervals use _cdf_mass_interior.
 function _cdf_mass(d::DensityEstimate{T}, F::Vector{T}, x::Real) where {T}
-    xs, ψ, κ = d.x, d.ψ, d.κ
+    xs, ψ = d.x, d.ψ
     n = length(xs)
     isnan(x) && return T(NaN) * one(x)
     if x <= xs[1]
+        κ = d.κL
         return ψ[1]^2 / (2κ) * exp(2κ * (x - xs[1]))
     elseif x >= xs[n]
+        κ = d.κR
         return F[n] + ψ[n]^2 / (2κ) * (-expm1(-2κ * (x - xs[n])))
     end
     k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
@@ -390,7 +566,8 @@ end
 # right half — so its absolute error vanishes toward both nodes and the CDF stays
 # continuous and monotone through every node.
 function _cdf_mass_interior(d::DensityEstimate{T}, F::Vector{T}, k::Int, x::Real) where {T}
-    xs, ψ, κ = d.x, d.ψ, d.κ
+    xs, ψ = d.x, d.ψ
+    κ = _kappa(d, k)
     a = κ * (xs[k+1] - x)               # a, b ≥ 0 and a + b = θ
     b = κ * (x - xs[k])
     θ = a + b
@@ -442,7 +619,7 @@ evaluations. See [`quantile`](@ref Statistics.quantile) for the inverse.
 
 # Examples
 ```jldoctest
-julia> d = DensityEstimate([0.0]; κ=0.5);   # a Laplace density centered at 0
+julia> d = DensityEstimate([0.0], 0.5);   # a Laplace density centered at 0
 
 julia> cdf(d, 0.0)
 0.5
@@ -487,12 +664,14 @@ end
 
 function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
     0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
-    xs, ψ, κ = d.x, d.ψ, d.κ
+    xs, ψ = d.x, d.ψ
     n = length(xs)
     target = q * total
     if target <= F[1]                   # left tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}
+        κ = d.κL
         return xs[1] + log(2κ * target / ψ[1]^2) / (2κ)
     elseif target >= F[n]               # right tail, through the complement 1 - q
+        κ = d.κR
         return xs[n] - log(2κ * (total * (1 - q)) / ψ[n]^2) / (2κ)
     end
     k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
@@ -559,10 +738,21 @@ about `1/√2 ≈ 0.7` per degree of freedom.
 For the exact finite-`N` mean, use `expected_chisq(`[`chisq_reference`](@ref)`(d))`.
 """
 function expected_chisq(d::DensityEstimate{T}) where {T}
+    _require_constant_kappa(d)
     N = sum(d.w)
     X = sum(d.w ./ d.ψ.^2) / N          # (1/N) Σ wᵢ / Q_cl(xᵢ),  Q_cl = ψ²
     return d.κ * X / sqrt(T(2))
 end
+
+# The reference law of χ² rests on the fluctuation field's nodal precision G₀⁻¹ = (2λ/κ)M,
+# a Green's-function identity for the constant-coefficient operator: it is not an
+# approximation to the piecewise-constant case, so every route to a χ² significance refuses
+# a varying scale rather than quietly using it. The statistic `chisq` is scale-free and
+# stays available.
+_require_constant_kappa(::DensityEstimate{T,T}) where {T} = nothing
+_require_constant_kappa(::DensityEstimate{T,Vector{T}}) where {T} =
+    throw(ArgumentError("the χ² reference distribution is defined only for a constant smoothing " *
+                        "scale, and this fit has a spatially varying κ"))
 
 # Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
@@ -649,8 +839,13 @@ end
 Assemble the exact reference distribution of [`chisq`](@ref) for the fit `d`, following
 Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
 [`chisq_ccdf`](@ref)/[`chisq_pdf`](@ref)/[`pvalue`](@ref) rather than rebuilding it.
+
+`d` must have been fitted with a constant `κ`: the reference law rests on a
+Green's-function identity for the constant-coefficient fluctuation operator, and a fit
+with a spatially varying `κ` (see [`DensityEstimate`](@ref)) throws rather than borrow it.
 """
 function chisq_reference(d::DensityEstimate{T}) where {T}
+    _require_constant_kappa(d)
     x, ψ, w, κ, λ = d.x, d.ψ, d.w, d.κ, d.λ
     n = length(x)
     # m_k = ∫ ψ_cl(x) G₀(xₖ,x) dx via forward/backward exponential accumulations.

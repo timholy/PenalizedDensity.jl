@@ -26,7 +26,7 @@ using PenalizedDensity
 x = randn(500)                       # samples from an unknown distribution
 κ = select_kappa_kl(x)               # recommended smoothing scale (KL cross-validation);
                                      # select_kappa_cv, select_kappa_ms, kappa_interval also exist
-d = DensityEstimate(x; κ)   # callable: d(x) is the density Q(x)
+d = DensityEstimate(x, κ)   # callable: d(x) is the density Q(x)
 
 d(0.0)                               # density at a point
 pvalue(d, x -> exp(-x^2/2)/√(2π))    # test a model (here a standard normal)

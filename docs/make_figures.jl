@@ -27,8 +27,8 @@ x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 # Fit at the recommended KL cross-validation scale and at the half-entropy scale.
 ki = kappa_interval(x)
 κkl = select_kappa_kl(x)
-d_half = DensityEstimate(x; κ=ki.κ)
-d_kl = DensityEstimate(x; κ=κkl)
+d_half = DensityEstimate(x, ki.κ)
+d_kl = DensityEstimate(x, κkl)
 
 g = range(-4.5, 7.5; length=800)
 fig = Figure(size=(760, 420), fontsize=15)
@@ -50,7 +50,7 @@ save(joinpath(ASSETS, "mixture_example.png"), fig; px_per_unit=2)
 # right axis reads this as h = fraction of the entropy resolved.
 W = N; Hent = log(N)                    # distinct samples ⇒ H = ln N
 κg = exp.(range(log(0.02), log(5000); length=80))
-Svals = [action(DensityEstimate(x; κ)) for κ in κg]
+Svals = [action(DensityEstimate(x, κ)) for κ in κg]
 gvals = Svals .+ W .* log.(κg)
 glo, ghi = W / 2, W / 2 + W * Hent
 
