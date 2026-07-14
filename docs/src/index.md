@@ -14,10 +14,11 @@ using the penalized maximum-likelihood scalar-field method of
 The density is written ``Q(x) = \psi(x)^2``, and the amplitude ``\psi`` maximizes the
 likelihood of the data subject to a smoothness penalty and normalization
 ``\int Q\,dx = 1``. Each data point contributes a peak of width ``\sim 1/\kappa``; the
-single smoothing scale ``\kappa`` trades resolution against smoothness. Sorting the data
-and writing ``\psi`` as rising and falling exponentials between adjacent points reduces
-the estimator to a symmetric tridiagonal problem, solved by a convex Newton iteration in
-``O(N)`` time with normalization imposed by a single rescaling.
+smoothing scale ``\kappa`` trades resolution against smoothness, and may either be a single
+number or vary across the data, ``\kappa(x)``, to resolve an irregular density where a single
+scale cannot. Sorting the data and writing ``\psi`` as rising and falling exponentials between
+adjacent points reduces the estimator to a symmetric tridiagonal problem, solved by a convex
+Newton iteration in ``O(N)`` time with normalization imposed by a single rescaling.
 
 ## Installation
 

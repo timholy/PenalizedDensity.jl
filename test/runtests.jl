@@ -602,6 +602,7 @@ end
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
             @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
+            @test_throws "pilot must return a positive scale" select_kappa_adaptive(chisq1; pilot=_ -> 0.0)
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
