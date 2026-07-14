@@ -33,9 +33,10 @@ inter-node interval, and at the outermost nodes for the two tails, so the fit re
 a piecewise-constant scale: `d.κ[k]` is the rate on `(d.x[k], d.x[k+1])`, and `d.κL`,
 `d.κR` the tail rates. Making `κ` large where the density is high and small where it is
 low buys resolution where the data can pay for it. The penalty weight is `1/κ(x)²` on
-`(ψ')²`, which keeps the pressure to normalize spatially uniform; the goodness-of-fit
-machinery ([`chisq_reference`](@ref) and everything built on it) is derived only for a
-constant `κ` and throws on a spatially varying one.
+`(ψ')²`, which keeps the pressure to normalize spatially uniform. The exact goodness-of-fit
+machinery ([`chisq_reference`](@ref) and everything built on it) supports a varying `κ`;
+only the large-`N` approximation ([`expected_chisq`](@ref)`(d)`, `method=:largeN`) needs a
+constant one, and throws otherwise.
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
@@ -192,6 +193,8 @@ function _kappa_profile(nodes::Vector{T}, κfun, ::Type{T}) where {T}
 end
 
 # Geometric mean of the interval rates: the overall scale the operator is expressed in.
+# A constant κ is its own reference scale.
+_reference_scale(κ::T, ::T, ::T) where {T} = κ
 _reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
     isempty(κs) ? sqrt(κL * κR) : exp(sum(log, κs) / length(κs))
 
@@ -823,9 +826,11 @@ end
 Mean of the reference χ² distribution in the large-`N` limit (Eq. 25),
 `⟨χ²⟩ = κ X / √2`, where `X = (1/N) Σᵢ wᵢ / Q_cl(xᵢ)` estimates the size of the
 region occupied by the data. With `1/κ` read as an effective bin width this is
-about `1/√2 ≈ 0.7` per degree of freedom.
+about `1/√2 ≈ 0.7` per degree of freedom. It requires a constant `κ`, which is the one
+scale this reading admits; a fit with a spatially varying `κ` throws.
 
-For the exact finite-`N` mean, use `expected_chisq(`[`chisq_reference`](@ref)`(d))`.
+For the exact finite-`N` mean, at any scale, use
+`expected_chisq(`[`chisq_reference`](@ref)`(d))`.
 """
 function expected_chisq(d::DensityEstimate{T}) where {T}
     _require_constant_kappa(d)
@@ -834,15 +839,15 @@ function expected_chisq(d::DensityEstimate{T}) where {T}
     return d.κ * X / sqrt(T(2))
 end
 
-# The reference law of χ² rests on the fluctuation field's nodal precision G₀⁻¹ = (2λ/κ)M,
-# a Green's-function identity for the constant-coefficient operator: it is not an
-# approximation to the piecewise-constant case, so every route to a χ² significance refuses
-# a varying scale rather than quietly using it. The statistic `chisq` is scale-free and
-# stays available.
+# ⟨χ²⟩ = κX/√2 reads 1/κ as one effective bin width everywhere, which a varying scale has no
+# single value for: the large-N approximation is refused rather than given an invented κ. The
+# exact finite-N mean, `expected_chisq(chisq_reference(d))`, is available at any scale.
 _require_constant_kappa(::DensityEstimate{T,T}) where {T} = nothing
 _require_constant_kappa(::DensityEstimate{T,Vector{T}}) where {T} =
-    throw(ArgumentError("the χ² reference distribution is defined only for a constant smoothing " *
-                        "scale, and this fit has a spatially varying κ"))
+    throw(ArgumentError("the large-N χ² approximation reads 1/κ as an effective bin width and " *
+                        "is defined only for a constant smoothing scale, but this fit has a " *
+                        "spatially varying κ; the exact reference distribution " *
+                        "(chisq_reference) supports both"))
 
 # Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
@@ -856,13 +861,20 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 # and C the covariance of the field values at the nodes. Equivalently its Laplace
 # transform is det(I + 2a·DC)^{-1/2}, exactly Eq. 18.
 #
-# Everything is tridiagonal. The unconstrained node covariance obeys
-#   C₀⁻¹ = G₀⁻¹ + S,  (G₀)ᵢⱼ = κ e^{-κ|xᵢ-xⱼ|}/(4λ),  S = diag(2wₖ/ψₖ²),
-# and the exponential kernel is Markov, so G₀⁻¹ = (2λ/κ)·M with M the
-# `roughness_operator`. The ∫ψ_cl δψ = 0 constraint contributes one rank-one term,
-# C = C₀ - b bᵀ/Vφ (Eq. 18's T(g) factor). Tail probabilities come from Imhof's
-# inversion, whose integrand needs only det(I + iuA) per node — an O(N)
-# tridiagonal determinant plus a rank-one correction — so no eigenvalues are formed.
+# Everything is tridiagonal. The unconstrained node covariance obeys C₀⁻¹ = G₀⁻¹ + S with
+# S = diag(2wₖ/ψₖ²), and the free part of the precision is L₀ = 2λ𝒜, 𝒜u = -(κ(x)⁻²u′)′ + u,
+# so G₀⁻¹ = 2λ M̂ with M̂ the `roughness_operator` at unit reference scale. That identity is
+# not the Gauss-Markov one: M̂ maps the nodal values of an 𝒜-harmonic interpolant to the
+# jumps of its flux v = κ⁻²ψ′, and a Green's-function column Ĝ(·,xⱼ) is precisely the
+# 𝒜-harmonic field whose only flux jump is a unit one at xⱼ, so M̂ Ĝ|nodes = I. It needs the
+# breakpoints of κ to be the nodes — with a jump strictly inside an interval, Ĝ(·,xⱼ) would
+# not be a single hyperbolic arc there — which is why the fit realizes one rate per interval.
+# At constant κ it reduces to G₀⁻¹ = (2λ/κ)M, with (G₀)ᵢⱼ = κ e^{-κ|xᵢ-xⱼ|}/(4λ).
+#
+# The ∫ψ_cl δψ = 0 constraint contributes one rank-one term, C = C₀ - b bᵀ/Vφ (Eq. 18's T(g)
+# factor). Tail probabilities come from Imhof's inversion, whose integrand needs only
+# det(I + iuA) per node — an O(N) tridiagonal determinant plus a rank-one correction — so no
+# eigenvalues are formed.
 
 """
     ChisqReference
@@ -886,29 +898,88 @@ end
 Base.show(io::IO, r::ChisqReference) =
     print(io, "ChisqReference($(length(r.g)) nodes, ⟨χ²⟩=$(r.mean))")
 
-# ∫ over one interval of the amplitude against a unit exponential decaying toward each
-# endpoint: p̃ = ∫ ψ e^{-κ(x_{k+1}-x)}dx, q̃ = ∫ ψ e^{-κ(x-x_k)}dx. The coth/csch forms
-# stay finite as θ → ∞ (isolated points); expm1 keeps S1 accurate as θ → 0.
-function _pq_tilde(ψk::T, ψk1::T, θ::T, κ::T) where {T}
-    cs = csch(θ)
-    S1 = (θ + expm1(-2θ) / 2) / (2κ)                # ∫₀ʰ sinh(κu) e^{-κu} du
-    S2 = (sinh(θ) - θ * exp(-θ)) / (2κ)             # ∫₀ʰ sinh(κ(h-u)) e^{-κu} du
-    return (ψk * S1 + ψk1 * S2) * cs, (ψk * S2 + ψk1 * S1) * cs
+# Coefficients of the per-interval accumulation the Green's-function sweeps run on. Both
+# solutions of 𝒜u = 0 have the form u(s) = u(xₖ)cosh(κₖs) + κₖ v(xₖ)sinh(κₖs) on interval k,
+# v = κ⁻²u′ being the flux, so with ψ the hyperbolic interpolant
+#   e^{-θ}∫₀ʰ u(s)ψ(s)ds = u(xₖ)(ψₖc₁ + ψₖ₊₁c₂) + κₖv(xₖ)(ψₖc₃ + ψₖ₊₁c₄).
+# The e^{-θ} keeps every coefficient bounded as θ → ∞ (isolated points). Below θ = 1 the
+# coth/csch forms of c₃ and c₄ cancel catastrophically (relative error ~eps/θ²); the
+# _sinhm/_coshm forms are algebraically identical and cancellation-free.
+function _sweep_coeffs(κ::T, h::T) where {T}
+    θ = κ * h
+    e = exp(-θ); t = e * e; m = -expm1(-2θ)         # e^{-θ}, e^{-2θ}, 1 - e^{-2θ}
+    c₁ = θ * e / (2κ)
+    c₂ = m / (4κ)
+    if θ < 1
+        sh = m / (2e)                               # sinh θ
+        c₃ = e * (θ * _coshm(θ) - _sinhm(θ)) / (2κ * sh)
+        c₄ = e * _sinhm(2θ) / (4κ * sh)
+    else
+        c₃ = e * (θ * (1 + t) / m - 1) / (2κ)       # e^{-θ}(θ coth θ - 1)/(2κ)
+        c₄ = ((1 + t) / 2 - 2θ * t / m) / (2κ)      # e^{-θ}(cosh θ - θ csch θ)/(2κ)
+    end
+    return c₁, c₂, c₃, c₄
 end
 
-# A = (κ²/2λ) ∫ α² dx, α = L₀⁻¹ψ_cl with α(xₖ)=ãₖ; closed-form per interval plus tails.
-function _constraint_A(x, ψ, ã, κ::T, λ) where {T}
+# α = L₀⁻¹ψ_cl at the nodes, mᵢ = α(xᵢ). With u∓ the solutions of 𝒜u = 0 decaying at ∓∞ and
+# C = v₋u₊ - u₋v₊ their flux Wronskian (constant, by Abel), Ĝ(x,y) = u₋(x∧y)u₊(x∨y)/C, so
+#   α(x) = [u₊(x)∫_{-∞}^x u₋ψ_cl + u₋(x)∫_x^∞ u₊ψ_cl] / (2λC).
+# Each tail fixes one solution: u₋ = e^{κL(x-x₁)} to the left of x₁ (normalized to 1 there,
+# whence v₋ = u₋/κL), and its mirror to the right. Since u∓ grow like e^{±∫κ}, they are
+# propagated — along with their accumulations — scaled by e^{∓∫κ}, which is what keeps the
+# recursions bounded; the scale factors cancel identically in α, so it is assembled from the
+# scaled quantities alone.
+function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T) where {T}
     n = length(x)
-    acc = ψ[1]^2 / (8κ^3)                                        # left tail
-    acc += ã[n]^2 / (2κ) + ã[n] * ψ[n] / (2κ^2) + ψ[n]^2 / (4κ^3) # right tail
+    û₋ = similar(ψ); v̂₋ = similar(ψ); Â = similar(ψ)   # u₋, v₋, ∫_{-∞}^x u₋ψ_cl
+    û₊ = similar(ψ); v̂₊ = similar(ψ); B̂ = similar(ψ)   # u₊, -v₊, ∫_x^∞ u₊ψ_cl
+    û₋[1] = one(T); v̂₋[1] = inv(κL); Â[1] = ψ[1] / (2κL)
     for k in 1:n-1
-        h = x[k+1] - x[k]; θ = κ * h
-        D = ψ[k+1] * csch(θ) - ψ[k] * coth(θ)
-        Ak = (ψ[k] + D) / 2; Bk = (ψ[k] - D) / 2; ãk = ã[k]
-        α(s) = exp(-κ*s) * ãk + Ak * sinh(κ*s) / κ + Bk * s * exp(-κ*s)
-        acc += quadgk(s -> α(s)^2, zero(h), h; rtol = sqrt(eps(T)))[1]
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
+        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2      # e^{-θ}cosh θ, e^{-θ}sinh θ
+        Â[k+1] = e * Â[k] + û₋[k] * (ψ[k] * c₁ + ψ[k+1] * c₂) +
+                            κk * v̂₋[k] * (ψ[k] * c₃ + ψ[k+1] * c₄)
+        û₋[k+1] = û₋[k] * ch + κk * v̂₋[k] * sh
+        v̂₋[k+1] = û₋[k] * sh / κk + v̂₋[k] * ch
     end
-    return (κ^2 / (2λ)) * acc
+    û₊[n] = one(T); v̂₊[n] = inv(κR); B̂[n] = ψ[n] / (2κR)
+    for k in n-1:-1:1
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
+        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2
+        B̂[k] = e * B̂[k+1] + û₊[k+1] * (ψ[k+1] * c₁ + ψ[k] * c₂) +
+                            κk * v̂₊[k+1] * (ψ[k+1] * c₃ + ψ[k] * c₄)
+        û₊[k] = û₊[k+1] * ch + κk * v̂₊[k+1] * sh
+        v̂₊[k] = û₊[k+1] * sh / κk + v̂₊[k+1] * ch
+    end
+    Ĉ = û₊[1] / κL + v̂₊[1]              # the Wronskian, in the scaled variables
+    return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
+end
+
+# ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α. On each interval α solves 𝒜α = ψ_cl/(2λ) at constant κ against a
+# hyperbolic source, so it is the interpolant of its own nodal values mₖ plus the resonant
+# particular solution s·cosh(κs) that the source forces; the tails are the same computation
+# with ψ_cl ∝ e^{∓κ(x-x_edge)}, where α acquires the same resonant factor.
+function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T) where {T}
+    n = length(x)
+    acc = ψ[1] * m[1] / (2κL) + ψ[1]^2 / (16λ * κL) +
+          ψ[n] * m[n] / (2κR) + ψ[n]^2 / (16λ * κR)
+    for k in 1:n-1
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        f = κk / (4λ)
+        β = f * h * _cosh_ratio(θ, θ)               # (κ h coth θ)/(4λ)
+        a₁ = m[k] + β * ψ[k]; a₂ = m[k+1] + β * ψ[k+1]
+        function ψα(s)
+            r = h - s
+            pr = _sinh_ratio(κk * r, θ); ps = _sinh_ratio(κk * s, θ)
+            α = a₁ * pr + a₂ * ps -
+                f * (ψ[k] * r * _cosh_ratio(κk * r, θ) + ψ[k+1] * s * _cosh_ratio(κk * s, θ))
+            return (ψ[k] * pr + ψ[k+1] * ps) * α
+        end
+        acc += quadgk(ψα, zero(h), h; rtol = sqrt(eps(T)))[1]
+    end
+    return acc
 end
 
 # Diagonal of the inverse of a symmetric tridiagonal, O(N), from its top-down and
@@ -930,36 +1001,25 @@ Assemble the exact reference distribution of [`chisq`](@ref) for the fit `d`, fo
 Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
 [`chisq_ccdf`](@ref)/[`chisq_pdf`](@ref)/[`pvalue`](@ref) rather than rebuilding it.
 
-`d` must have been fitted with a constant `κ`: the reference law rests on a
-Green's-function identity for the constant-coefficient fluctuation operator, and a fit
-with a spatially varying `κ` (see [`DensityEstimate`](@ref)) throws rather than borrow it.
+A spatially varying `κ` (see [`DensityEstimate`](@ref)) is supported: the nodal precision of
+the fluctuation field is `2λ` times the same tridiagonal operator the fit assembles, whatever
+the scale, so the law stays exact and `O(N)`.
 """
 function chisq_reference(d::DensityEstimate{T}) where {T}
-    _require_constant_kappa(d)
-    x, ψ, w, κ, λ = d.x, d.ψ, d.w, d.κ, d.λ
+    x, ψ, w, λ = d.x, d.ψ, d.w, d.λ
+    κ, κL, κR = d.κ, d.κL, d.κR
     n = length(x)
-    # m_k = ∫ ψ_cl(x) G₀(xₖ,x) dx via forward/backward exponential accumulations.
-    ã = similar(ψ); b̃ = similar(ψ)
-    ã[1] = ψ[1] / (2κ)
-    for k in 1:n-1
-        θ = κ * (x[k+1] - x[k])
-        p, _ = _pq_tilde(ψ[k], ψ[k+1], θ, κ)
-        ã[k+1] = exp(-θ) * ã[k] + p
-    end
-    b̃[n] = ψ[n] / (2κ)
-    for k in n-1:-1:1
-        θ = κ * (x[k+1] - x[k])
-        _, q = _pq_tilde(ψ[k], ψ[k+1], θ, κ)
-        b̃[k] = q + exp(-θ) * b̃[k+1]
-    end
-    m = (κ / (4λ)) .* (ã .+ b̃)
-    # C₀⁻¹ = (2λ/κ) M + diag(2 wᵢ/ψᵢ²);  b = (I + G₀S)⁻¹ m solves C₀⁻¹ b = G₀⁻¹ m.
-    M = roughness_operator(x, κ)
-    C0inv = SymTridiagonal((2λ/κ) .* M.dv .+ 2 .* w ./ ψ.^2, (2λ/κ) .* M.ev)
-    b = C0inv \ ((2λ/κ) .* (M * m))
-    Vφ = _constraint_A(x, ψ, ã, κ, λ) - sum(m .* (2 .* w ./ ψ.^2) .* b)   # Var(∫ψ_cl δψ)
+    m = _node_alpha(x, ψ, κ, κL, κR, λ)                # mₖ = ∫ψ_cl(x) G₀(xₖ,x) dx
+    # C₀⁻¹ = G₀⁻¹ + S = 2λM̂ + diag(2wᵢ/ψᵢ²);  b = (I + G₀S)⁻¹m solves C₀⁻¹b = G₀⁻¹m. The
+    # assembly carries the reference scale κ̄, which G₀⁻¹ = 2λM̂ does not admit: divide it out.
+    M = _operator(x, κ, κL, κR)
+    f = 2λ / _reference_scale(κ, κL, κR)
+    S = 2 .* w ./ ψ.^2
+    C0inv = SymTridiagonal(f .* M.dv .+ S, f .* M.ev)
+    b = C0inv \ (f .* (M * m))
+    Vφ = _int_psi_alpha(x, ψ, m, κ, κL, κR, λ) - sum(m .* S .* b)         # Var(∫ψ_cl δψ)
     # Reduced tridiagonal tri = D^{-1/2} C₀⁻¹ D^{-1/2} and rank-one direction g.
-    D = 4 .* w ./ ψ.^2; sq = sqrt.(D)
+    D = 2 .* S; sq = sqrt.(D)                          # D = 4wᵢ/ψᵢ²
     tri = SymTridiagonal(C0inv.dv ./ D, C0inv.ev ./ (sq[1:n-1] .* sq[2:n]))
     g = sq .* b ./ sqrt(Vφ)
     return ChisqReference{T}(tri, g, _tridiag_invdiag(tri) - sum(abs2, g))
@@ -1009,6 +1069,7 @@ chisq_ccdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
     _dispatch_chisq(chisq_ccdf, _chisq_ccdf_largeN, d, z, method)
 
 function _chisq_ccdf_largeN(d::DensityEstimate{T}, z::Real) where {T}
+    _require_constant_kappa(d)      # ahead of the z ≤ 0 shortcut, which would answer anyway
     zT = T(z)
     zT > 0 || return one(T)
     μ = expected_chisq(d)
@@ -1047,6 +1108,7 @@ chisq_pdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
     _dispatch_chisq(chisq_pdf, _chisq_pdf_largeN, d, z, method)
 
 function _chisq_pdf_largeN(d::DensityEstimate{T}, z::Real) where {T}
+    _require_constant_kappa(d)      # ahead of the z ≤ 0 shortcut, which would answer anyway
     zT = T(z)
     zT > 0 || return zero(T)
     μ = expected_chisq(d)

@@ -1,4 +1,5 @@
 using PenalizedDensity
+using LinearAlgebra: SymTridiagonal
 using OffsetArrays
 using QuadGK: quadgk
 using Random, Statistics
@@ -15,19 +16,33 @@ function integrate(f, a, b; n=2_000_001)
 end
 
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
-# field δψ from the constrained Gaussian on a fine grid and evaluate χ²(δψ). This is the
-# ground truth the exact reference distribution must reproduce. Returns the χ² samples.
+# field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
+# exact reference distribution must reproduce, at a constant or a varying scale alike.
+#
+# The field's precision is L = 2λ𝒜 + 2Σ(wᵢ/ψᵢ²)δ(x-xᵢ), 𝒜u = -(κ(x)⁻²u′)′ + u, discretized
+# conservatively: each cell of the grid contributes (2λ/κ²)(Δδψ)²/h to the gradient energy
+# and 2λ·h to the mass. The grid contains every node, so κ is single-valued on each cell and
+# the point sources land on grid points exactly. Nothing here shares an assembly, a Green's
+# function, or a recursion with the package. Returns the χ² samples.
 function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
-    κ, λ = d.κ, d.λ; ℓ2 = 2λ / κ^2
-    xlo = first(d.x) - pad / κ; xhi = last(d.x) + pad / κ
-    m = ceil(Int, (xhi - xlo) / ((1 / κ) / per_len)) + 1
-    y = range(xlo, xhi; length=m); δ = step(y)
-    ψc = amplitude(d, collect(y))
-    nearest(xi) = (i = searchsortedfirst(y, xi); i == 1 ? 1 : i > m ? m : (xi - y[i-1] < y[i] - xi ? i - 1 : i))
-    gid = nearest.(d.x)
-    p = fill(2λ * δ, m); q = fill(-ℓ2 / δ, m - 1)
-    p[1] += ℓ2 / δ; p[m] += ℓ2 / δ; for j in 2:m-1; p[j] += 2ℓ2 / δ; end
-    for (gi, s) in zip(gid, 2 .* d.w ./ d.ψ.^2); p[gi] += s; end
+    x, ψ, λ = d.x, d.ψ, d.λ
+    κ(k) = k == 0 ? d.κL : k > length(d.x) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
+    bnds = vcat(first(x) - pad / d.κL, x, last(x) + pad / d.κR)
+    y = Float64[]
+    for k in 1:length(bnds)-1                       # ≈ per_len points per local length 1/κ
+        npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per_len))
+        append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+    end
+    push!(y, last(bnds)); m = length(y); δ = diff(y)
+    ψc = amplitude(d, y)
+    gid = [searchsortedfirst(y, xi) for xi in x]
+    cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+    mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+    p = 2λ .* mass; q = zeros(m - 1)
+    for j in 1:m-1
+        c = 2λ / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+    end
+    for (gi, s) in zip(gid, 2 .* d.w ./ ψ.^2); p[gi] += s; end
     # Cholesky P = RᵀR of the tridiagonal precision, R upper-bidiagonal (c diag, b super).
     c = similar(p); b = similar(q); c[1] = sqrt(p[1])
     for j in 2:m; b[j-1] = q[j-1] / c[j-1]; c[j] = sqrt(p[j] - b[j-1]^2); end
@@ -35,16 +50,28 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     solveP!(v, a) = (u = similar(a); u[1] = a[1] / c[1];
         for j in 2:m; u[j] = (a[j] - b[j-1] * u[j-1]) / c[j]; end;
         v[m] = u[m] / c[m]; for j in m-1:-1:1; v[j] = (u[j] - b[j] * v[j+1]) / c[j]; end; v)
-    v = solveP!(similar(ψc), ψc); aPa = sum(ψc .* v)     # for the ∫ψ_cl δψ = 0 constraint
+    mψ = mass .* ψc                                  # the ∫ψ_cl δψ = 0 constraint
+    v = solveP!(similar(ψc), mψ); aPa = sum(mψ .* v)
     rng = MersenneTwister(seed)
-    z = similar(ψc); ξ = similar(ψc); h = similar(ψc); iψ2 = d.w ./ d.ψ.^2
+    z = similar(ψc); ξ = similar(ψc); h = similar(ψc); iψ2 = d.w ./ ψ.^2
     chis = Vector{Float64}(undef, nsamp)
     for s in 1:nsamp
         randn!(rng, ξ); solveR!(z, ξ)
-        proj = sum(ψc .* z) / aPa; @. h = z - proj * v
+        proj = sum(mψ .* z) / aPa; @. h = z - proj * v
         chis[s] = 4 * sum(iψ2[k] * h[gid[k]]^2 for k in eachindex(gid))
     end
     return chis
+end
+
+# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale (it needs only
+# Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1). A wrong nodal precision or a wrong α breaks it.
+function green_identity(d)
+    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ)
+    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR)
+    f = 2d.λ / PenalizedDensity._reference_scale(d.κ, d.κL, d.κR)
+    S = 2 .* d.w ./ d.ψ.^2
+    b = SymTridiagonal(f .* M.dv .+ S, f .* M.ev) \ (f .* (M * m))
+    return 4 * sum(d.w .* b ./ d.ψ)
 end
 
 @testset "PenalizedDensity.jl" begin
@@ -482,16 +509,18 @@ end
             @test cdf(a, Inf) == 1
         end
 
-        @testset "the χ² machinery refuses a varying scale" begin
+        @testset "only the large-N χ² approximation refuses a varying scale" begin
             a = DensityEstimate(x, t -> 2.0 * exp(-t))
             msg = "defined only for a constant smoothing scale"
-            @test_throws msg chisq_reference(a)
-            @test_throws msg expected_chisq(a)
-            @test_throws msg chisq_ccdf(a, 1.0)
-            @test_throws msg chisq_pdf(a, 1.0)
-            @test_throws msg pvalue(a, a)
+            @test_throws msg expected_chisq(a)                       # ⟨χ²⟩ = κX/√2 (Eq. 25)
             @test_throws msg chisq_ccdf(a, 1.0; method=:largeN)
+            @test_throws msg chisq_pdf(a, 1.0; method=:largeN)
+            @test_throws msg pvalue(a, a; method=:largeN)
             @test chisq(a, a) == 0            # the statistic itself is scale-free
+            # The exact finite-N law is defined at any scale, and carries the mean.
+            @test chisq_reference(a) isa ChisqReference
+            @test expected_chisq(chisq_reference(a)) > 0
+            @test 0 ≤ pvalue(a, a) ≤ 1
         end
 
         @testset "input validation" begin
@@ -672,6 +701,77 @@ end
         # Generic indexing: OffsetArray input gives an identical reference.
         ro = chisq_reference(DensityEstimate(OffsetArray(x, -75), d.κ))
         @test ro.tri.dv ≈ r.tri.dv && ro.g ≈ r.g && expected_chisq(ro) ≈ μ
+
+        # Green's identity, the reference's internal consistency check.
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "goodness of fit: exact reference at a varying scale" begin
+        # A constant callable takes the piecewise path and lands on the scalar path's answer.
+        xg = randn(Xoshiro(11), 500)
+        κ = select_kappa_kl(xg)
+        rs = chisq_reference(DensityEstimate(xg, κ))
+        rc = chisq_reference(DensityEstimate(xg, t -> κ))
+        @test rc.tri.dv ≈ rs.tri.dv rtol = 1e-10
+        @test rc.g ≈ rs.g rtol = 1e-10
+        @test expected_chisq(rc) ≈ expected_chisq(rs) rtol = 1e-10
+        @test chisq_ccdf(rc, expected_chisq(rc)) ≈ chisq_ccdf(rs, expected_chisq(rs)) rtol = 1e-10
+
+        # The decisive test: the exact law reproduces a direct Monte-Carlo of the fluctuation
+        # field. A hard-edge family under the plug-in selector, whose realized rates span five
+        # orders of magnitude — every quantity the reference is built from is propagated in
+        # scaled form precisely so this does not overflow.
+        xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
+        da = DensityEstimate(xa, select_kappa_adaptive(xa))
+        @test maximum(da.κ) / minimum(da.κ) > 1e4
+        ra = chisq_reference(da)
+        chis = fieldmc_chisq(da; nsamp=40_000, seed=3)
+        @test expected_chisq(ra) ≈ mean(chis) rtol = 0.02
+        for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
+            @test chisq_ccdf(ra, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(da) ≈ 1 rtol = 1e-5
+
+        # And a smooth family at small N, under a hand-chosen scale.
+        xs = sort!(randn(Xoshiro(2), 60))
+        ds = DensityEstimate(xs, t -> 2exp(-t / 2))
+        rsm = chisq_reference(ds)
+        chs = fieldmc_chisq(ds; nsamp=40_000, seed=3)
+        @test expected_chisq(rsm) ≈ mean(chs) rtol = 0.02
+        for z in quantile(chs, (0.3, 0.9, 0.99))
+            @test chisq_ccdf(rsm, z) ≈ mean(>(z), chs) atol = 0.012
+        end
+        @test green_identity(ds) ≈ 1 rtol = 1e-5
+
+        # ∬ψ_cl G₀ ψ_cl and the nodal α agree with a conservative finite-difference solve of
+        # 𝒜α = ψ_cl/(2λ) on a node-aligned grid: an independent route, with no Green's
+        # function in it. It converges to the closed forms at the discretization's O(δ²).
+        errs = map((100, 400)) do per
+            x, ψ, λ = ds.x, ds.ψ, ds.λ
+            κ(k) = k == 0 ? ds.κL : k > length(x) - 1 ? ds.κR : PenalizedDensity._kappa(ds.κ, k)
+            bnds = vcat(first(x) - 15 / ds.κL, x, last(x) + 15 / ds.κR)
+            y = Float64[]
+            for k in 1:length(bnds)-1
+                npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per))
+                append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+            end
+            push!(y, last(bnds)); m = length(y); δ = diff(y)
+            cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+            mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+            p = copy(mass); q = zeros(m - 1)
+            for j in 1:m-1
+                c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+            end
+            ψy = amplitude(ds, y)
+            αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
+            mfd = [αfd[searchsortedfirst(y, xi)] for xi in x]
+            mex = PenalizedDensity._node_alpha(x, ψ, ds.κ, ds.κL, ds.κR, λ)
+            (maximum(abs.(mex .- mfd) ./ abs.(mfd)),
+             abs(PenalizedDensity._int_psi_alpha(x, ψ, mex, ds.κ, ds.κL, ds.κR, λ) -
+                 sum(mass .* ψy .* αfd)) / sum(mass .* ψy .* αfd))
+        end
+        @test all(<(2e-4), errs[1]) && all(<(2e-5), errs[2])   # and 16× finer ⇒ 16× closer
+        @test all(first(errs) ./ last(errs) .> 10)
     end
 
     @testset "kappa_interval: principled range" begin
