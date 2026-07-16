@@ -27,8 +27,8 @@ x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 # Fit at the recommended KL cross-validation scale and at the half-entropy scale.
 ki = kappa_interval(x)
 κkl = select_kappa_kl(x)
-d_half = DensityEstimate(x; κ=ki.κ)
-d_kl = DensityEstimate(x; κ=κkl)
+d_half = DensityEstimate(x, ki.κ)
+d_kl = DensityEstimate(x, κkl)
 
 g = range(-4.5, 7.5; length=800)
 fig = Figure(size=(760, 420), fontsize=15)
@@ -50,7 +50,7 @@ save(joinpath(ASSETS, "mixture_example.png"), fig; px_per_unit=2)
 # right axis reads this as h = fraction of the entropy resolved.
 W = N; Hent = log(N)                    # distinct samples ⇒ H = ln N
 κg = exp.(range(log(0.02), log(5000); length=80))
-Svals = [action(DensityEstimate(x; κ)) for κ in κg]
+Svals = [action(DensityEstimate(x, κ)) for κ in κg]
 gvals = Svals .+ W .* log.(κg)
 glo, ghi = W / 2, W / 2 + W * Hent
 
@@ -75,3 +75,40 @@ hidespines!(axr); hidexdecorations!(axr)
 xlims!(axr, κg[1], κg[end]); ylims!(axr, -0.06, 1.06)
 
 save(joinpath(ASSETS, "action_entropy.png"), fig2; px_per_unit=2)
+
+# --- Third figure: a varying κ against a divergent edge --------------------------
+# χ²₁ diverges as x^(-1/2) at the origin. No single κ can both resolve that edge and
+# stay quiet in the tail; a scale that follows the density does both.
+Random.seed!(7)
+z = randn(4000) .^ 2
+chisq1pdf(x) = x <= 0 ? NaN : exp(-x / 2) / sqrt(2π * x)
+
+κconst = select_kappa_kl(z)
+κadapt = select_kappa_adaptive(z)
+d_const = DensityEstimate(z, κconst)
+d_adapt = DensityEstimate(z, κadapt)
+
+gz = exp.(range(log(3e-5), log(3.0); length=900))
+fig3 = Figure(size=(880, 400), fontsize=15)
+
+# Log-log: the x^(-1/2) divergence is a straight line, so it is immediately visible how
+# far into the edge each fit tracks it before rolling over.
+ax = Axis(fig3[1, 1]; xscale=log10, yscale=log10, xlabel="x", ylabel="probability density",
+          title="χ²₁: tracking a divergent edge")
+lines!(ax, gz, chisq1pdf.(gz); color=:black, linestyle=:dash, linewidth=2, label="true density")
+lines!(ax, gz, d_const.(gz); color=:steelblue, linewidth=2.5,
+       label="constant κ = $(round(Int, κconst))")
+lines!(ax, gz, d_adapt.(gz); color=:crimson, linewidth=2.5, label="varying κ(x)")
+axislegend(ax; position=:lb, framevisible=false)
+xlims!(ax, 3e-5, 3); ylims!(ax, 0.1, 100)
+
+# The selected scale, against the density it follows.
+axk = Axis(fig3[1, 2]; yscale=log10, xlabel="x", ylabel="selected scale  κ(x)",
+           title="κ(x): fine at the edge, coarse in the tail")
+mids = [(d_adapt.x[k] + d_adapt.x[k+1]) / 2 for k in 1:length(d_adapt.κ)]
+lines!(axk, mids, d_adapt.κ; color=:crimson, linewidth=2.5, label="varying κ(x)")
+hlines!(axk, κconst; color=:steelblue, linestyle=:dash, linewidth=2, label="constant κ")
+axislegend(axk; position=:rt, framevisible=false)
+xlims!(axk, 0, 6); ylims!(axk, 1, 2000)
+
+save(joinpath(ASSETS, "adaptive_kappa.png"), fig3; px_per_unit=2)

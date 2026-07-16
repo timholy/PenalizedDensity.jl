@@ -1,4 +1,5 @@
 using PenalizedDensity
+using LinearAlgebra: SymTridiagonal, ZeroPivotException
 using OffsetArrays
 using QuadGK: quadgk
 using Random, Statistics
@@ -6,6 +7,14 @@ using Random: randn!
 using Test
 using Aqua
 using ExplicitImports
+
+# Bytes allocated by one `_logΦ!` sweep, measured behind a function barrier: called with
+# untyped arguments the sweep's `Tuple{Float64,Float64}` return is boxed at the call site,
+# which would be charged to the callee. The first call compiles.
+function sweep_allocated(piv, rhs, r, u)
+    PenalizedDensity._logΦ!(piv, rhs, r, u)
+    return @allocated PenalizedDensity._logΦ!(piv, rhs, r, u)
+end
 
 # Trapezoidal integral of a callable over a wide, fine grid.
 function integrate(f, a, b; n=2_000_001)
@@ -15,19 +24,33 @@ function integrate(f, a, b; n=2_000_001)
 end
 
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
-# field δψ from the constrained Gaussian on a fine grid and evaluate χ²(δψ). This is the
-# ground truth the exact reference distribution must reproduce. Returns the χ² samples.
+# field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
+# exact reference distribution must reproduce, at a constant or a varying scale alike.
+#
+# The field's precision is L = 2λ𝒜 + 2Σ(wᵢ/ψᵢ²)δ(x-xᵢ), 𝒜u = -(κ(x)⁻²u′)′ + u, discretized
+# conservatively: each cell of the grid contributes (2λ/κ²)(Δδψ)²/h to the gradient energy
+# and 2λ·h to the mass. The grid contains every node, so κ is single-valued on each cell and
+# the point sources land on grid points exactly. Nothing here shares an assembly, a Green's
+# function, or a recursion with the package. Returns the χ² samples.
 function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
-    κ, λ = d.κ, d.λ; ℓ2 = 2λ / κ^2
-    xlo = first(d.x) - pad / κ; xhi = last(d.x) + pad / κ
-    m = ceil(Int, (xhi - xlo) / ((1 / κ) / per_len)) + 1
-    y = range(xlo, xhi; length=m); δ = step(y)
-    ψc = amplitude(d, collect(y))
-    nearest(xi) = (i = searchsortedfirst(y, xi); i == 1 ? 1 : i > m ? m : (xi - y[i-1] < y[i] - xi ? i - 1 : i))
-    gid = nearest.(d.x)
-    p = fill(2λ * δ, m); q = fill(-ℓ2 / δ, m - 1)
-    p[1] += ℓ2 / δ; p[m] += ℓ2 / δ; for j in 2:m-1; p[j] += 2ℓ2 / δ; end
-    for (gi, s) in zip(gid, 2 .* d.w ./ d.ψ.^2); p[gi] += s; end
+    x, ψ, λ = d.x, d.ψ, d.λ
+    κ(k) = k == 0 ? d.κL : k > length(d.x) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
+    bnds = vcat(first(x) - pad / d.κL, x, last(x) + pad / d.κR)
+    y = Float64[]
+    for k in 1:length(bnds)-1                       # ≈ per_len points per local length 1/κ
+        npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per_len))
+        append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+    end
+    push!(y, last(bnds)); m = length(y); δ = diff(y)
+    ψc = amplitude(d, y)
+    gid = [searchsortedfirst(y, xi) for xi in x]
+    cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+    mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+    p = 2λ .* mass; q = zeros(m - 1)
+    for j in 1:m-1
+        c = 2λ / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+    end
+    for (gi, s) in zip(gid, 2 .* d.w ./ ψ.^2); p[gi] += s; end
     # Cholesky P = RᵀR of the tridiagonal precision, R upper-bidiagonal (c diag, b super).
     c = similar(p); b = similar(q); c[1] = sqrt(p[1])
     for j in 2:m; b[j-1] = q[j-1] / c[j-1]; c[j] = sqrt(p[j] - b[j-1]^2); end
@@ -35,22 +58,34 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     solveP!(v, a) = (u = similar(a); u[1] = a[1] / c[1];
         for j in 2:m; u[j] = (a[j] - b[j-1] * u[j-1]) / c[j]; end;
         v[m] = u[m] / c[m]; for j in m-1:-1:1; v[j] = (u[j] - b[j] * v[j+1]) / c[j]; end; v)
-    v = solveP!(similar(ψc), ψc); aPa = sum(ψc .* v)     # for the ∫ψ_cl δψ = 0 constraint
+    mψ = mass .* ψc                                  # the ∫ψ_cl δψ = 0 constraint
+    v = solveP!(similar(ψc), mψ); aPa = sum(mψ .* v)
     rng = MersenneTwister(seed)
-    z = similar(ψc); ξ = similar(ψc); h = similar(ψc); iψ2 = d.w ./ d.ψ.^2
+    z = similar(ψc); ξ = similar(ψc); h = similar(ψc); iψ2 = d.w ./ ψ.^2
     chis = Vector{Float64}(undef, nsamp)
     for s in 1:nsamp
         randn!(rng, ξ); solveR!(z, ξ)
-        proj = sum(ψc .* z) / aPa; @. h = z - proj * v
+        proj = sum(mψ .* z) / aPa; @. h = z - proj * v
         chis[s] = 4 * sum(iψ2[k] * h[gid[k]]^2 for k in eachindex(gid))
     end
     return chis
 end
 
+# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale (it needs only
+# Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1). A wrong nodal precision or a wrong α breaks it.
+function green_identity(d)
+    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ)
+    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR)
+    f = 2d.λ / PenalizedDensity._reference_scale(d.κ, d.κL, d.κR)
+    S = 2 .* d.w ./ d.ψ.^2
+    b = SymTridiagonal(f .* M.dv .+ S, f .* M.ev) \ (f .* (M * m))
+    return 4 * sum(d.w .* b ./ d.ψ)
+end
+
 @testset "PenalizedDensity.jl" begin
     @testset "single point is a Laplace density" begin
         κ = 1.5
-        d = DensityEstimate([2.0]; κ)
+        d = DensityEstimate([2.0], κ)
         @test d.ψ[1] ≈ sqrt(κ)
         @test d(2.0) ≈ κ                       # Q(x₀) = κ
         @test d(3.0) ≈ κ * exp(-2κ)            # Q(x) = κ e^{-2κ|x-x₀|}
@@ -59,7 +94,7 @@ end
     end
 
     @testset "normalization, shape, and `show`" begin
-        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
         @test integrate(d, -30, 30) ≈ 1 atol = 1e-8
         @test d(0.0) > d(2.0)                  # denser near the data
         @test all(≥(0), d.(range(-5, 5; length=101)))   # Q = ψ² ≥ 0
@@ -67,7 +102,7 @@ end
     end
 
     @testset "continuity at the nodes" begin
-        d = DensityEstimate([0.0, 1.3, 2.0, 5.1]; κ=0.7)
+        d = DensityEstimate([0.0, 1.3, 2.0, 5.1], 0.7)
         for xi in d.x
             @test amplitude(d, xi - 1e-9) ≈ amplitude(d, xi + 1e-9) atol = 1e-6
         end
@@ -75,7 +110,7 @@ end
 
     @testset "repeated points equal integer weights" begin
         # Merging identical points must reproduce the weighted problem.
-        d1 = DensityEstimate([0.0, 0.0, 0.0, 4.0]; κ=1.2)
+        d1 = DensityEstimate([0.0, 0.0, 0.0, 4.0], 1.2)
         @test d1.x == [0.0, 4.0]
         @test d1.w == [3.0, 1.0]
         @test integrate(d1, -30, 40) ≈ 1 atol = 1e-8
@@ -84,19 +119,19 @@ end
     end
 
     @testset "rtol merges points within rtol/κ" begin
-        d = DensityEstimate([0.0, 1e-10, 1.0]; κ=1.0, rtol=1e-6)
+        d = DensityEstimate([0.0, 1e-10, 1.0], 1.0; rtol=1e-6)
         @test length(d.x) == 2
         @test d.w == [2.0, 1.0]
         # The threshold is rtol/κ: here 1e-3/2 = 5e-4.
-        @test length(DensityEstimate([0.0, 1e-4, 1.0]; κ=2.0, rtol=1e-3).x) == 2
-        @test length(DensityEstimate([0.0, 1e-3, 1.0]; κ=2.0, rtol=1e-3).x) == 3
+        @test length(DensityEstimate([0.0, 1e-4, 1.0], 2.0; rtol=1e-3).x) == 2
+        @test length(DensityEstimate([0.0, 1e-3, 1.0], 2.0; rtol=1e-3).x) == 3
         # The default rtol > 0 merges points far below the resolution (numerical hygiene).
-        @test length(DensityEstimate([0.0, 1e-9, 1.0]; κ=1.0).x) == 2
+        @test length(DensityEstimate([0.0, 1e-9, 1.0], 1.0).x) == 2
         # Merging points closer than the resolution is lossless.
         Random.seed!(5)
         x = randn(5_000)
-        da = DensityEstimate(x; κ=3.0)
-        db = DensityEstimate(x; κ=3.0, rtol=1e-3)
+        da = DensityEstimate(x, 3.0)
+        db = DensityEstimate(x, 3.0; rtol=1e-3)
         g = range(-4, 4; length=101)
         @test maximum(abs.(da.(g) .- db.(g))) < 1e-3
     end
@@ -108,15 +143,15 @@ end
         # rtol=0 exercises the raw solver without the near-coincident-point merge.
         Random.seed!(4)
         x = randn(20_000)
-        d = DensityEstimate(x; κ=3.0, rtol=0.0)
+        d = DensityEstimate(x, 3.0; rtol=0.0)
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
         # Stationarity of the normalized amplitude: Mψ = (κ/λ) w ./ ψ (Eq. field equation).
         M = PenalizedDensity.roughness_operator(d.x, d.κ)
         resid = M * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
         @test maximum(abs, resid) < 1e-6 * maximum(abs, M * d.ψ)
-        DensityEstimate(x; κ=3.0, rtol=0.0)           # compile before measuring
-        @test (@allocated DensityEstimate(x; κ=3.0, rtol=0.0)) < 40 * length(x) * sizeof(Float64)
+        DensityEstimate(x, 3.0; rtol=0.0)           # compile before measuring
+        @test (@allocated DensityEstimate(x, 3.0; rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
     @testset "scale equivariance" begin
@@ -125,11 +160,11 @@ end
         # so the unnormalized fit and its stopping criterion are invariant under this scaling.
         Random.seed!(11)
         x = randn(2_000)
-        d = DensityEstimate(x; κ=3.0)
+        d = DensityEstimate(x, 3.0)
         xt = range(-3, 3; length=25)
         Q = d.(xt)
         for s in (1e-15, 1e20)
-            ds = DensityEstimate(s .* x; κ=3.0 / s)
+            ds = DensityEstimate(s .* x, 3.0 / s)
             @test maximum(abs.(ds.(s .* xt) .- Q ./ s) ./ (Q ./ s)) < 1e-8
         end
     end
@@ -138,7 +173,7 @@ end
         Random.seed!(1)
         x = randn(400)
         κ = select_kappa_ms(x; κs=exp.(range(log(0.05), log(20); length=40)))
-        d = DensityEstimate(x; κ)
+        d = DensityEstimate(x, κ)
         @test 0.75 < d.λ / length(x) < 1.25    # paper: λ ≈ N
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
         φ(t) = exp(-t^2 / 2) / sqrt(2π)         # recovers a standard normal
@@ -185,7 +220,7 @@ end
 
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
         # near-coincident points (small θ) that defeat a naive csch⁴ form.
-        d = DensityEstimate(x; κ = 4.0)
+        d = DensityEstimate(x, 4.0)
         ∫Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ)
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
@@ -214,7 +249,7 @@ end
         # minimum-sensitivity scale and gives a smaller integrated squared error.
         Q(t) = exp(-t^2 / 2) / sqrt(2π)
         ise(κ0) = (gg = range(-8, 8; length = 6001);
-                   dd = DensityEstimate(x; κ = κ0);
+                   dd = DensityEstimate(x, κ0);
                    step(gg) * sum((dd(t) - Q(t))^2 for t in gg))
         @test κ < select_kappa_ms(x)
         @test ise(κ) < ise(select_kappa_ms(x))
@@ -255,7 +290,7 @@ end
         # scale and gives a smaller Kullback–Leibler divergence to the truth.
         Q(t) = exp(-t^2 / 2) / sqrt(2π)
         kl(κ0) = (gg = range(-8, 8; length = 6001);
-                  dd = DensityEstimate(x; κ = κ0);
+                  dd = DensityEstimate(x, κ0);
                   step(gg) * sum(Q(t) * log(Q(t) / dd(t)) for t in gg))
         @test κ < select_kappa_ms(x)
         @test kl(κ) < kl(select_kappa_ms(x))
@@ -268,7 +303,7 @@ end
     end
 
     @testset "amplitude² == density" begin
-        d = DensityEstimate([-2.0, 0.5, 3.0]; κ=0.9)
+        d = DensityEstimate([-2.0, 0.5, 3.0], 0.9)
         g = range(-4, 5; length=25)
         @test amplitude(d, collect(g)) .^ 2 ≈ d.(g)
     end
@@ -276,7 +311,7 @@ end
     @testset "cdf and quantile" begin
         # Single point: exactly Laplace(x₀, rate 2κ), where cdf and quantile are elementary.
         κ = 1.5; x0 = 2.0
-        d = DensityEstimate([x0]; κ)
+        d = DensityEstimate([x0], κ)
         lap_cdf(x) = x <= x0 ? exp(2κ * (x - x0)) / 2 : 1 - exp(-2κ * (x - x0)) / 2
         lap_q(q) = q <= 1/2 ? x0 + log(2q) / (2κ) : x0 - log(2 * (1 - q)) / (2κ)
         for x in (-3.0, 0.0, 2.0, 2.5, 7.0)
@@ -300,7 +335,7 @@ end
         Random.seed!(21)
         x = randn(60)
         for κ in (0.5, 3.0, 40.0)
-            d = DensityEstimate(x; κ)
+            d = DensityEstimate(x, κ)
             lo, hi = d.x[1], d.x[end]
             for t in range(lo - 8 / κ, hi + 8 / κ; length = 41)
                 ref = quadgk(d, -Inf, filter(<(t), d.x)..., t; rtol = 1e-13)[1]
@@ -330,14 +365,14 @@ end
 
         # An isolated far node (θ = κ·Δx = 240): every branch stays finite and the
         # probability round trip survives the numerically flat valley.
-        di = DensityEstimate([0.0, 1.0, 2.0, 50.0]; κ = 5.0)
+        di = DensityEstimate([0.0, 1.0, 2.0, 50.0], 5.0)
         @test all(isfinite, quantile(di, collect(0.001:0.001:0.999)))
         for q in (1e-9, 0.01, 0.3, 0.7, 0.99, 1 - 1e-9)
             @test cdf(di, quantile(di, q)) ≈ q rtol = 1e-12
         end
 
         # Near-coincident nodes (θ ≈ 1e-3, kept unmerged with rtol = 0).
-        dn = DensityEstimate([0.0, 1e-3, 1.0, 2.0]; κ = 1.0, rtol = 0.0)
+        dn = DensityEstimate([0.0, 1e-3, 1.0, 2.0], 1.0; rtol = 0.0)
         for t in range(-2, 4; length = 41)
             ref = quadgk(dn, -Inf, filter(<(t), dn.x)..., t; rtol = 1e-13)[1]
             @test cdf(dn, t) ≈ ref atol = 1e-12
@@ -347,9 +382,9 @@ end
         # values are preserved and quantiles transform affinely.
         Random.seed!(33)
         xa = randn(500)
-        d0 = DensityEstimate(xa; κ = 2.5)
+        d0 = DensityEstimate(xa, 2.5)
         for (s, b) in ((1e-8, 3.0), (1e6, -20.0))
-            ds = DensityEstimate(s .* xa .+ b; κ = 2.5 / s)
+            ds = DensityEstimate(s .* xa .+ b, 2.5 / s)
             for t in range(-3, 3; length = 21)
                 @test cdf(ds, s * t + b) ≈ cdf(d0, t) atol = 1e-7
             end
@@ -359,8 +394,8 @@ end
         end
 
         # Float32 fits give Float32 results that agree with the Float64 fit.
-        d32 = DensityEstimate(Float32[-1, 0, 1]; κ = 1.0f0)
-        d64 = DensityEstimate([-1.0, 0.0, 1.0]; κ = 1.0)
+        d32 = DensityEstimate(Float32[-1, 0, 1], 1.0f0)
+        d64 = DensityEstimate([-1.0, 0.0, 1.0], 1.0)
         @test @inferred(cdf(d32, 0.5f0)) isa Float32
         @test @inferred(quantile(d32, 0.5f0)) isa Float32
         @test cdf(d32, 0.5f0) ≈ cdf(d64, 0.5) atol = 1e-5
@@ -377,15 +412,272 @@ end
 
     @testset "generic indexing: OffsetArray input" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
-        d = DensityEstimate(x; κ=1.1)
-        do_ = DensityEstimate(OffsetArray(x, -3); κ=1.1)   # 0-based-ish axes
+        d = DensityEstimate(x, 1.1)
+        do_ = DensityEstimate(OffsetArray(x, -3), 1.1)   # 0-based-ish axes
         @test do_.x == d.x
         @test do_.ψ ≈ d.ψ
         @test do_(0.7) ≈ d(0.7)
+
+        κfun(t) = 1.1 * (1 + exp(-t^2))
+        a = DensityEstimate(x, κfun)
+        ao = DensityEstimate(OffsetArray(x, -3), κfun)
+        @test ao.x == a.x
+        @test ao.κ == a.κ
+        @test ao.ψ ≈ a.ψ
+        @test ao(0.7) ≈ a(0.7)
+    end
+
+    @testset "adaptive κ: a callable scale" begin
+        x = sort!(randn(Xoshiro(7), 2000) .* 1.5)
+
+        @testset "a constant callable reproduces the scalar fit" begin
+            for κ in (0.5, 5.0, 25.0, 200.0)
+                d = DensityEstimate(x, κ)
+                a = DensityEstimate(x, _ -> κ)
+                @test a.x == d.x && a.w == d.w
+                @test a.κ == fill(κ, length(d.x) - 1)   # one rate per interval
+                @test a.κL == κ && a.κR == κ
+                # Both solve the same convex program, in operators that differ by an overall
+                # factor: they agree to the Newton solver's own convergence floor.
+                @test a.ψ ≈ d.ψ rtol=1e-9
+                @test a.λ ≈ d.λ rtol=1e-9
+                ts = range(-6, 6; length=101)
+                @test a.(ts) ≈ d.(ts) rtol=1e-9
+                @test cdf(a, ts) ≈ cdf(d, ts) rtol=1e-8
+                @test quantile(a, 0.01:0.01:0.99) ≈ quantile(d, 0.01:0.01:0.99) rtol=1e-8
+                @test action(a) ≈ action(d) rtol=1e-8
+            end
+        end
+
+        @testset "the fit follows the requested scale" begin
+            # A scale that varies by two orders of magnitude across the sample.
+            κfun(t) = 2.0 * exp(-t)
+            a = DensityEstimate(x, κfun)
+            n = length(a.x)
+            @test length(a.κ) == n - 1
+            @test a.κ == [κfun((a.x[k] + a.x[k+1]) / 2) for k in 1:n-1]  # interval midpoints
+            @test a.κL == κfun(first(a.x)) && a.κR == κfun(last(a.x))    # tails at the edge nodes
+            @test extrema(a.κ)[2] / extrema(a.κ)[1] > 100
+            # ψ² integrates to 1: exactly through the closed-form cdf, and to quadrature
+            # accuracy against an independent integration.
+            @test cdf(a, -Inf) == 0 && cdf(a, Inf) == 1
+            @test quadgk(a, -Inf, a.x[1], 0.0, a.x[end], Inf; rtol=1e-10)[1] ≈ 1 atol=1e-8
+            @test amplitude(a, 0.3)^2 == a(0.3)
+            # cdf and quantile still invert each other on a varying scale.
+            qs = 0.001:0.017:0.999
+            @test cdf(a, quantile(a, collect(qs))) ≈ qs atol=1e-12
+        end
+
+        @testset "cross-validation on a varying scale" begin
+            xs = sort!(randn(Xoshiro(23), 500))
+            κfun(t) = 3.0 + 2.0 * exp(-t^2 / 2)
+            nodes, w, κs, κL, κR = PenalizedDensity._merge_and_realize(xs, κfun, cbrt(eps(Float64)))
+            W = sum(w)
+
+            # A constant profile scores what the scalar path scores.
+            for κ0 in (1.5, 4.0, 12.0)
+                cn, cw = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)) / κ0)
+                flat = fill(κ0, length(cn) - 1)
+                @test PenalizedDensity._klcv(cn, cw, flat, κ0, κ0) ≈
+                      PenalizedDensity._klcv(cn, cw, κ0) rtol=1e-11
+                @test PenalizedDensity._lscv(cn, cw, flat, κ0, κ0) ≈
+                      PenalizedDensity._lscv(cn, cw, κ0) rtol=1e-11
+            end
+
+            # ∫Q̂², the LSCV roughness term, against quadrature over the segments the varying
+            # scale defines.
+            a = PenalizedDensity._fit(nodes, w, κs, κL, κR)
+            ∫Q2 = PenalizedDensity._int_quartic(a.x, a.ψ, a.κ, a.κL, a.κR)
+            num = quadgk(t -> a(t)^2, -Inf, first(a.x); rtol=1e-10)[1] +
+                  quadgk(t -> a(t)^2, last(a.x), Inf; rtol=1e-10)[1] +
+                  sum(quadgk(t -> a(t)^2, a.x[k], a.x[k+1]; rtol=1e-10)[1] for k in 1:length(a.x)-1)
+            @test ∫Q2 ≈ num rtol=1e-8
+
+            # The first-order leave-one-out densities match brute-force refitting, which drops
+            # the node and re-realizes the scale on the reduced node set. Tolerances as in the
+            # constant-κ scores above: KLCV's log weights the tail nodes, where the expansion is
+            # least accurate, as heavily as the bulk.
+            loo = map(eachindex(nodes)) do i
+                keep = [j for j in eachindex(nodes) if j != i]
+                n2, w2 = nodes[keep], w[keep]
+                κs2, κL2, κR2 = PenalizedDensity._kappa_profile(n2, κfun, Float64)
+                PenalizedDensity._fit(n2, w2, κs2, κL2, κR2)(nodes[i])
+            end
+            @test PenalizedDensity._klcv(nodes, w, κs, κL, κR) ≈
+                  -sum(w .* log.(loo)) / W rtol=2e-2
+            @test PenalizedDensity._lscv(nodes, w, κs, κL, κR) ≈
+                  ∫Q2 - 2 * sum(w .* loo) / W rtol=5e-3
+        end
+
+        @testset "a one-node fit has only tails" begin
+            a = DensityEstimate([0.3], t -> 0.5 + t)
+            @test isempty(a.κ)
+            @test a.κL == a.κR == 0.8
+            @test cdf(a, 0.3) ≈ 0.5           # symmetric Laplace about the single point
+            @test cdf(a, Inf) == 1
+            # `show` reports the range over the tails alone, the intervals being empty.
+            @test occursin("κ ∈ [0.8, 0.8]", sprint(show, a))
+        end
+
+        @testset "`show` reports the range of a varying scale" begin
+            a = DensityEstimate([0.0, 1.0, 2.0], t -> 1 + t)
+            @test occursin("κ ∈ [$(a.κL), $(a.κR)]", sprint(show, a))
+            @test minimum(a.κ) > a.κL && maximum(a.κ) < a.κR   # the tails are the extremes
+        end
+
+        @testset "both χ² methods are defined at a varying scale" begin
+            a = DensityEstimate(x, t -> 2.0 * exp(-t))
+            @test chisq(a, a) == 0            # the statistic itself is scale-free
+            r = chisq_reference(a)
+            @test r isa ChisqReference
+            @test expected_chisq(a) == expected_chisq(r) > 0
+            # :largeN is the Wald shape at the exact mean, so it too works at any scale.
+            @test chisq_ccdf(a, 1.0; method=:largeN) == chisq_ccdf(r, 1.0; method=:largeN)
+            @test 0 ≤ chisq_ccdf(a, 1.0; method=:largeN) ≤ 1
+            @test chisq_pdf(a, 1.0; method=:largeN) ≥ 0
+            @test 0 ≤ pvalue(a, a; method=:largeN) ≤ 1
+            @test 0 ≤ pvalue(a, a) ≤ 1
+            @test_throws "method must be :exact or :largeN" chisq_ccdf(a, 1.0; method=:bogus)
+        end
+
+        @testset "input validation" begin
+            for bad in (t -> -1.0, t -> 0.0, t -> NaN, t -> Inf)
+                @test_throws "smoothing scale must be finite and positive" DensityEstimate(x, bad)
+            end
+            @test_throws "cannot be given as a vector" DensityEstimate(x, fill(2.0, length(x) - 1))
+        end
+    end
+
+    @testset "adaptive κ: the plug-in selector" begin
+        # χ²₁: a divergent edge at 0, the regularity limit a constant scale cannot resolve.
+        chisq1 = sort!(randn(Xoshiro(19), 3000).^2)
+        rtol = cbrt(eps(Float64))
+        klcv_const(x, κ) = PenalizedDensity._klcv(PenalizedDensity._merge_presorted(x, rtol / κ)..., κ)
+        klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol)
+
+        @testset "AdaptiveScale evaluates c·(p̂/ḡ)^α" begin
+            κ0 = select_kappa_kl(chisq1)
+            p = DensityEstimate(chisq1, κ0)
+            k = AdaptiveScale(3.0, 0.5, p)
+            lgbar = mean(log(p(xi)) for xi in chisq1)     # ln of the geometric mean of p̂
+            for t in (0.05, 0.3, 1.0, 2.5, 6.0)
+                @test k(t) ≈ 3.0 * (p(t) / exp(lgbar))^0.5
+            end
+            # Where the scale equals c, the pilot density equals its geometric mean.
+            @test k(chisq1[argmin(abs.(log.(p.(chisq1)) .- lgbar))]) ≈ 3.0 rtol=1e-3
+
+            # The batch path the selector uses must agree with the scalar rule exactly: it
+            # walks the pilot's nodes once instead of searching for each position.
+            ts = sort!(vcat(chisq1[1:50:end], range(1e-4, 9.0; length=97)))
+            @test PenalizedDensity._kappa_sorted(k, ts, Float64) == k.(ts)
+
+            # Far out in the tail the pilot density underflows to zero; the rule floors there
+            # rather than producing a zero (and an infinite) smoothing length.
+            far = last(chisq1) + 1e4
+            @test p(far) == 0
+            @test k(far) == k.κmin == 1e-6 * k.c
+
+            @test sprint(show, k) ==
+                  "AdaptiveScale(c=3.0, α=0.5) over a pilot with $(length(p.x)) nodes"
+        end
+
+        @testset "adaptivity is used only when it wins" begin
+            κ = select_kappa_adaptive(chisq1)
+            @test κ isa AdaptiveScale
+            @test κ.α > 0
+            # The selector's own guarantee: the chosen scale beats the constant one on the
+            # score that chose it.
+            @test klcv_scale(chisq1, κ) < klcv_const(chisq1, select_kappa_kl(chisq1))
+
+            d = DensityEstimate(chisq1, κ)
+            @test length(d.κ) == length(d.x) - 1
+            # The scale follows the density: finest at the divergent edge, coarsest in the tail.
+            @test argmax(d.κ) < length(d.κ) ÷ 10
+            @test extrema(d.κ)[2] / extrema(d.κ)[1] > 100
+            @test cdf(d, Inf) == 1
+
+            # Uniform data has no density contrast to exploit — κ ∝ p̂^α is already constant —
+            # so the α = 0 candidate wins and a plain scalar comes back, keeping the fast path
+            # and the goodness-of-fit machinery.
+            u = sort!(rand(Xoshiro(5), 3000))
+            κu = select_kappa_adaptive(u)
+            @test κu isa Real
+            @test DensityEstimate(u, κu).κ isa Real
+            @test chisq_reference(DensityEstimate(u, κu)) isa ChisqReference
+        end
+
+        @testset "alphas and pilot are honored" begin
+            κ = select_kappa_adaptive(chisq1; alphas=(1.0,))
+            @test κ isa AdaptiveScale && κ.α == 1.0
+            # A pilot hook: any callable returning a positive scale from the sample.
+            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot=select_kappa_ms)
+            @test κms isa AdaptiveScale
+            @test κms.pilot.κ == select_kappa_ms(chisq1)
+            # Offset input is merged and sorted like any other vector.
+            @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
+        end
+
+        @testset "the c search brackets its minimum" begin
+            # Driven by synthetic scores: the searches take the objective as an argument, so
+            # their geometry is testable without a density pathological enough to force it.
+            sel(score, c0) = PenalizedDensity._select_c(score, c0)
+
+            # A minimum already inside the opening bracket is refined in place.
+            @test sel(c -> (log(c) - log(2.0))^2, 2.5) ≈ 2.0 rtol=1e-3
+
+            # One centered on an edge recenters until the minimum falls strictly inside. The
+            # bracket spans ×/÷20, so a target 1e4 away from c0 needs several shifts.
+            @test sel(c -> (log(c) - log(1e4))^2, 1.0) ≈ 1e4 rtol=1e-3
+            @test sel(c -> (log(c) - log(1e-4))^2, 1.0) ≈ 1e-4 rtol=1e-3
+
+            # Non-finite scores are unresolvable candidates, stepped over rather than chosen.
+            # Some of the opening bracket must resolve; masking all of it is the error below.
+            masked(c) = c < 0.5 ? NaN : (log(c) - log(5.0))^2
+            @test sel(masked, 1.0) ≈ 5.0 rtol=1e-3
+
+            # Nothing resolvable anywhere in the opening bracket.
+            @test_throws "no resolvable smoothing scale" sel(_ -> NaN, 1.0)
+            # A score with no interior minimum runs off the bracket until it gives up.
+            @test_throws "kept running off its search bracket" sel(c -> -log(c), 1.0)
+        end
+
+        @testset "an unresolvable candidate scores NaN" begin
+            # A κ profile spanning many orders of magnitude can drive the factorization to an
+            # exact zero pivot. That candidate is unresolvable, not a failure of the search.
+            zero_pivot(args...) = throw(ZeroPivotException(3))
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol))
+            # Any other failure is a bug and must not be swallowed.
+            other(args...) = throw(DomainError(1.0, "something else went wrong"))
+            @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol)
+            # Too few nodes to fit: scored NaN before the scorefun is ever reached.
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, [1.0], _ -> 5.0, rtol))
+        end
+
+        @testset "input validation" begin
+            @test_throws "at least one exponent" select_kappa_adaptive(chisq1; alphas=())
+            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
+            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
+            @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
+            @test_throws "pilot must return a positive scale" select_kappa_adaptive(chisq1; pilot=_ -> 0.0)
+            p = DensityEstimate(chisq1, 10.0)
+            @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
+            @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
+        end
+    end
+
+    @testset "deprecated keyword κ" begin
+        x = [-1.0, 0.0, 0.0, 1.0]
+        d = @test_deprecated DensityEstimate(x; κ=1.0)
+        @test d.ψ == DensityEstimate(x, 1.0).ψ
+        dr = @test_deprecated DensityEstimate(x; κ=1.0, rtol=1e-3)
+        @test dr.ψ == DensityEstimate(x, 1.0; rtol=1e-3).ψ
+        # A callable scale is reachable only through the positional form, so the keyword
+        # never has to grow a second meaning.
+        @test_throws "must be passed positionally" DensityEstimate(x; κ = t -> 1.0)
     end
 
     @testset "goodness of fit: statistic" begin
-        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
         @test chisq(d, d) == 0                 # a distribution vs itself
         @test chisq(d, x -> 0.9 * d(x)) > 0    # a mismatched (here unnormalized) trial
         # matches the defining sum 4 Σ wᵢ (√Q(xᵢ)/ψ_cl(xᵢ) − 1)²
@@ -396,12 +688,10 @@ end
     end
 
     @testset "goodness of fit: large-N (Eq. 26) reference" begin
-        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0]; κ=1.0)
+        d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
+        # :largeN is the Wald inverse-Gaussian(mean μ, shape μ²) at the exact mean μ = tr A.
         μ = expected_chisq(d)
-        @test μ > 0
-        # Eq. 25: ⟨χ²⟩ is 1/√2 per effective bin (κX bins).
-        N = sum(d.w); X = sum(d.w ./ d.ψ.^2) / N
-        @test μ / (d.κ * X) ≈ 1 / sqrt(2)
+        @test μ ≈ expected_chisq(chisq_reference(d)) > 0
         # method=:largeN is the inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
         p = chisq_pdf.(Ref(d), zs; method=:largeN)
@@ -423,7 +713,7 @@ end
 
     @testset "goodness of fit: exact reference distribution" begin
         # A single point: χ² is exactly a scaled χ²₁ (one generalized-χ² weight = the mean).
-        d1 = DensityEstimate([0.7]; κ=1.5); r1 = chisq_reference(d1)
+        d1 = DensityEstimate([0.7], 1.5); r1 = chisq_reference(d1)
         e1 = expected_chisq(r1)
         @test chisq_ccdf(r1, e1) ≈ 0.3173105 rtol = 1e-3       # P(Z² ≥ 1)
         @test chisq_ccdf(r1, 4 * e1) ≈ 0.0455003 rtol = 1e-3   # P(Z² ≥ 4)
@@ -431,16 +721,18 @@ end
 
         # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
         Random.seed!(1)
-        x = randn(150); d = DensityEstimate(x; κ=select_kappa_ms(x))
+        x = randn(150); d = DensityEstimate(x, select_kappa_ms(x))
         r = chisq_reference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=7)
         @test expected_chisq(r) ≈ mean(chis) rtol = 0.02
         for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end
-        # The exact tail differs substantially from the large-N approximation.
-        zt = quantile(chis, 0.99)
-        @test chisq_ccdf(d, zt; method=:largeN) > 1.3 * chisq_ccdf(r, zt)
+        # The Wald shape at the exact mean tracks the exact tail closely.
+        for frac in (0.8, 1.2, 1.6)
+            z = frac * expected_chisq(r)
+            @test chisq_ccdf(d, z; method=:largeN) ≈ chisq_ccdf(r, z) rtol = 0.1
+        end
 
         # ccdf ∈ [0,1] and monotone; pdf ≥ 0, integrates to ~1, and is −d(ccdf)/dz.
         μ = expected_chisq(r)
@@ -463,9 +755,87 @@ end
         @test_throws ArgumentError chisq_pdf(d, 1.0; method=:bogus)
         @test_throws ArgumentError pvalue(d, Q; method=:bogus)
 
+        @test sprint(show, r) == "ChisqReference($(length(r.g)) nodes, ⟨χ²⟩=$(r.mean))"
+
+        # The Imhof integrand sweep is allocation-free given its scratch buffers.
+        @test r.tg ≈ r.tri * r.g
+        piv, rhs = PenalizedDensity._logΦ_scratch(r)
+        @test sweep_allocated(piv, rhs, r, 0.7) == 0
+
         # Generic indexing: OffsetArray input gives an identical reference.
-        ro = chisq_reference(DensityEstimate(OffsetArray(x, -75); κ=d.κ))
+        ro = chisq_reference(DensityEstimate(OffsetArray(x, -75), d.κ))
         @test ro.tri.dv ≈ r.tri.dv && ro.g ≈ r.g && expected_chisq(ro) ≈ μ
+
+        # Green's identity, the reference's internal consistency check.
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "goodness of fit: exact reference at a varying scale" begin
+        # A constant callable takes the piecewise path and lands on the scalar path's answer.
+        xg = randn(Xoshiro(11), 500)
+        κ = select_kappa_kl(xg)
+        rs = chisq_reference(DensityEstimate(xg, κ))
+        rc = chisq_reference(DensityEstimate(xg, t -> κ))
+        @test rc.tri.dv ≈ rs.tri.dv rtol = 1e-10
+        @test rc.g ≈ rs.g rtol = 1e-10
+        @test expected_chisq(rc) ≈ expected_chisq(rs) rtol = 1e-10
+        @test chisq_ccdf(rc, expected_chisq(rc)) ≈ chisq_ccdf(rs, expected_chisq(rs)) rtol = 1e-10
+
+        # The decisive test: the exact law reproduces a direct Monte-Carlo of the fluctuation
+        # field. A hard-edge family under the plug-in selector, whose realized rates span five
+        # orders of magnitude — every quantity the reference is built from is propagated in
+        # scaled form precisely so this does not overflow.
+        xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
+        da = DensityEstimate(xa, select_kappa_adaptive(xa))
+        @test maximum(da.κ) / minimum(da.κ) > 1e4
+        ra = chisq_reference(da)
+        chis = fieldmc_chisq(da; nsamp=40_000, seed=3)
+        @test expected_chisq(ra) ≈ mean(chis) rtol = 0.02
+        for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
+            @test chisq_ccdf(ra, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(da) ≈ 1 rtol = 1e-5
+
+        # And a smooth family at small N, under a hand-chosen scale.
+        xs = sort!(randn(Xoshiro(2), 60))
+        ds = DensityEstimate(xs, t -> 2exp(-t / 2))
+        rsm = chisq_reference(ds)
+        chs = fieldmc_chisq(ds; nsamp=40_000, seed=3)
+        @test expected_chisq(rsm) ≈ mean(chs) rtol = 0.02
+        for z in quantile(chs, (0.3, 0.9, 0.99))
+            @test chisq_ccdf(rsm, z) ≈ mean(>(z), chs) atol = 0.012
+        end
+        @test green_identity(ds) ≈ 1 rtol = 1e-5
+
+        # ∬ψ_cl G₀ ψ_cl and the nodal α agree with a conservative finite-difference solve of
+        # 𝒜α = ψ_cl/(2λ) on a node-aligned grid: an independent route, with no Green's
+        # function in it. It converges to the closed forms at the discretization's O(δ²).
+        errs = map((100, 400)) do per
+            x, ψ, λ = ds.x, ds.ψ, ds.λ
+            κ(k) = k == 0 ? ds.κL : k > length(x) - 1 ? ds.κR : PenalizedDensity._kappa(ds.κ, k)
+            bnds = vcat(first(x) - 15 / ds.κL, x, last(x) + 15 / ds.κR)
+            y = Float64[]
+            for k in 1:length(bnds)-1
+                npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per))
+                append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+            end
+            push!(y, last(bnds)); m = length(y); δ = diff(y)
+            cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+            mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+            p = copy(mass); q = zeros(m - 1)
+            for j in 1:m-1
+                c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+            end
+            ψy = amplitude(ds, y)
+            αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
+            mfd = [αfd[searchsortedfirst(y, xi)] for xi in x]
+            mex = PenalizedDensity._node_alpha(x, ψ, ds.κ, ds.κL, ds.κR, λ)
+            (maximum(abs.(mex .- mfd) ./ abs.(mfd)),
+             abs(PenalizedDensity._int_psi_alpha(x, ψ, mex, ds.κ, ds.κL, ds.κR, λ) -
+                 sum(mass .* ψy .* αfd)) / sum(mass .* ψy .* αfd))
+        end
+        @test all(<(2e-4), errs[1]) && all(<(2e-5), errs[2])   # and 16× finer ⇒ 16× closer
+        @test all(first(errs) ./ last(errs) .> 10)
     end
 
     @testset "kappa_interval: principled range" begin
@@ -484,7 +854,7 @@ end
         # Use widely-separated points so isolation is reached at a moderate κ (avoiding
         # sinh overflow), where H = ln 3 exactly.
         xs = [0.0, 5.0, 10.0]; W3 = 3; H3 = log(3)
-        g(κ) = action(DensityEstimate(xs; κ)) + W3 * log(κ)
+        g(κ) = action(DensityEstimate(xs, κ)) + W3 * log(κ)
         @test g(1e-5) ≈ W3 / 2 rtol = 1e-3            # one lump
         @test g(3.0) ≈ W3 / 2 + W3 * H3 rtol = 1e-4   # three isolated points
         # Repeated points enter through the multiplicity entropy.
@@ -494,7 +864,7 @@ end
     @testset "large κ stays finite (no sinh overflow)" begin
         Random.seed!(3)
         x = randn(300)
-        d = DensityEstimate(x; κ = 5000.0)   # kernels far narrower than spacings
+        d = DensityEstimate(x, 5000.0)   # kernels far narrower than spacings
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test isfinite(d.λ) && d.λ > 0
         @test isfinite(action(d))
@@ -502,14 +872,14 @@ end
     end
 
     @testset "input validation" begin
-        @test_throws ArgumentError DensityEstimate(Float64[]; κ=1.0)
-        @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[]; κ=1.0)
-        @test_throws ArgumentError DensityEstimate([1.0]; κ=0.0)
-        @test_throws "κ must be positive" DensityEstimate([1.0]; κ=0.0)
-        @test_throws ArgumentError DensityEstimate([1.0]; κ=-1.0)
-        @test_throws "κ must be positive" DensityEstimate([1.0]; κ=-1.0)
-        @test_throws ArgumentError DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
-        @test_throws "rtol must be nonnegative" DensityEstimate([1.0]; κ=1.0, rtol=-1.0)
+        @test_throws ArgumentError DensityEstimate(Float64[], 1.0)
+        @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[], 1.0)
+        @test_throws ArgumentError DensityEstimate([1.0], 0.0)
+        @test_throws "κ must be positive" DensityEstimate([1.0], 0.0)
+        @test_throws ArgumentError DensityEstimate([1.0], -1.0)
+        @test_throws "κ must be positive" DensityEstimate([1.0], -1.0)
+        @test_throws ArgumentError DensityEstimate([1.0], 1.0; rtol=-1.0)
+        @test_throws "rtol must be nonnegative" DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws "κs must be sorted and positive" select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
         @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
