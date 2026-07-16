@@ -1,5 +1,5 @@
 using PenalizedDensity
-using LinearAlgebra: SymTridiagonal
+using LinearAlgebra: SymTridiagonal, ZeroPivotException
 using OffsetArrays
 using QuadGK: quadgk
 using Random, Statistics
@@ -515,6 +515,14 @@ end
             @test a.κL == a.κR == 0.8
             @test cdf(a, 0.3) ≈ 0.5           # symmetric Laplace about the single point
             @test cdf(a, Inf) == 1
+            # `show` reports the range over the tails alone, the intervals being empty.
+            @test occursin("κ ∈ [0.8, 0.8]", sprint(show, a))
+        end
+
+        @testset "`show` reports the range of a varying scale" begin
+            a = DensityEstimate([0.0, 1.0, 2.0], t -> 1 + t)
+            @test occursin("κ ∈ [$(a.κL), $(a.κR)]", sprint(show, a))
+            @test minimum(a.κ) > a.κL && maximum(a.κ) < a.κR   # the tails are the extremes
         end
 
         @testset "both χ² methods are defined at a varying scale" begin
@@ -568,6 +576,9 @@ end
             far = last(chisq1) + 1e4
             @test p(far) == 0
             @test k(far) == k.κmin == 1e-6 * k.c
+
+            @test sprint(show, k) ==
+                  "AdaptiveScale(c=3.0, α=0.5) over a pilot with $(length(p.x)) nodes"
         end
 
         @testset "adaptivity is used only when it wins" begin
@@ -604,6 +615,42 @@ end
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
             @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
+        end
+
+        @testset "the c search brackets its minimum" begin
+            # Driven by synthetic scores: the searches take the objective as an argument, so
+            # their geometry is testable without a density pathological enough to force it.
+            sel(score, c0) = PenalizedDensity._select_c(score, c0)
+
+            # A minimum already inside the opening bracket is refined in place.
+            @test sel(c -> (log(c) - log(2.0))^2, 2.5) ≈ 2.0 rtol=1e-3
+
+            # One centered on an edge recenters until the minimum falls strictly inside. The
+            # bracket spans ×/÷20, so a target 1e4 away from c0 needs several shifts.
+            @test sel(c -> (log(c) - log(1e4))^2, 1.0) ≈ 1e4 rtol=1e-3
+            @test sel(c -> (log(c) - log(1e-4))^2, 1.0) ≈ 1e-4 rtol=1e-3
+
+            # Non-finite scores are unresolvable candidates, stepped over rather than chosen.
+            # Some of the opening bracket must resolve; masking all of it is the error below.
+            masked(c) = c < 0.5 ? NaN : (log(c) - log(5.0))^2
+            @test sel(masked, 1.0) ≈ 5.0 rtol=1e-3
+
+            # Nothing resolvable anywhere in the opening bracket.
+            @test_throws "no resolvable smoothing scale" sel(_ -> NaN, 1.0)
+            # A score with no interior minimum runs off the bracket until it gives up.
+            @test_throws "kept running off its search bracket" sel(c -> -log(c), 1.0)
+        end
+
+        @testset "an unresolvable candidate scores NaN" begin
+            # A κ profile spanning many orders of magnitude can drive the factorization to an
+            # exact zero pivot. That candidate is unresolvable, not a failure of the search.
+            zero_pivot(args...) = throw(ZeroPivotException(3))
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol))
+            # Any other failure is a bug and must not be swallowed.
+            other(args...) = throw(DomainError(1.0, "something else went wrong"))
+            @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol)
+            # Too few nodes to fit: scored NaN before the scorefun is ever reached.
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, [1.0], _ -> 5.0, rtol))
         end
 
         @testset "input validation" begin
@@ -707,6 +754,8 @@ end
         @test_throws ArgumentError chisq_ccdf(d, 1.0; method=:bogus)
         @test_throws ArgumentError chisq_pdf(d, 1.0; method=:bogus)
         @test_throws ArgumentError pvalue(d, Q; method=:bogus)
+
+        @test sprint(show, r) == "ChisqReference($(length(r.g)) nodes, ⟨χ²⟩=$(r.mean))"
 
         # The Imhof integrand sweep is allocation-free given its scratch buffers.
         @test r.tg ≈ r.tri * r.g
