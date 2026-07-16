@@ -1475,12 +1475,6 @@ AdaptiveScale{T}(c, α, pilot::D, loggbar, κmin) where {T,D} =
 # (p̂/ḡ)^α there to zero; the floor keeps the assembled operator's coth(θ)/κ entries finite.
 const _KAPPA_FLOOR = 1e-6
 
-"""
-    AdaptiveScale(c, α, pilot::DensityEstimate)
-
-Build the scale from `c`, `α`, and a pilot fit, with `ḡ` the geometric mean of the pilot
-density over the sample the pilot was fitted to.
-"""
 function AdaptiveScale(c::Real, α::Real, pilot::DensityEstimate{T}) where {T}
     α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
     c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
