@@ -82,9 +82,21 @@ struct DensityEstimate{T<:AbstractFloat,K}
     λ::T           # normalization multiplier (diagnostic)
 
     function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, λ) where {T<:AbstractFloat,K}
+        length(x) == length(w) == length(ψ) ||
+            throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
+                                    "got $(length(x)), $(length(w)), $(length(ψ))"))
+        _check_interval_scale(κ, length(x))
         return new{T,K}(x, w, ψ, κ, κL, κR, λ)
     end
 end
+
+# A per-interval scale carries one rate for each of the n-1 gaps between n nodes; a mismatch
+# would leave surplus intervals silently unused rather than error at `d.κ[k]`.
+_check_interval_scale(::Real, n) = nothing
+_check_interval_scale(κ::AbstractVector, n) =
+    length(κ) == n - 1 || throw(DimensionMismatch(
+        "a per-interval scale needs one rate per inter-node interval: " *
+        "got $(length(κ)) rates for $n nodes"))
 
 DensityEstimate{T}(x, w, ψ, κ::Real, κL, κR, λ) where {T} =
     DensityEstimate{T,T}(x, w, ψ, κ, κL, κR, λ)
