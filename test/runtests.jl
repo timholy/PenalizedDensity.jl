@@ -8,6 +8,14 @@ using Test
 using Aqua
 using ExplicitImports
 
+# Bytes allocated by one `_logΦ!` sweep, measured behind a function barrier: called with
+# untyped arguments the sweep's `Tuple{Float64,Float64}` return is boxed at the call site,
+# which would be charged to the callee. The first call compiles.
+function sweep_allocated(piv, rhs, r, u)
+    PenalizedDensity._logΦ!(piv, rhs, r, u)
+    return @allocated PenalizedDensity._logΦ!(piv, rhs, r, u)
+end
+
 # Trapezoidal integral of a callable over a wide, fine grid.
 function integrate(f, a, b; n=2_000_001)
     xs = range(a, b; length=n)
@@ -703,8 +711,7 @@ end
         # The Imhof integrand sweep is allocation-free given its scratch buffers.
         @test r.tg ≈ r.tri * r.g
         piv, rhs = PenalizedDensity._logΦ_scratch(r)
-        PenalizedDensity._logΦ!(piv, rhs, r, 0.7)          # compile
-        @test (@allocated PenalizedDensity._logΦ!(piv, rhs, r, 0.7)) == 0
+        @test sweep_allocated(piv, rhs, r, 0.7) == 0
 
         # Generic indexing: OffsetArray input gives an identical reference.
         ro = chisq_reference(DensityEstimate(OffsetArray(x, -75), d.κ))
