@@ -1322,7 +1322,6 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where 
     looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
     return ψ, looi
 end
-_loo_density(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _loo_density(nodes, w, κ, κ, κ)
 
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
 # estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)².
