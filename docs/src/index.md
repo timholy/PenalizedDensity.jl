@@ -32,9 +32,9 @@ Pkg.add("PenalizedDensity")
 ```@example quickstart
 using PenalizedDensity
 
-x = [-2.1, -0.4, -0.4, 0.3, 1.2, 1.9]     # samples from an unknown distribution
+xs = [-2.1, -0.4, -0.4, 0.3, 1.2, 1.9]     # samples from an unknown distribution
 
-d = DensityEstimate(x, 1.0)  # callable: d(x) is the density Q(x)
+d = DensityEstimate(xs, 1.0)  # d is Q, and callable: d(x) returns the density estimate at x 
 (d(0.0), d(2.0))
 ```
 
