@@ -509,18 +509,19 @@ end
             @test cdf(a, Inf) == 1
         end
 
-        @testset "only the large-N χ² approximation refuses a varying scale" begin
+        @testset "both χ² methods are defined at a varying scale" begin
             a = DensityEstimate(x, t -> 2.0 * exp(-t))
-            msg = "defined only for a constant smoothing scale"
-            @test_throws msg expected_chisq(a)                       # ⟨χ²⟩ = κX/√2 (Eq. 25)
-            @test_throws msg chisq_ccdf(a, 1.0; method=:largeN)
-            @test_throws msg chisq_pdf(a, 1.0; method=:largeN)
-            @test_throws msg pvalue(a, a; method=:largeN)
             @test chisq(a, a) == 0            # the statistic itself is scale-free
-            # The exact finite-N law is defined at any scale, and carries the mean.
-            @test chisq_reference(a) isa ChisqReference
-            @test expected_chisq(chisq_reference(a)) > 0
+            r = chisq_reference(a)
+            @test r isa ChisqReference
+            @test expected_chisq(a) == expected_chisq(r) > 0
+            # :largeN is the Wald shape at the exact mean, so it too works at any scale.
+            @test chisq_ccdf(a, 1.0; method=:largeN) == chisq_ccdf(r, 1.0; method=:largeN)
+            @test 0 ≤ chisq_ccdf(a, 1.0; method=:largeN) ≤ 1
+            @test chisq_pdf(a, 1.0; method=:largeN) ≥ 0
+            @test 0 ≤ pvalue(a, a; method=:largeN) ≤ 1
             @test 0 ≤ pvalue(a, a) ≤ 1
+            @test_throws "method must be :exact or :largeN" chisq_ccdf(a, 1.0; method=:bogus)
         end
 
         @testset "input validation" begin
@@ -633,11 +634,9 @@ end
 
     @testset "goodness of fit: large-N (Eq. 26) reference" begin
         d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
+        # :largeN is the Wald inverse-Gaussian(mean μ, shape μ²) at the exact mean μ = tr A.
         μ = expected_chisq(d)
-        @test μ > 0
-        # Eq. 25: ⟨χ²⟩ is 1/√2 per effective bin (κX bins).
-        N = sum(d.w); X = sum(d.w ./ d.ψ.^2) / N
-        @test μ / (d.κ * X) ≈ 1 / sqrt(2)
+        @test μ ≈ expected_chisq(chisq_reference(d)) > 0
         # method=:largeN is the inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
         p = chisq_pdf.(Ref(d), zs; method=:largeN)
@@ -674,9 +673,11 @@ end
         for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end
-        # The exact tail differs substantially from the large-N approximation.
-        zt = quantile(chis, 0.99)
-        @test chisq_ccdf(d, zt; method=:largeN) > 1.3 * chisq_ccdf(r, zt)
+        # The Wald shape at the exact mean tracks the exact tail closely.
+        for frac in (0.8, 1.2, 1.6)
+            z = frac * expected_chisq(r)
+            @test chisq_ccdf(d, z; method=:largeN) ≈ chisq_ccdf(r, z) rtol = 0.1
+        end
 
         # ccdf ∈ [0,1] and monotone; pdf ≥ 0, integrates to ~1, and is −d(ccdf)/dz.
         μ = expected_chisq(r)
@@ -698,6 +699,12 @@ end
         @test_throws ArgumentError chisq_ccdf(d, 1.0; method=:bogus)
         @test_throws ArgumentError chisq_pdf(d, 1.0; method=:bogus)
         @test_throws ArgumentError pvalue(d, Q; method=:bogus)
+
+        # The Imhof integrand sweep is allocation-free given its scratch buffers.
+        @test r.tg ≈ r.tri * r.g
+        piv, rhs = PenalizedDensity._logΦ_scratch(r)
+        PenalizedDensity._logΦ!(piv, rhs, r, 0.7)          # compile
+        @test (@allocated PenalizedDensity._logΦ!(piv, rhs, r, 0.7)) == 0
 
         # Generic indexing: OffsetArray input gives an identical reference.
         ro = chisq_reference(DensityEstimate(OffsetArray(x, -75), d.κ))
