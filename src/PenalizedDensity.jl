@@ -1772,7 +1772,7 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
 end
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -1808,7 +1808,7 @@ select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_
     _select_by_score(_lscv, x, κs, rtol, support)
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
 minimizing the mean negative leave-one-out log-likelihood
@@ -1964,6 +1964,20 @@ function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T) where {T}
     end
 end
 
+# `_score_kappa` with a fixed natural boundary at `lo`/`hi`, threaded to the 7-arg `scorefun`.
+# A distinct arity from the unbounded 4-arg method above (not a same-arity forwarder), so it
+# cannot collide the way a 5-arg `_klcv`/`_lscv` convenience wrapper would.
+function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T, lo::T, hi::T) where {T}
+    nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
+    length(nodes) >= 2 || return T(NaN)
+    try
+        return scorefun(nodes, w, κs, κL, κR, lo, hi)
+    catch e
+        e isa ZeroPivotException && return T(NaN)
+        rethrow()
+    end
+end
+
 const _CSPAN = 20.0    # the c bracket runs ×/÷ this factor about its center
 const _CGRID = 13      # grid points across it, to bracket the minimum
 const _CITERS = 20     # golden-section refinements: pins ln c to ~1e-4 of the bracket, far
@@ -1991,8 +2005,8 @@ function _select_c(score, c0::T) where {T}
 end
 
 """
-    select_kappa_adaptive(x; alphas=(0.25, 0.5, 0.75, 1.0), pilot=select_kappa_kl, rtol=cbrt(eps(T)))
-        -> κ
+    select_kappa_adaptive(x; alphas=(0.25, 0.5, 0.75, 1.0), pilot=select_kappa_kl, rtol=cbrt(eps(T)),
+        support=(-Inf, Inf)) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
 return it ready to pass to [`DensityEstimate`](@ref).
@@ -2026,6 +2040,18 @@ comparison. They are searched in increasing order, whatever order they are given
 is the node-merging tolerance, as a fraction of the local smoothing length, matching
 [`DensityEstimate`](@ref)'s.
 
+`support = (a, b)` (default `(-Inf, Inf)`) fits the pilot density and cross-validates every
+candidate scale on a finite domain, as [`DensityEstimate`](@ref)'s `support` does; it is a
+fixed hyperparameter of the search, not itself selected, and is held fixed across every
+candidate `α`/`c`. Data outside `[a, b]`, or `a ≥ b`, throws a `DomainError`. Composing this
+selector with a boundary search that chooses `support` (and a constant `κ`) by the same
+cross-validation score is two documented steps, not one entry point: choose the support first,
+then pass it here, then fit `DensityEstimate(x, κ; support)` with the scale this returns.
+Because `support` is fixed throughout the `α` search, composing this way re-runs that search on
+each boundary arm's own domain, so `α` gets to respond to whatever regularity a boundary
+already bought (rather than being reused from an unbounded selection that saw a different
+edge).
+
 # Examples
 ```jldoctest
 julia> x = -log.(1 .- (0.5:999.5) ./ 1000);   # exponential: a jump at the left edge
@@ -2047,24 +2073,33 @@ true
 function select_kappa_adaptive(x::AbstractVector{<:Real};
                                alphas=(0.25, 0.5, 0.75, 1.0),
                                pilot=select_kappa_kl,
-                               rtol::Real=cbrt(eps(float(eltype(x)))))
+                               rtol::Real=cbrt(eps(float(eltype(x)))),
+                               support::Tuple{Real,Real}=(-Inf, Inf))
     isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
     all(>(0), alphas) ||
         throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
                             "(α = 0) is always compared against them"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    T = float(promote_type(eltype(x), eltype(alphas), typeof(rtol)))
+    a, b = support
+    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    T = float(promote_type(eltype(x), eltype(alphas), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
+    slo, shi = T(a), T(b)
+    _check_support(xs, slo, shi)
     r = T(rtol)
 
+    # The pilot hook chooses only a scalar starting scale, so it is called support-oblivious
+    # (any callable returning a positive scale from the sample, including ones with no notion
+    # of a boundary at all); the pilot *density* p̂ below is what actually carries the support.
     κ0 = T(pilot(xs))
     κ0 > 0 || throw(ArgumentError("the pilot must return a positive scale, got $κ0"))
-    p = DensityEstimate(xs, κ0; rtol=r)
+    p = DensityEstimate(xs, κ0; rtol=r, support=(slo, shi))
     loggbar = _log_geomean(p)
 
-    # The constant scale, scored on the same footing as the adaptive candidates.
+    # The constant scale, scored on the same footing as the adaptive candidates. The 7-arg
+    # `_klcv` reduces to the unbounded arithmetic exactly when `slo, shi = -Inf, Inf`.
     best_c, best_α = κ0, zero(T)
-    best_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0)
+    best_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
     isfinite(best_score) || (best_score = typemax(T))
 
     # The exponents are searched in increasing order, each bracket centered on the previous
@@ -2075,8 +2110,8 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     c0 = κ0
     for α in sort!(collect(T, alphas))
         scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
-        c0 = _select_c(c -> _score_kappa(_klcv, xs, scale(c), r), c0)
-        s = _score_kappa(_klcv, xs, scale(c0), r)
+        c0 = _select_c(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0)
+        s = _score_kappa(_klcv, xs, scale(c0), r, slo, shi)
         if isfinite(s) && s < best_score
             best_score, best_c, best_α = s, c0, α
         end

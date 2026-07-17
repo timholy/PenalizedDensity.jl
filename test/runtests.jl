@@ -1242,6 +1242,40 @@ end
     end
 end
 
+@testset "select_kappa_adaptive: fixed support" begin
+    @testset "runs on a bounded domain and composes into a normalized fit" begin
+        # Exponential on its natural support: runs, and the returned scale composes into a
+        # normalized bounded fit.
+        x = -log.(1 .- rand(Xoshiro(70), 500))
+        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test d.lo == 0.0 && d.hi == Inf
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-8)
+        right, Er = quadgk(d, d.x[end], d.x[end] + 60; rtol=1e-8)
+        @test max(El, Ei, Er) < 1e-6
+        @test abs(left + interior + right - 1) < 1e-6
+
+        # Uniform on its true (0, 1) support: the machinery must run and the composed fit must
+        # normalize; which α wins (possibly 0, the boundary already having fixed the edge) is
+        # not asserted.
+        xu = rand(Xoshiro(71), 500)
+        κu = select_kappa_adaptive(xu; support=(0.0, 1.0))
+        @test κu isa Real || κu isa AdaptiveScale
+        du = DensityEstimate(xu, κu; support=(0.0, 1.0))
+        @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
+        mass, _ = quadgk(du, 0.0, 1.0; rtol=1e-8)
+        @test mass ≈ 1 atol=1e-4
+    end
+
+    @testset "input validation" begin
+        @test_throws DomainError select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+        @test_throws "support must satisfy a < b" select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+        @test_throws DomainError select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+        @test_throws "lies outside the support" select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+    end
+end
+
 @testset "code quality (Aqua)" begin
     Aqua.test_all(PenalizedDensity)
 end
