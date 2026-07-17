@@ -1051,6 +1051,35 @@ end
         @test_throws ArgumentError pvalue(d, t -> 1.0)
     end
 
+    @testset "quantile precision near q = 1 (complement inversion)" begin
+        Random.seed!(54)
+        x = sort(rand(200) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 10.0; support=(0.0, 1.0))
+        for q in (1 - 1e-12, 1 - 1e-10, 1 - 1e-8, 1 - 1e-4)
+            y = quantile(d, q)
+            @test cdf(d, y) ≈ q atol = 4 * eps(1.0)
+        end
+    end
+
+    @testset "_boundary_mass_from_node stays cancellation-free as v → u" begin
+        Random.seed!(55)
+        for _ in 1:50
+            κ = exp(6 * rand() - 3)
+            u = exp(8 * rand() - 2)
+            ψ = 1.0 + rand()
+            for ε in (1e-3, 1e-9, 1e-15)
+                v = u * (1 - ε)
+                m = PenalizedDensity._boundary_mass_from_node(ψ, κ, v, u)
+                # Reference from the raw (unstabilized) closed form, in BigFloat so its own
+                # cancellation is below the comparison tolerance.
+                ub, vb, κb, ψb = big(u), big(v), big(κ), big(ψ)
+                mref = Float64(ψb^2 * ((ub - vb) * sech(ub)^2 +
+                                       cosh(ub + vb) * sinh(ub - vb) / cosh(ub)^2) / (2κb))
+                @test m ≈ mref rtol = 1e-12
+            end
+        end
+    end
+
     @testset "AdaptiveScale composition" begin
         x = -log.(1 .- (0.5:999.5) ./ 1000)
         κ = select_kappa_adaptive(x)

@@ -910,12 +910,15 @@ end
 # The complementary piece of `_boundary_mass_from_wall`: ψ̂² integrated from v out to the node
 # (v = u). Written through the identity sinh(2u) - sinh(2v) = 2cosh(u+v)sinh(u-v) so it stays
 # cancellation-free as v → u, unlike computing it as `_tail_mass - _boundary_mass_from_wall`
-# (a difference of two nearly equal quantities there).
+# (a difference of two nearly equal quantities there). Expanding cosh(u+v)sinh(u-v)/cosh(u)² in
+# p = e^{-2u} and δ = u - v ≥ 0 collapses both e^{2(v-u)} - 1 and e^{-2(v+u)} - e^{-4u} to the
+# same factor `nA` = 1 - e^{-2δ}, evaluated through expm1 for a δ of any size (no cancellation
+# as δ → 0, no overflow as u → ∞ — every exponent stays ≤ 0).
 function _boundary_mass_from_node(ψ_node::T, κ::T, v::T, u::T) where {T}
     p = exp(-2u)
-    A = exp(2 * (v - u))
-    B = exp(-2 * (v + u))
-    R = (oneunit(T) - A + B - p^2) / (oneunit(T) + p)^2   # cosh(u+v)sinh(u-v)/cosh(u)²
+    nA = -expm1(-2 * (u - v))              # 1 - exp(-2(u-v)), δ = u - v ≥ 0 keeps this safe
+    q = p * exp(-2v)                       # exp(-2(u+v))
+    R = nA * (oneunit(T) + q) / (oneunit(T) + p)^2   # cosh(u+v)sinh(u-v)/cosh(u)²
     return ψ_node^2 * ((u - v) * _sech2_stable(u) + R) / (2κ)
 end
 
@@ -1079,6 +1082,22 @@ function _invert_cdf_mass(d::DensityEstimate{T}, massfun, lo::T, hi::T, y::T, ta
     error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
 end
 
+# As `_invert_cdf_mass`, but for a `massfun` that *decreases* with y (derivative `-ψ(y)²`) —
+# used on the right boundary segment, where working in the complement `total - target` keeps
+# precision as `q → 1`, mirroring `_right_tail_quantile`'s use of `1 - q`.
+function _invert_cdf_mass_complement(d::DensityEstimate{T}, massfun, lo::T, hi::T, y::T, target::T) where {T}
+    for _ in 1:200
+        r = massfun(y) - target
+        r == 0 && return y
+        r > 0 ? (lo = y) : (hi = y)
+        ynew = y + r / _amplitude(d, y)^2       # Newton: d(massfun)/dy = -ψ²
+        lo < ynew < hi || (ynew = (lo + hi) / 2)
+        ynew == y && return y
+        y = ynew
+    end
+    error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
+end
+
 function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
     0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
     xs, ψ = d.x, d.ψ
@@ -1093,8 +1112,9 @@ function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where
         return _invert_cdf_mass(d, y -> _cdf_mass(d, F, y), d.lo, xs[1], y, target)
     elseif target >= F[n]
         isfinite(d.hi) || return _right_tail_quantile(ψ[n], d.κR, xs[n], total, q)
-        y = total > F[n] ? d.hi - ((total - target) / (total - F[n])) * (d.hi - xs[n]) : d.hi
-        return _invert_cdf_mass(d, y -> _cdf_mass(d, F, y), xs[n], d.hi, y, target)
+        ctarget = (1 - q) * total           # = total - target, precise as q → 1
+        y = total > F[n] ? d.hi - (ctarget / (total - F[n])) * (d.hi - xs[n]) : d.hi
+        return _invert_cdf_mass_complement(d, y -> total - _cdf_mass(d, F, y), xs[n], d.hi, y, ctarget)
     end
     k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
     lok, hik = xs[k], xs[k+1]
