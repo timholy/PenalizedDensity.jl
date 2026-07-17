@@ -11,7 +11,7 @@ export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_
 export cdf, quantile
 
 """
-    DensityEstimate(x::AbstractVector{T}, κ; rtol=cbrt(eps(T)))
+    DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -51,6 +51,18 @@ the local smoothing length), are merged into one node carrying the count as its 
 weight, so weighted data is handled naturally. Without merging, the resulting
 tridiagonal system can be nearly singular.
 
+`support = (a, b)` fits the density on a finite domain instead of all of `ℝ`; either end may be
+`-Inf`/`Inf` for a one-sided or fully unbounded fit (the default). At a finite endpoint the
+density is left free rather than pinned to zero (a natural, or Neumann, boundary condition:
+`ψ'(a) = 0`) — the wall changes only the outermost interval on that side, replacing its
+exponential tail with a `cosh` arc pinned flat at the wall, so a discontinuous or divergent edge
+(a "jump edge") is representable directly rather than approximated by a fast-decaying tail. `Q`
+is exactly zero outside `[a, b]`, [`cdf`](@ref) reaches exactly `0` at `a` and `1` at `b`, and
+every data point must lie in `[a, b]` (checked at fit time; a violation, or `a ≥ b`, throws a
+`DomainError`). The goodness-of-fit machinery ([`chisq_reference`](@ref) and everything built on
+it) is not yet supported on a finite support and throws there; a plain (unbounded) fit is
+unaffected.
+
 Passing `κ` as a keyword, `DensityEstimate(x; κ)`, is deprecated in favor of the
 positional form.
 
@@ -70,6 +82,14 @@ julia> a.κ                                # one rate per inter-node interval
 2-element Vector{Float64}:
  1.778800783071405
  1.778800783071405
+
+julia> u = DensityEstimate(range(0.05, 0.95; length=50), 10.0; support=(0.0, 1.0));
+
+julia> u(-0.1), u(1.1)              # zero outside the support
+(0.0, 0.0)
+
+julia> cdf(u, 0.0), cdf(u, 1.0)     # cdf hits 0 and 1 exactly at the walls
+(0.0, 1.0)
 ```
 """
 struct DensityEstimate{T<:AbstractFloat,K}
@@ -79,14 +99,16 @@ struct DensityEstimate{T<:AbstractFloat,K}
     κ::K           # smoothing scale: one number, or one per inter-node interval
     κL::T          # decay rate of the left tail
     κR::T          # decay rate of the right tail
+    lo::T          # left edge of the support; -Inf for an unbounded left tail
+    hi::T          # right edge of the support; +Inf for an unbounded right tail
     λ::T           # normalization multiplier (diagnostic)
 
-    function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, λ) where {T<:AbstractFloat,K}
+    function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ) where {T<:AbstractFloat,K}
         length(x) == length(w) == length(ψ) ||
             throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
                                     "got $(length(x)), $(length(w)), $(length(ψ))"))
         _check_interval_scale(κ, length(x))
-        return new{T,K}(x, w, ψ, κ, κL, κR, λ)
+        return new{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ)
     end
 end
 
@@ -98,15 +120,18 @@ _check_interval_scale(κ::AbstractVector, n) =
         "a per-interval scale needs one rate per inter-node interval: " *
         "got $(length(κ)) rates for $n nodes"))
 
-DensityEstimate{T}(x, w, ψ, κ::Real, κL, κR, λ) where {T} =
-    DensityEstimate{T,T}(x, w, ψ, κ, κL, κR, λ)
-DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, λ) where {T} =
-    DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, λ)
+DensityEstimate{T}(x, w, ψ, κ::Real, κL, κR, lo, hi, λ) where {T} =
+    DensityEstimate{T,T}(x, w, ψ, κ, κL, κR, lo, hi, λ)
+DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T} =
+    DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 
-function DensityEstimate(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(R))) where R<:Real
+function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
+                         rtol::Real=cbrt(eps(R))) where R<:Real
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
-    return _estimate(x, κ, rtol)
+    lo, hi = support
+    lo < hi || throw(DomainError((lo, hi), "support must satisfy a < b, got support=($lo, $hi)"))
+    return _estimate(x, κ, rtol, lo, hi)
 end
 
 function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) where R<:Real
@@ -117,26 +142,48 @@ function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) wher
     return DensityEstimate(x, κ; rtol)
 end
 
-function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real) where {R<:Real}
+# Every data point must lie in the requested support, or the boundary terms below (a cosh arc
+# pinned at the wall) would be fit against data outside their own domain.
+function _check_support(xs::Vector{T}, lo::T, hi::T) where {T}
+    first(xs) >= lo ||
+        throw(DomainError(first(xs), "data point $(first(xs)) lies outside the support [$lo, $hi]"))
+    last(xs) <= hi ||
+        throw(DomainError(last(xs), "data point $(last(xs)) lies outside the support [$lo, $hi]"))
+end
+
+# A finite bound competes in the working-type promotion the same way κ or rtol does; an
+# infinite one is exactly representable in any AbstractFloat, so the default `support=(-Inf,
+# Inf)` (always `Float64`-typed, being a literal) must not force a wider type onto, say, a
+# Float32 fit. `Bool` is the promotion lattice's bottom numeric type, so it drops out here.
+_support_eltype(a) = isfinite(a) ? typeof(a) : Bool
+
+function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real) where {R<:Real}
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
-    T = float(promote_type(R, typeof(κ), typeof(rtol)))
-    nodes, weights = _merge_presorted(_sorted_sample(x, T), T(rtol) / T(κ))
-    return _fit(nodes, weights, T(κ))
+    T = float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
+    xs = _sorted_sample(x, T)
+    lo, hi = T(a), T(b)
+    _check_support(xs, lo, hi)
+    nodes, weights = _merge_presorted(xs, T(rtol) / T(κ))
+    return _fit(nodes, weights, T(κ), lo, hi)
 end
 
 # The nodes are not known until the data has been merged, and the merge tolerance is itself
 # rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
 # to. The scale has to arrive as a function of position.
-_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real) =
+_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real) =
     throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
                         "on the local scale, so the nodes it would index do not exist yet. Pass a " *
                         "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
 
-function _estimate(x::AbstractVector{R}, κfun, rtol::Real) where {R<:Real}
+function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) where {R<:Real}
     # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
     # data point is the only way to see it.
-    T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x)))))
-    return _fit(_merge_and_realize(_sorted_sample(x, T), κfun, T(rtol))...)
+    T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x))), _support_eltype(a), _support_eltype(b)))
+    xs = _sorted_sample(x, T)
+    lo, hi = T(a), T(b)
+    _check_support(xs, lo, hi)
+    nodes, weights, κs, κL, κR = _merge_and_realize(xs, κfun, T(rtol))
+    return _fit(nodes, weights, κs, κL, κR, lo, hi)
 end
 
 # The scale on the interval between nodes k and k+1. Constant and piecewise-constant fits
@@ -158,27 +205,59 @@ function _show_kappa(d::DensityEstimate{T,Vector{T}}) where {T}
     hi = max(d.κL, d.κR, maximum(d.κ; init=typemin(T)))
     return "κ ∈ [$lo, $hi]"
 end
-Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)")
 
-# Fit from already-merged distinct nodes and their weights.
+# "" when unbounded, else the support explicitly — appended after λ so a plain `show` of an
+# unbounded fit is untouched.
+_show_support(d::DensityEstimate) =
+    isinf(d.lo) && isinf(d.hi) ? "" : ", support=[$(d.lo), $(d.hi)]"
+Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)$(_show_support(d))")
+
+# Fit from already-merged distinct nodes and their weights, unbounded on both sides. Kept
+# as its own entry point (rather than always routing through the boundary-aware `_fit` below)
+# so callers that only ever need the unbounded fit — `select_kappa_ms`, `kappa_interval` — run
+# the exact arithmetic this function has always used.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
     ψ = _solve_amplitude(nodes, weights, κ)
     Z = _norm_sq(nodes, ψ, κ)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
-    return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, λ)
+    return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, T(-Inf), T(Inf), λ)
 end
 
-# Piecewise-constant scale. The assembled operator carries an arbitrary overall factor κ̄
-# (see `roughness_operator`), which cancels from the normalized amplitude and leaves the
-# multiplier λ = κ̄ Z well defined: the stationarity condition of the unscaled operator is
-# Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the scaling law above.
+# Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite). At
+# `lo, hi = -Inf, Inf` this defers to the unbounded `_fit` above, so a default-support caller
+# takes the identical code path and gets identical arithmetic, not merely a close approximation.
+function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _fit(nodes, weights, κ)
+    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights)
+    Z = _norm_sq(nodes, ψ, κ, lo, hi)
+    ψ ./= sqrt(Z)
+    λ = κ * Z
+    return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, lo, hi, λ)
+end
+
+# Piecewise-constant scale, unbounded on both sides. The assembled operator carries an
+# arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from the normalized
+# amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity condition of the
+# unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the scaling law
+# `_fit(nodes, weights, κ)` above uses.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
     κ̄ = _reference_scale(κs, κL, κR)
     ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄), weights)
     Z = _norm_sq(nodes, ψ, κs, κL, κR)
     ψ ./= sqrt(Z)
-    return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, κ̄ * Z)
+    return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, T(-Inf), T(Inf), κ̄ * Z)
+end
+
+# Piecewise-constant scale with an optional natural boundary, deferring to the unbounded
+# piecewise `_fit` above when both `lo` and `hi` are infinite.
+function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _fit(nodes, weights, κs, κL, κR)
+    κ̄ = _reference_scale(κs, κL, κR)
+    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights)
+    Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
+    ψ ./= sqrt(Z)
+    return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
 end
 
 # Reject scale values a fit cannot use.
@@ -294,6 +373,50 @@ function roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat}
     return SymTridiagonal(d, e)     # M
 end
 
+# tanh(u), overflow-free through e^{-2u} (accurate and finite up to u ≈ 1e300, well past where
+# cosh/sinh alone would overflow around u ≈ 710).
+_tanh_stable(u::T) where {T} = (e = exp(-2u); (oneunit(T) - e) / (oneunit(T) + e))
+
+# sech(u)² = 1/cosh(u)², overflow-free through e^{-2u}.
+_sech2_stable(u::T) where {T} = (e = exp(-2u); 4 * e / (oneunit(T) + e)^2)
+
+# u·sech(u)², the companion term in the boundary tail mass below.
+_usech2_stable(u::T) where {T} = u * _sech2_stable(u)
+
+# Tail diagonal contribution to the roughness operator at a boundary gap Δ = |edge - boundary|:
+# tanh(κΔ) for a natural (Neumann) boundary, or 1 in the unbounded limit Δ = ∞. Both forms agree
+# as Δ → ∞ (tanh → 1); the branch only avoids evaluating tanh at an infinite argument.
+_tail_diag(κ::T, Δ::T) where {T} = isfinite(Δ) ? _tanh_stable(κ * Δ) : oneunit(T)
+
+# Tail mass ∫ψ² over a boundary segment of gap Δ: ψ₁²(tanh u + u·sech²u)/(2κ) at u = κΔ finite,
+# or the unbounded ψ₁²/(2κ) as Δ → ∞ (both terms of the finite form → 0 and 1 respectively).
+function _tail_mass(ψ1::T, κ::T, Δ::T) where {T}
+    isfinite(Δ) || return ψ1^2 / (2κ)
+    u = κ * Δ
+    return ψ1^2 * (_tanh_stable(u) + _usech2_stable(u)) / (2κ)
+end
+
+# `roughness_operator` with an optional natural (Neumann) boundary at `lo`/`hi`: the tail
+# diagonal entries `1` become `tanh(κΔ)` at each finite gap Δ. Defers to the unbounded
+# `roughness_operator(x, κ)` above when both are infinite, so a default-support fit takes the
+# identical code path.
+function roughness_operator(x::Vector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
+    isinf(lo) && isinf(hi) && return roughness_operator(x, κ)
+    n = length(x)
+    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
+    d = zeros(T, n)
+    e = zeros(T, n - 1)
+    d[1] += _tail_diag(κ, x[1] - lo)
+    d[n] += _tail_diag(κ, hi - x[n])
+    for k in 1:n-1
+        θ = κ * (x[k+1] - x[k])
+        d[k]   += coth(θ)
+        d[k+1] += coth(θ)
+        e[k]    = -csch(θ)
+    end
+    return SymTridiagonal(d, e)
+end
+
 # The same operator for a piecewise-constant scale: interval k (rate κs[k], θ = κs[k]·hₖ)
 # contributes coth(θ)/κs[k] to each adjacent diagonal entry and -csch(θ)/κs[k] off-diagonal,
 # and each tail 1/κ_edge to its own. Dividing through by one κ no longer cancels the entries,
@@ -319,6 +442,29 @@ function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::
         d[k]   += u * coth(θ)
         d[k+1] += u * coth(θ)
         e[k]    = -u * csch(θ)      # coth/csch stay finite as θ → ∞ (isolated points)
+    end
+    return SymTridiagonal(d, e)
+end
+
+# The piecewise operator with an optional natural boundary: the tail entry `κ̄/κ_edge` becomes
+# `κ̄·tanh(κ_edge Δ)/κ_edge` at a finite gap. Defers to the unbounded piecewise operator above
+# when both `lo` and `hi` are infinite.
+function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
+    isinf(lo) && isinf(hi) && return roughness_operator(x, κs, κL, κR, κ̄)
+    n = length(x)
+    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
+    length(κs) == n - 1 ||
+        throw(DimensionMismatch("$n nodes bound $(n-1) intervals, but got $(length(κs)) scales"))
+    d = zeros(T, n)
+    e = zeros(T, n - 1)
+    d[1] += κ̄ * _tail_diag(κL, x[1] - lo) / κL
+    d[n] += κ̄ * _tail_diag(κR, hi - x[n]) / κR
+    for k in 1:n-1
+        θ = κs[k] * (x[k+1] - x[k])
+        u = κ̄ / κs[k]
+        d[k]   += u * coth(θ)
+        d[k+1] += u * coth(θ)
+        e[k]    = -u * csch(θ)
     end
     return SymTridiagonal(d, e)
 end
@@ -412,12 +558,46 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     return Z
 end
 
+# `_norm_sq` with an optional natural boundary: the tail mass ψ₁²/(2κ) becomes
+# ψ₁²(tanh u + u·sech²u)/(2κ) at each finite gap. Defers to the unbounded form above when both
+# `lo` and `hi` are infinite.
+function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _norm_sq(x, ψ, κ)
+    n = length(x)
+    Z = _tail_mass(ψ[1], κ, x[1] - lo) + _tail_mass(ψ[n], κ, hi - x[n])
+    for k in 1:n-1
+        θ = κ * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+    end
+    return Z
+end
+
 # ∫ ψ² dx for a piecewise-constant scale. The interpolant on interval k and the tail decays
 # are set by the rates themselves, not by the operator's overall factor, so this is the
 # physical mass whatever κ̄ the amplitude was solved in.
 function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
     n = length(x)
     Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
+    for k in 1:n-1
+        κ = κs[k]
+        θ = κ * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+    end
+    return Z
+end
+
+# The piecewise `_norm_sq` with an optional natural boundary. Defers to the unbounded form
+# above when both `lo` and `hi` are infinite.
+function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _norm_sq(x, ψ, κs, κL, κR)
+    n = length(x)
+    Z = _tail_mass(ψ[1], κL, x[1] - lo) + _tail_mass(ψ[n], κR, hi - x[n])
     for k in 1:n-1
         κ = κs[k]
         θ = κ * (x[k+1] - x[k])
@@ -438,6 +618,31 @@ function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T
     Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
     Gψ[1] += ψ[1] / (2κL)
     Gψ[n] += ψ[n] / (2κR)
+    for k in 1:n-1
+        κk = _kappa(κ, k)
+        θ = κk * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κk)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κk)
+        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
+        Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
+    end
+    return Z, Gψ
+end
+
+# `_norm_sq_gram` with an optional natural boundary. `Gψᵢ = tail-mass(ψᵢ)/ψᵢ` at a boundary node
+# reduces to the unbounded `ψᵢ/(2κ_edge)` since the tail mass is homogeneous degree 2 in ψᵢ; the
+# `isinf` branch below takes the unbounded code path exactly rather than relying on that algebra.
+function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _norm_sq_gram(x, ψ, κ, κL, κR)
+    n = length(x)
+    Gψ = zeros(T, n)
+    tl = _tail_mass(ψ[1], κL, x[1] - lo)
+    tr = _tail_mass(ψ[n], κR, hi - x[n])
+    Z = tl + tr
+    Gψ[1] += tl / ψ[1]
+    Gψ[n] += tr / ψ[n]
     for k in 1:n-1
         κk = _kappa(κ, k)
         θ = κk * (x[k+1] - x[k])
@@ -547,7 +752,8 @@ end
     amplitude(d::DensityEstimate, x)
 
 Evaluate the amplitude `ψ(x)` (so that the density is `d(x) == ψ(x)^2`) at real `x`,
-which may be a scalar or an array.
+which may be a scalar or an array. Zero outside a finite `support` (see
+[`DensityEstimate`](@ref)); the fitted density is exactly zero there, not merely small.
 """
 amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
 amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
@@ -555,10 +761,27 @@ amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x
 function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
     xs = d.x
     n = length(xs)
-    x <= xs[1] && return d.ψ[1] * exp(d.κL * (x - xs[1]))
-    x >= xs[n] && return d.ψ[n] * exp(-d.κR * (x - xs[n]))
+    if x <= xs[1]
+        x < d.lo && return zero(T)
+        return _left_tail_amplitude(d.ψ[1], d.κL, x, xs[1], d.lo)
+    elseif x >= xs[n]
+        x > d.hi && return zero(T)
+        return _right_tail_amplitude(d.ψ[n], d.κR, x, xs[n], d.hi)
+    end
     return _amplitude(d, searchsortedlast(xs, x), x)    # xs[k] <= x < xs[k+1]
 end
+
+# ψ(x) in the left tail (x ≤ xs[1], lo ≤ x): the exponential decay ψ₁e^{κ(x-xs[1])} when
+# unbounded, or the Neumann cosh arc ψ₁cosh(κ(x-lo))/cosh(κ(xs[1]-lo)) at a finite boundary.
+# Both are ψ evaluated relative to its value at xs[1]; the finite form is exactly the unbounded
+# one with the exponential's single decaying branch replaced by the cosh arc it limits to as
+# lo → -∞.
+_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
+    isfinite(lo) ? ψ1 * _cosh_ratio2(κ * (x - lo), κ * (x1 - lo)) : ψ1 * exp(κ * (x - x1))
+
+# Mirror of `_left_tail_amplitude` for the right tail.
+_right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
+    isfinite(hi) ? ψn * _cosh_ratio2(κ * (hi - x), κ * (hi - xn)) : ψn * exp(-κ * (x - xn))
 
 # ψ(x) inside interval k, i.e. for xs[k] ≤ x ≤ xs[k+1]. Split out so a caller that already
 # knows which interval x falls in — a sorted sweep — need not search for it.
@@ -573,7 +796,8 @@ end
 # ln Q(t) = 2 ln ψ(t) at every position of the sorted vector `ts`, advancing through the
 # nodes alongside `ts` in one pass. Evaluating pointwise would binary-search for each
 # position, and a plug-in scale is realized on O(N) positions for every candidate it scores.
-# The logarithm keeps the far tails informative where Q itself underflows to zero.
+# The logarithm keeps the far tails informative where Q itself underflows to zero; outside a
+# finite support Q is by construction zero, i.e. ln Q = -Inf.
 function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
     xs = d.x
     n = length(xs)
@@ -584,13 +808,28 @@ function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
         while k < n - 1 && xs[k+1] <= t
             k += 1
         end
-        ψt = t <= xs[1] ? d.ψ[1] * exp(d.κL * (t - xs[1])) :
-             t >= xs[n] ? d.ψ[n] * exp(-d.κR * (t - xs[n])) :
-             _amplitude(d, k, t)
-        out[i] = 2 * log(ψt)
+        if t <= xs[1]
+            out[i] = t < d.lo ? T(-Inf) : 2 * _log_left_tail_amplitude(d.ψ[1], d.κL, t, xs[1], d.lo)
+        elseif t >= xs[n]
+            out[i] = t > d.hi ? T(-Inf) : 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, t, xs[n], d.hi)
+        else
+            out[i] = 2 * log(_amplitude(d, k, t))
+        end
     end
     return out
 end
+
+# ln ψ(t) in the left tail, unbounded branch identical to `log(_left_tail_amplitude(...))`
+# (so `_logdensity_sorted` reduces to its pre-existing arithmetic when `lo = -Inf`); the finite
+# branch uses `_logcosh` so it stays finite well past where `cosh` itself would overflow.
+_log_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
+    isfinite(lo) ? log(ψ1) + _logcosh(κ * (x - lo)) - _logcosh(κ * (x1 - lo)) :
+                   log(ψ1 * exp(κ * (x - x1)))
+
+# Mirror of `_log_left_tail_amplitude` for the right tail.
+_log_right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
+    isfinite(hi) ? log(ψn) + _logcosh(κ * (hi - x)) - _logcosh(κ * (hi - xn)) :
+                   log(ψn * exp(-κ * (x - xn)))
 
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
@@ -598,6 +837,17 @@ _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
 # cosh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ (companion to
 # _sinh_ratio). With u = θ it is coth θ, also overflow-safe.
 _cosh_ratio(u::T, θ::T) where {T} = -exp(u - θ) * (1 + exp(-2u)) / expm1(-2θ)
+
+# cosh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u (a cosh-denominator
+# companion to _sinh_ratio/_cosh_ratio, used by the boundary-segment amplitude).
+_cosh_ratio2(v::T, u::T) where {T} = exp(v - u) * (oneunit(T) + exp(-2v)) / (oneunit(T) + exp(-2u))
+
+# sinh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u and accurate as v → 0
+# (via expm1, the same treatment _sinh_ratio gives its numerator).
+_sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + exp(-2u))
+
+# log(cosh(v)) for v ≥ 0, evaluated without overflow at large v.
+_logcosh(v::T) where {T} = v + log1p(exp(-2v)) - log(T(2))
 
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
@@ -631,7 +881,7 @@ function _node_cdf(d::DensityEstimate{T}) where {T}
     x, ψ = d.x, d.ψ
     n = length(x)
     F = Vector{T}(undef, n)
-    F[1] = ψ[1]^2 / (2 * d.κL)          # left tail
+    F[1] = _tail_mass(ψ[1], d.κL, x[1] - d.lo)      # left tail (or boundary segment)
     for k in 1:n-1
         κ = _kappa(d, k)
         θ = κ * (x[k+1] - x[k])
@@ -646,21 +896,54 @@ function _node_cdf(d::DensityEstimate{T}) where {T}
         end
         F[k+1] = F[k] + (fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]) / κ
     end
-    return F, F[n] + ψ[n]^2 / (2 * d.κR)
+    return F, F[n] + _tail_mass(ψ[n], d.κR, d.hi - x[n])
 end
 
-# Unnormalized cumulative mass ∫_{-∞}^{x} ψ² dt, given the node cumulatives F. The tails
-# are elementary exponential integrals; interior intervals use _cdf_mass_interior.
+# ψ̂(v)² integrated from the wall (v = 0) out to v, for the boundary field ψ̂(s) = cosh(κs)/cosh(u)
+# on a segment of width u = κΔ (Neumann at the wall, node value ψ_node at s = Δ); v = κs ∈ [0, u].
+# Both terms are non-negative for v ≥ 0, so — unlike the interior `_segmass` — this needs no
+# small-u cancellation treatment; it reduces to `_tail_mass` at v = u.
+function _boundary_mass_from_wall(ψ_node::T, κ::T, v::T, u::T) where {T}
+    return ψ_node^2 * (v * _sech2_stable(u) + _cosh_ratio2(v, u) * _sinh_ratio2(v, u)) / (2κ)
+end
+
+# The complementary piece of `_boundary_mass_from_wall`: ψ̂² integrated from v out to the node
+# (v = u). Written through the identity sinh(2u) - sinh(2v) = 2cosh(u+v)sinh(u-v) so it stays
+# cancellation-free as v → u, unlike computing it as `_tail_mass - _boundary_mass_from_wall`
+# (a difference of two nearly equal quantities there).
+function _boundary_mass_from_node(ψ_node::T, κ::T, v::T, u::T) where {T}
+    p = exp(-2u)
+    A = exp(2 * (v - u))
+    B = exp(-2 * (v + u))
+    R = (oneunit(T) - A + B - p^2) / (oneunit(T) + p)^2   # cosh(u+v)sinh(u-v)/cosh(u)²
+    return ψ_node^2 * ((u - v) * _sech2_stable(u) + R) / (2κ)
+end
+
+# Unnormalized cumulative mass ∫_{lo}^{x} ψ² dt, given the node cumulatives F: zero at or below
+# `lo` (an unreachable comparison when `lo = -Inf`) and the grand total at or above `hi`. The
+# tails are elementary exponential integrals when unbounded; a finite boundary integrates the
+# cosh-arc segment from whichever end (wall or node) is nearer x, so its absolute error vanishes
+# toward both ends and the CDF stays continuous through the boundary node — the same discipline
+# `_cdf_mass_interior` applies at interior nodes. Interior intervals use `_cdf_mass_interior`.
 function _cdf_mass(d::DensityEstimate{T}, F::Vector{T}, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
     isnan(x) && return T(NaN) * one(x)
     if x <= xs[1]
-        κ = d.κL
-        return ψ[1]^2 / (2κ) * exp(2κ * (x - xs[1]))
+        isfinite(d.lo) || return ψ[1]^2 / (2 * d.κL) * exp(2 * d.κL * (x - xs[1]))
+        x <= d.lo && return zero(T) * one(x)
+        v = d.κL * (x - d.lo)
+        u = d.κL * (xs[1] - d.lo)
+        return v <= u / 2 ? _boundary_mass_from_wall(ψ[1], d.κL, v, u) :
+                             F[1] - _boundary_mass_from_node(ψ[1], d.κL, v, u)
     elseif x >= xs[n]
-        κ = d.κR
-        return F[n] + ψ[n]^2 / (2κ) * (-expm1(-2κ * (x - xs[n])))
+        isfinite(d.hi) || return F[n] + ψ[n]^2 / (2 * d.κR) * (-expm1(-2 * d.κR * (x - xs[n])))
+        x >= d.hi && return F[n] + _tail_mass(ψ[n], d.κR, d.hi - xs[n])
+        vp = d.κR * (d.hi - x)
+        u = d.κR * (d.hi - xs[n])
+        return vp >= u / 2 ? F[n] + _boundary_mass_from_node(ψ[n], d.κR, vp, u) :
+                              F[n] + _tail_mass(ψ[n], d.κR, d.hi - xs[n]) -
+                              _boundary_mass_from_wall(ψ[n], d.κR, vp, u)
     end
     k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
     return _cdf_mass_interior(d, F, k, x)
@@ -710,13 +993,16 @@ end
 """
     cdf(d::DensityEstimate, x)
 
-Cumulative distribution function of the fitted density: `F(x) = ∫_{-∞}^x Q(t) dt` with
-`Q = ψ²`, evaluated in closed form (no quadrature). The tails are pure exponentials;
-on each inter-node interval `ψ'' = κ²ψ` makes `ψ'² - κ²ψ²` constant, which yields the
-exact antiderivative of the hyperbolic interpolant.
+Cumulative distribution function of the fitted density: `F(x) = ∫_a^x Q(t) dt` with `Q = ψ²`
+and `a` the fit's left support endpoint (`-Inf` unless [`DensityEstimate`](@ref) was given a
+finite `support`), evaluated in closed form (no quadrature). Outside a finite `[a, b]` support,
+`F` is exactly `0` at or below `a` and exactly `1` at or above `b`. The tails (or, on a finite
+support, the two boundary segments) are pure exponentials or `cosh` arcs; on each inter-node
+interval `ψ'' = κ²ψ` makes `ψ'² - κ²ψ²` constant, which yields the exact antiderivative of the
+hyperbolic interpolant.
 
-`F` is nondecreasing with `F(-Inf) == 0` and `F(Inf) == 1` exactly: the few ulps of
-normalization roundoff in the fitted amplitudes are absorbed by a global rescaling.
+`F` is nondecreasing with `F(a) == 0` and `F(b) == 1` exactly: the few ulps of normalization
+roundoff in the fitted amplitudes are absorbed by a global rescaling.
 
 `x` may be a scalar or an array. Each call assembles the per-node cumulative masses at
 `O(length(d.x))` cost; the array method assembles them once and shares them across all
@@ -746,12 +1032,14 @@ end
     quantile(d::DensityEstimate, q)
 
 Quantile function of the fitted density, the inverse of [`cdf`](@ref):
-`cdf(d, quantile(d, q)) ≈ q` for `q ∈ [0, 1]`, with `quantile(d, 0) == -Inf` and
-`quantile(d, 1) == Inf`; `q` outside `[0, 1]` (including `NaN`) throws a
-`DomainError`. In the exponential tails the inversion is in closed form; on interior
-intervals a Newton iteration on the closed-form CDF, bracketed by the enclosing nodes,
-converges to floating-point accuracy. The right tail is solved through `1 - q`, so
-upper quantiles lose no more precision than `q` itself carries.
+`cdf(d, quantile(d, q)) ≈ q` for `q ∈ [0, 1]`, with `quantile(d, 0) == a` and
+`quantile(d, 1) == b` (the fit's support endpoints, `-Inf`/`Inf` unless
+[`DensityEstimate`](@ref) was given a finite `support`); `q` outside `[0, 1]` (including `NaN`)
+throws a `DomainError`. In an unbounded tail the inversion is in closed form; on interior
+intervals, and on a finite boundary segment (transcendental there), a Newton iteration on the
+closed-form CDF, bracketed by the enclosing nodes or by the wall and the outermost node,
+converges to floating-point accuracy. The right side is solved through `1 - q`, so upper
+quantiles lose no more precision than `q` itself carries.
 
 `q` may be a scalar or an array; the array method assembles the per-node cumulative
 masses once and shares them across all evaluations.
@@ -767,23 +1055,20 @@ function Statistics.quantile(d::DensityEstimate, q::AbstractArray)
     return map(qi -> _quantile(d, F, total, qi), q)
 end
 
-function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
-    0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
-    xs, ψ = d.x, d.ψ
-    n = length(xs)
-    target = q * total
-    if target <= F[1]                   # left tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}
-        κ = d.κL
-        return xs[1] + log(2κ * target / ψ[1]^2) / (2κ)
-    elseif target >= F[n]               # right tail, through the complement 1 - q
-        κ = d.κR
-        return xs[n] - log(2κ * (total * (1 - q)) / ψ[n]^2) / (2κ)
-    end
-    k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
-    lo, hi = xs[k], xs[k+1]
-    y = lo + (target - F[k]) / (F[k+1] - F[k]) * (hi - lo)  # linear-in-mass start
+# Closed-form quantile in an unbounded exponential tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}.
+_left_tail_quantile(ψ1::T, κ::T, x1::T, target::T) where {T} = x1 + log(2κ * target / ψ1^2) / (2κ)
+
+# Mirror of `_left_tail_quantile` for the right tail, solved through the complement 1 - q so
+# upper quantiles lose no more precision than `q` itself carries.
+_right_tail_quantile(ψn::T, κ::T, xn::T, total::T, q::Real) where {T} =
+    xn - log(2κ * (total * (1 - q)) / ψn^2) / (2κ)
+
+# Safeguarded Newton (bisection fallback) for the `y` solving `massfun(y) == target` on
+# `[lo, hi]`, where `massfun` is monotone increasing with derivative `ψ(y)²` — shared by the
+# interior-interval and boundary-segment quantile inversions below.
+function _invert_cdf_mass(d::DensityEstimate{T}, massfun, lo::T, hi::T, y::T, target::T) where {T}
     for _ in 1:200
-        r = _cdf_mass_interior(d, F, k, y) - target
+        r = massfun(y) - target
         r == 0 && return y
         r < 0 ? (lo = y) : (hi = y)
         ynew = y - r / _amplitude(d, y)^2       # Newton: the CDF's derivative is ψ²
@@ -791,7 +1076,30 @@ function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where
         ynew == y && return y
         y = ynew
     end
-    error("quantile: safeguarded Newton failed to converge at q = $q — please report this")
+    error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
+end
+
+function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
+    0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
+    xs, ψ = d.x, d.ψ
+    n = length(xs)
+    target = q * total
+    if target <= F[1]
+        isfinite(d.lo) || return _left_tail_quantile(ψ[1], d.κL, xs[1], target)
+        # F[1] == 0 only at a zero-width boundary segment (xs[1] == d.lo), where target == 0
+        # too (target ≤ F[1] and target ≥ 0); the linear start is meaningless there, but any
+        # start converges immediately since `_cdf_mass(d, F, d.lo) == 0 == target` exactly.
+        y = F[1] > 0 ? d.lo + (target / F[1]) * (xs[1] - d.lo) : d.lo
+        return _invert_cdf_mass(d, y -> _cdf_mass(d, F, y), d.lo, xs[1], y, target)
+    elseif target >= F[n]
+        isfinite(d.hi) || return _right_tail_quantile(ψ[n], d.κR, xs[n], total, q)
+        y = total > F[n] ? d.hi - ((total - target) / (total - F[n])) * (d.hi - xs[n]) : d.hi
+        return _invert_cdf_mass(d, y -> _cdf_mass(d, F, y), xs[n], d.hi, y, target)
+    end
+    k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
+    lok, hik = xs[k], xs[k+1]
+    y = lok + (target - F[k]) / (F[k+1] - F[k]) * (hik - lok)  # linear-in-mass start
+    return _invert_cdf_mass(d, y -> _cdf_mass_interior(d, F, k, y), lok, hik, y, target)
 end
 
 """
@@ -1001,8 +1309,16 @@ Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
 A spatially varying `κ` (see [`DensityEstimate`](@ref)) is supported: the nodal precision of
 the fluctuation field is `2λ` times the same tridiagonal operator the fit assembles, whatever
 the scale, so the law stays exact and `O(N)`.
+
+Not yet supported for a fit with a finite `support` (see [`DensityEstimate`](@ref)): the exact
+reference distribution on a bounded domain is future work, and this throws rather than silently
+applying the unbounded theory to a fit where it does not apply.
 """
 function chisq_reference(d::DensityEstimate{T}) where {T}
+    isinf(d.lo) && isinf(d.hi) ||
+        throw(ArgumentError("chisq_reference is not yet supported for a finite-support fit " *
+                            "(support=($(d.lo), $(d.hi))); the exact reference distribution on " *
+                            "a bounded domain is future work"))
     x, ψ, w, λ = d.x, d.ψ, d.w, d.λ
     κ, κL, κR = d.κ, d.κL, d.κR
     n = length(x)
