@@ -614,8 +614,8 @@ end
         @testset "alphas and pilot are honored" begin
             κ = select_kappa_adaptive(chisq1; alphas=(1.0,))
             @test κ isa AdaptiveScale && κ.α == 1.0
-            # A pilot hook: any callable returning a positive scale from the sample.
-            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot=select_kappa_ms)
+            # pilot_selector: any callable returning a positive scale from the sample.
+            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot_selector=select_kappa_ms)
             @test κms isa AdaptiveScale
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
@@ -663,7 +663,7 @@ end
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
             @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
-            @test_throws "pilot must return a positive scale" select_kappa_adaptive(chisq1; pilot=_ -> 0.0)
+            @test_throws "pilot_selector must return a positive scale" select_kappa_adaptive(chisq1; pilot_selector=_ -> 0.0)
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)

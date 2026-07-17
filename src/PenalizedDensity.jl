@@ -1963,8 +1963,8 @@ function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::In
 end
 
 """
-    select_kappa_adaptive(x; alphas=(0.25, 0.5, 0.75, 1.0), pilot=select_kappa_kl, rtol=cbrt(eps(T)),
-        support=(-Inf, Inf)) -> κ
+    select_kappa_adaptive(x; alphas=(0.25, 0.5, 0.75, 1.0), pilot_selector=select_kappa_kl,
+        rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
 return it ready to pass to [`DensityEstimate`](@ref).
@@ -1977,10 +1977,10 @@ small multiple of one [`select_kappa_kl`](@ref) call; shorten `alphas` to trade 
 speed.
 
 The `alphas` must be positive: `α = 0` is the constant scale, which is always in the
-comparison. They are searched in increasing order, whatever order they are given in. `pilot`
-sets the constant scale of the pilot density the family is built from, and may be any
-callable returning a positive scale from the sample. `rtol` is the node-merging tolerance, as
-a fraction of the local smoothing length, matching [`DensityEstimate`](@ref)'s.
+comparison. They are searched in increasing order, whatever order they are given in.
+`pilot_selector` sets the constant scale of the pilot density the family is built from, and
+may be any callable returning a positive scale from the sample. `rtol` is the node-merging
+tolerance, as a fraction of the local smoothing length, matching [`DensityEstimate`](@ref)'s.
 
 `support = (a, b)` (default `(-Inf, Inf)`) fits the pilot density and cross-validates every
 candidate scale on a finite domain, as [`DensityEstimate`](@ref)'s `support` does; it is a
@@ -2018,8 +2018,8 @@ kink, or heavy tails. On smooth densities there is nothing to buy, and this sele
 — it returns a plain number, the constant scale, whenever adaptivity does not earn its
 keep by the same cross-validation score that chose it.
 
-The rule is a plug-in: fit a pilot density `p̂` at the constant scale `pilot(x)` (by default
-[`select_kappa_kl`](@ref)), then consider the family
+The rule is a plug-in: fit a pilot density `p̂` at the constant scale `pilot_selector(x)` (by
+default [`select_kappa_kl`](@ref)), then consider the family
 
     κ(x; c, α) = c · (p̂(x) / ḡ)^α,     ḡ = geometric mean of p̂ over the sample
 
@@ -2029,17 +2029,17 @@ generalized to a varying scale — the same criterion [`select_kappa_kl`](@ref) 
 and, like it, evaluated in closed form and `O(N)`, with no refitting. The constant scale
 competes as the `α = 0` member of the same family and on the same score.
 
-The pilot *hook* is support-oblivious — it sees only the sample — while the pilot *density*
-it scales is fitted on `support`, so a selector with no notion of a boundary, like
-[`select_kappa_ms`](@ref), remains usable as `pilot` on a bounded domain. Because `support`
-is fixed throughout the `α` search, composing with [`select_support`](@ref) re-runs that
-search on each boundary arm's own domain, so `α` gets to respond to whatever regularity a
-boundary already bought, rather than being reused from an unbounded selection that saw a
-different edge.
+`pilot_selector` is a scale-selection method, and is called on the sample alone with no notion
+of `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
+notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot_selector` on a
+bounded domain. Because `support` is fixed throughout the `α` search, composing with
+[`select_support`](@ref) re-runs that search on each boundary arm's own domain, so `α` gets to
+respond to whatever regularity a boundary already bought, rather than being reused from an
+unbounded selection that saw a different edge.
 """
 function select_kappa_adaptive(x::AbstractVector{<:Real};
                                alphas=(0.25, 0.5, 0.75, 1.0),
-                               pilot=select_kappa_kl,
+                               pilot_selector=select_kappa_kl,
                                rtol::Real=cbrt(eps(float(eltype(x)))),
                                support::Tuple{Real,Real}=(-Inf, Inf))
     isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
@@ -2055,11 +2055,11 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     _check_support(xs, slo, shi)
     r = T(rtol)
 
-    # The pilot hook chooses only a scalar starting scale, so it is called support-oblivious
+    # pilot_selector chooses only a scalar starting scale, so it is called support-oblivious
     # (any callable returning a positive scale from the sample, including ones with no notion
-    # of a boundary at all); the pilot *density* p̂ below is what actually carries the support.
-    κ0 = T(pilot(xs))
-    κ0 > 0 || throw(ArgumentError("the pilot must return a positive scale, got $κ0"))
+    # of a boundary at all); the pilot density p̂ below is what actually carries the support.
+    κ0 = T(pilot_selector(xs))
+    κ0 > 0 || throw(ArgumentError("pilot_selector must return a positive scale, got $κ0"))
     p = DensityEstimate(xs, κ0; rtol=r, support=(slo, shi))
     loggbar = _log_geomean(p)
 
