@@ -25,17 +25,22 @@ end
 
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
 # field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
-# exact reference distribution must reproduce, at a constant or a varying scale alike.
+# exact reference distribution must reproduce, at a constant or a varying scale alike, on ℝ or
+# on a bounded support.
 #
 # The field's precision is L = 2λ𝒜 + 2Σ(wᵢ/ψᵢ²)δ(x-xᵢ), 𝒜u = -(κ(x)⁻²u′)′ + u, discretized
 # conservatively: each cell of the grid contributes (2λ/κ²)(Δδψ)²/h to the gradient energy
 # and 2λ·h to the mass. The grid contains every node, so κ is single-valued on each cell and
-# the point sources land on grid points exactly. Nothing here shares an assembly, a Green's
-# function, or a recursion with the package. Returns the χ² samples.
+# the point sources land on grid points exactly. A finite `d.lo`/`d.hi` terminates the grid
+# there instead of padding into a decaying tail; the conservative stencil already has no term
+# coupling a grid edge to anything past it, so ending the grid exactly at the wall *is* the
+# natural (Neumann) boundary condition, not an approximation to it. Nothing here shares an
+# assembly, a Green's function, or a recursion with the package. Returns the χ² samples.
 function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     x, ψ, λ = d.x, d.ψ, d.λ
     κ(k) = k == 0 ? d.κL : k > length(d.x) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
-    bnds = vcat(first(x) - pad / d.κL, x, last(x) + pad / d.κR)
+    bnds = vcat(isfinite(d.lo) ? d.lo : first(x) - pad / d.κL, x,
+                isfinite(d.hi) ? d.hi : last(x) + pad / d.κR)
     y = Float64[]
     for k in 1:length(bnds)-1                       # ≈ per_len points per local length 1/κ
         npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per_len))
@@ -71,11 +76,11 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     return chis
 end
 
-# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale (it needs only
+# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale, bounded or not (it needs only
 # Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1). A wrong nodal precision or a wrong α breaks it.
 function green_identity(d)
-    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ)
-    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR)
+    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ, d.lo, d.hi)
+    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR, d.lo, d.hi)
     f = 2d.λ / PenalizedDensity._reference_scale(d.κ, d.κL, d.κR)
     S = 2 .* d.w ./ d.ψ.^2
     b = SymTridiagonal(f .* M.dv .+ S, f .* M.ev) \ (f .* (M * m))
@@ -1041,14 +1046,14 @@ end
         @test_throws "support must satisfy a < b" DensityEstimate([0.5], 1.0; support=(0.5, 0.5))
     end
 
-    @testset "chisq family throws on a bounded fit" begin
+    @testset "chisq family runs on a bounded fit" begin
         d = DensityEstimate(sort(rand(Xoshiro(45), 50)), 10.0; support=(0.0, 1.0))
-        @test_throws ArgumentError chisq_reference(d)
-        @test_throws "not yet supported for a finite-support fit" chisq_reference(d)
-        @test_throws ArgumentError expected_chisq(d)
-        @test_throws ArgumentError chisq_ccdf(d, 1.0)
-        @test_throws ArgumentError chisq_pdf(d, 1.0)
-        @test_throws ArgumentError pvalue(d, t -> 1.0)
+        r = chisq_reference(d)
+        @test r isa ChisqReference
+        @test expected_chisq(d) == r.mean > 0
+        @test 0 <= chisq_ccdf(d, 1.0) <= 1
+        @test chisq_pdf(d, 1.0) >= 0
+        @test 0 <= pvalue(d, t -> 1.0) <= 1
     end
 
     @testset "cross-validation on a bounded fit" begin
@@ -1239,6 +1244,124 @@ end
             φhalf_exact = sqrt(w / (tanh(κ * Δl) + 1))
             @test only(φhalf) ≈ φhalf_exact rtol = 1e-5
         end
+    end
+end
+
+@testset "goodness of fit: exact reference on a bounded fit" begin
+    @testset "unbounded regression" begin
+        Random.seed!(60)
+        x = randn(150)
+        d = DensityEstimate(x, select_kappa_ms(x))
+        r = chisq_reference(d)
+        d2 = DensityEstimate(x, d.κ; support=(-Inf, Inf))
+        r2 = chisq_reference(d2)
+        @test r2.tri.dv == r.tri.dv && r2.tri.ev == r.tri.ev && r2.g == r.g && r2.mean == r.mean
+
+        # A far wall (1e4 smoothing lengths out) reproduces the unbounded reference closely.
+        far = 1e4 / d.κ
+        dfar = DensityEstimate(x, d.κ; support=(minimum(x) - far, maximum(x) + far))
+        rfar = chisq_reference(dfar)
+        @test maximum(abs.(rfar.tri.dv .- r.tri.dv) ./ abs.(r.tri.dv)) < 1e-10
+        @test maximum(abs.(rfar.g .- r.g) ./ abs.(r.g)) < 1e-10
+        @test abs(rfar.mean - r.mean) / r.mean < 1e-10
+        @test abs(chisq_ccdf(rfar, r.mean) - chisq_ccdf(r, r.mean)) < 1e-8
+    end
+
+    @testset "Green's identity on bounded fits" begin
+        # 4Σᵢwᵢbᵢ/ψᵢ = 1 needs only Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1 (see `green_identity`
+        # above), so it exercises the bounded `_node_alpha`/`_operator` together on constant and
+        # one- and two-sided supports.
+        for (name, xgen, κ, support) in (
+                ("uniform, both walls",   rng -> rand(rng, 300),                    15.0, (0.0, 1.0)),
+                ("exponential, one wall", rng -> -log.(1 .- rand(rng, 300)),        12.0, (0.0, Inf)),
+                ("triangular, both walls", rng -> rand(rng, 300) .+ rand(rng, 300), 10.0, (0.0, 2.0)))
+            rng = Xoshiro(hash((:b4green, name)))
+            x = sort(xgen(rng))
+            d = DensityEstimate(x, κ; support)
+            @test green_identity(d) ≈ 1 rtol = 1e-5
+        end
+        # Composed with adaptive κ.
+        xa = sort!(randn(Xoshiro(9), 300) .^ 2)
+        da = DensityEstimate(xa, select_kappa_adaptive(xa; support=(0.0, Inf)); support=(0.0, Inf))
+        @test green_identity(da) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "FD ground truth: m and ∫ψα converge to the closed forms at O(δ²)" begin
+        # As the unbounded suite's analogous check above, but the grid now runs exactly from
+        # `d.lo` to `d.hi` instead of a padded tail: the conservative stencil's Neumann condition
+        # falls out of ending the grid there, per `fieldmc_chisq`'s comment.
+        Random.seed!(62)
+        x = sort(rand(60) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 6.0; support=(0.0, 1.0))
+        errs = map((100, 400)) do per
+            xn, ψ, λ = d.x, d.ψ, d.λ
+            κ(k) = k == 0 ? d.κL : k > length(xn) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
+            bnds = vcat(d.lo, xn, d.hi)
+            y = Float64[]
+            for k in 1:length(bnds)-1
+                npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per))
+                append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+            end
+            push!(y, last(bnds)); m = length(y); δ = diff(y)
+            cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+            mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+            p = copy(mass); q = zeros(m - 1)
+            for j in 1:m-1
+                c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+            end
+            ψy = amplitude(d, y)
+            αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
+            mfd = [αfd[searchsortedfirst(y, xi)] for xi in xn]
+            mex = PenalizedDensity._node_alpha(xn, ψ, d.κ, d.κL, d.κR, λ, d.lo, d.hi)
+            (maximum(abs.(mex .- mfd) ./ abs.(mfd)),
+             abs(PenalizedDensity._int_psi_alpha(xn, ψ, mex, d.κ, d.κL, d.κR, λ, d.lo, d.hi) -
+                 sum(mass .* ψy .* αfd)) / sum(mass .* ψy .* αfd))
+        end
+        @test all(<(2e-4), errs[1]) && all(<(2e-5), errs[2])
+        @test all(first(errs) ./ last(errs) .> 10)
+    end
+
+    @testset "field Monte Carlo: bounded uniform (both walls, flagship)" begin
+        # The flagship case: a natural boundary makes the flat field exactly representable,
+        # which no unbounded or spatially-varying-κ fit could do (CHUNK-B0's ceiling result).
+        Random.seed!(63)
+        x = sort(rand(400) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, 1.0)); support=(0.0, 1.0))
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=11)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "field Monte Carlo: bounded exponential (one wall)" begin
+        Random.seed!(64)
+        x = sort(-log.(1 .- rand(400)))
+        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, Inf)); support=(0.0, Inf))
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=12)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "field Monte Carlo: bounded fit with adaptive κ" begin
+        Random.seed!(65)
+        x = sort!(randn(Xoshiro(66), 300) .^ 2)
+        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test maximum(d.κ) / minimum(d.κ) > 1e4
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=13)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
     end
 end
 
