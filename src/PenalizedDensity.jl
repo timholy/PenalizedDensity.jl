@@ -210,53 +210,35 @@ _show_support(d::DensityEstimate) =
     isinf(d.lo) && isinf(d.hi) ? "" : ", support=[$(d.lo), $(d.hi)]"
 Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)$(_show_support(d))")
 
-# Fit from already-merged distinct nodes and their weights, unbounded on both sides. Kept
-# as its own entry point (rather than always routing through the boundary-aware `_fit` below)
-# so callers that only ever need the unbounded fit — `select_kappa_ms`, `kappa_interval` — run
-# the exact arithmetic this function has always used.
-function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T}
-    ψ = _solve_amplitude(nodes, weights, κ)
-    Z = _norm_sq(nodes, ψ, κ)
-    ψ ./= sqrt(Z)
-    λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
-    return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, T(-Inf), T(Inf), λ)
-end
-
-# Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite). At
-# `lo, hi = -Inf, Inf` this defers to the unbounded `_fit` above, so a default-support caller
-# takes the identical code path and gets identical arithmetic, not merely a close approximation.
+# Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _fit(nodes, weights, κ)
     ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights)
     Z = _norm_sq(nodes, ψ, κ, lo, hi)
     ψ ./= sqrt(Z)
-    λ = κ * Z
+    λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
     return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, lo, hi, λ)
 end
 
-# Piecewise-constant scale, unbounded on both sides. The assembled operator carries an
-# arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from the normalized
-# amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity condition of the
-# unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the scaling law
-# `_fit(nodes, weights, κ)` above uses.
-function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
-    κ̄ = _reference_scale(κs, κL, κR)
-    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄), weights)
-    Z = _norm_sq(nodes, ψ, κs, κL, κR)
-    ψ ./= sqrt(Z)
-    return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, T(-Inf), T(Inf), κ̄ * Z)
-end
+# Fit from already-merged distinct nodes and their weights, unbounded on both sides.
+_fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T} =
+    _fit(nodes, weights, κ, T(-Inf), T(Inf))
 
-# Piecewise-constant scale with an optional natural boundary, deferring to the unbounded
-# piecewise `_fit` above when both `lo` and `hi` are infinite.
+# Piecewise-constant scale with an optional natural boundary at `lo`/`hi`. The assembled
+# operator carries an arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from
+# the normalized amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity
+# condition of the unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the
+# scaling law `_fit(nodes, weights, κ, lo, hi)` above uses.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _fit(nodes, weights, κs, κL, κR)
     κ̄ = _reference_scale(κs, κL, κR)
     ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights)
     Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
     ψ ./= sqrt(Z)
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
 end
+
+# Piecewise-constant scale, unbounded on both sides.
+_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
+    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf))
 
 # Reject scale values a fit cannot use.
 _check_kappa(κ, x) =
@@ -352,16 +334,18 @@ function _merge_and_realize(xs::Vector{T}, κfun, rtol::T) where {T}
     return nodes, weights, κs, κL, κR
 end
 
-# Tridiagonal operator M (SPD) coupling the nodal amplitudes.
-# Off-diagonal e[k] = -csch(κ hₖ); diagonal d[i] accumulates coth(κ hₖ) from each
-# adjacent interval and +1 from each adjacent tail.
-function roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat}
+# Tridiagonal operator M (SPD) coupling the nodal amplitudes, with an optional natural
+# (Neumann) boundary at `lo`/`hi` (either may be infinite). Off-diagonal e[k] = -csch(κ hₖ);
+# diagonal d[i] accumulates coth(κ hₖ) from each adjacent interval, and from each tail
+# `_tail_diag(κ, Δ)` — `tanh(κΔ)` at a finite gap Δ, or exactly `1` as Δ → ∞, so an unbounded
+# side reproduces the fixed-tail entry exactly.
+function roughness_operator(x::Vector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
     d = zeros(T, n)
     e = zeros(T, n - 1)
-    d[1] += oneunit(T)              # left tail
-    d[n] += oneunit(T)              # right tail
+    d[1] += _tail_diag(κ, x[1] - lo)   # left tail
+    d[n] += _tail_diag(κ, hi - x[n])   # right tail
     for k in 1:n-1
         θ = κ * (x[k+1] - x[k])
         d[k]   += coth(θ)
@@ -370,6 +354,10 @@ function roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat}
     end
     return SymTridiagonal(d, e)     # M
 end
+
+# `roughness_operator` on the unbounded line.
+roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat} =
+    roughness_operator(x, κ, T(-Inf), T(Inf))
 
 # tanh(u), overflow-free through e^{-2u} (accurate and finite up to u ≈ 1e300, well past where
 # cosh/sinh alone would overflow around u ≈ 710).
@@ -394,46 +382,27 @@ function _tail_mass(ψ1::T, κ::T, Δ::T) where {T}
     return ψ1^2 * (_tanh_stable(u) + _usech2_stable(u)) / (2κ)
 end
 
-# `roughness_operator` with an optional natural (Neumann) boundary at `lo`/`hi`: the tail
-# diagonal entries `1` become `tanh(κΔ)` at each finite gap Δ. Defers to the unbounded
-# `roughness_operator(x, κ)` above when both are infinite, so a default-support fit takes the
-# identical code path.
-function roughness_operator(x::Vector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
-    isinf(lo) && isinf(hi) && return roughness_operator(x, κ)
-    n = length(x)
-    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
-    d = zeros(T, n)
-    e = zeros(T, n - 1)
-    d[1] += _tail_diag(κ, x[1] - lo)
-    d[n] += _tail_diag(κ, hi - x[n])
-    for k in 1:n-1
-        θ = κ * (x[k+1] - x[k])
-        d[k]   += coth(θ)
-        d[k+1] += coth(θ)
-        e[k]    = -csch(θ)
-    end
-    return SymTridiagonal(d, e)
-end
-
-# The same operator for a piecewise-constant scale: interval k (rate κs[k], θ = κs[k]·hₖ)
-# contributes coth(θ)/κs[k] to each adjacent diagonal entry and -csch(θ)/κs[k] off-diagonal,
-# and each tail 1/κ_edge to its own. Dividing through by one κ no longer cancels the entries,
-# so the rates survive explicitly.
+# The same operator for a piecewise-constant scale, with an optional natural boundary at
+# `lo`/`hi`: interval k (rate κs[k], θ = κs[k]·hₖ) contributes coth(θ)/κs[k] to each adjacent
+# diagonal entry and -csch(θ)/κs[k] off-diagonal, and each tail contributes
+# `_tail_diag(κ_edge, Δ)/κ_edge` — `1/κ_edge` as Δ → ∞ (an unbounded side), or
+# `tanh(κ_edge Δ)/κ_edge` at a finite gap. Dividing through by one κ no longer cancels the
+# entries, so the rates survive explicitly.
 #
 # Everything is scaled by the reference rate κ̄. That factor is arbitrary — it rescales the
 # unnormalized amplitude by κ̄^{-1/2} and drops out of both the normalized fit and λ = κ̄ Z —
 # but it fixes the magnitude the Newton solve sees. Taking κ̄ to be the typical rate keeps the
-# entries O(1), and at a constant κ (where κ̄ = κ) reproduces `roughness_operator(x, κ)` entry
-# for entry.
-function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T) where {T<:AbstractFloat}
+# entries O(1), and at a constant κ (where κ̄ = κ) reproduces `roughness_operator(x, κ, lo, hi)`
+# entry for entry.
+function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
     length(κs) == n - 1 ||
         throw(DimensionMismatch("$n nodes bound $(n-1) intervals, but got $(length(κs)) scales"))
     d = zeros(T, n)
     e = zeros(T, n - 1)
-    d[1] += κ̄ / κL                  # left tail
-    d[n] += κ̄ / κR                  # right tail
+    d[1] += κ̄ * _tail_diag(κL, x[1] - lo) / κL   # left tail
+    d[n] += κ̄ * _tail_diag(κR, hi - x[n]) / κR   # right tail
     for k in 1:n-1
         θ = κs[k] * (x[k+1] - x[k])
         u = κ̄ / κs[k]
@@ -444,41 +413,22 @@ function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::
     return SymTridiagonal(d, e)
 end
 
-# The piecewise operator with an optional natural boundary: the tail entry `κ̄/κ_edge` becomes
-# `κ̄·tanh(κ_edge Δ)/κ_edge` at a finite gap. Defers to the unbounded piecewise operator above
-# when both `lo` and `hi` are infinite.
-function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
-    isinf(lo) && isinf(hi) && return roughness_operator(x, κs, κL, κR, κ̄)
-    n = length(x)
-    n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
-    length(κs) == n - 1 ||
-        throw(DimensionMismatch("$n nodes bound $(n-1) intervals, but got $(length(κs)) scales"))
-    d = zeros(T, n)
-    e = zeros(T, n - 1)
-    d[1] += κ̄ * _tail_diag(κL, x[1] - lo) / κL
-    d[n] += κ̄ * _tail_diag(κR, hi - x[n]) / κR
-    for k in 1:n-1
-        θ = κs[k] * (x[k+1] - x[k])
-        u = κ̄ / κs[k]
-        d[k]   += u * coth(θ)
-        d[k+1] += u * coth(θ)
-        e[k]    = -u * csch(θ)
-    end
-    return SymTridiagonal(d, e)
-end
+# `roughness_operator` for a piecewise-constant scale on the unbounded line.
+roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T) where {T<:AbstractFloat} =
+    roughness_operator(x, κs, κL, κR, κ̄, T(-Inf), T(Inf))
 
-# M for a bare scale, whichever form it takes. A constant κ is its own reference scale, so
-# this reduces to `roughness_operator(x, κ)` entry for entry; a per-interval κ is assembled
-# in units of the geometric-mean rate, as the fit does.
-_operator(x::Vector{T}, κ::T, κL::T, κR::T) where {T} = roughness_operator(x, κ)
-_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
-    roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR))
-
-# `_operator` with an optional natural boundary at `lo`/`hi`. Each defers to the corresponding
-# `roughness_operator` above, which itself defers to the unbounded form when both are infinite.
+# M for a bare scale, whichever form it takes, with an optional natural boundary at `lo`/`hi`.
+# A constant κ is its own reference scale, so this reduces to `roughness_operator(x, κ, lo, hi)`
+# entry for entry; a per-interval κ is assembled in units of the geometric-mean rate, as the
+# fit does.
 _operator(x::Vector{T}, κ::T, κL::T, κR::T, lo::T, hi::T) where {T} = roughness_operator(x, κ, lo, hi)
 _operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T} =
     roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
+
+# `_operator` on the unbounded line.
+_operator(x::Vector{T}, κ::T, κL::T, κR::T) where {T} = _operator(x, κ, κL, κR, T(-Inf), T(Inf))
+_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
+    _operator(x, κs, κL, κR, T(-Inf), T(Inf))
 
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
 function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
@@ -545,11 +495,13 @@ end
 _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:AbstractFloat} =
     _solve_amplitude(roughness_operator(x, κ), w; kwargs...)
 
-# ∫ ψ² dx for the hyperbolic interpolant with exponential tails, as a tridiagonal
-# quadratic form evaluated at the nodal amplitudes.
-function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+# ∫ ψ² dx for the hyperbolic interpolant with exponential tails, as a tridiagonal quadratic
+# form evaluated at the nodal amplitudes, with an optional natural boundary at `lo`/`hi`. The
+# tail mass is `_tail_mass(ψ_edge, κ, Δ)` — ψ₁²/(2κ) as Δ → ∞ (an unbounded side), or
+# ψ₁²(tanh u + u·sech²u)/(2κ) at a finite gap.
+function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T, lo::T, hi::T) where {T}
     n = length(x)
-    Z = (ψ[1]^2 + ψ[n]^2) / (2κ)    # tails
+    Z = _tail_mass(ψ[1], κ, x[1] - lo) + _tail_mass(ψ[n], κ, hi - x[n])
     for k in 1:n-1
         θ = κ * (x[k+1] - x[k])
         ct, cs = coth(θ), csch(θ)
@@ -562,44 +514,15 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     return Z
 end
 
-# `_norm_sq` with an optional natural boundary: the tail mass ψ₁²/(2κ) becomes
-# ψ₁²(tanh u + u·sech²u)/(2κ) at each finite gap. Defers to the unbounded form above when both
-# `lo` and `hi` are infinite.
-function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _norm_sq(x, ψ, κ)
-    n = length(x)
-    Z = _tail_mass(ψ[1], κ, x[1] - lo) + _tail_mass(ψ[n], κ, hi - x[n])
-    for k in 1:n-1
-        θ = κ * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
-        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-    end
-    return Z
-end
+# `_norm_sq` on the unbounded line.
+_norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _norm_sq(x, ψ, κ, T(-Inf), T(Inf))
 
-# ∫ ψ² dx for a piecewise-constant scale. The interpolant on interval k and the tail decays
-# are set by the rates themselves, not by the operator's overall factor, so this is the
-# physical mass whatever κ̄ the amplitude was solved in.
-function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T}
-    n = length(x)
-    Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
-    for k in 1:n-1
-        κ = κs[k]
-        θ = κ * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
-        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-    end
-    return Z
-end
-
-# The piecewise `_norm_sq` with an optional natural boundary. Defers to the unbounded form
-# above when both `lo` and `hi` are infinite.
+# ∫ ψ² dx for a piecewise-constant scale, with an optional natural boundary at `lo`/`hi`. The
+# interpolant on interval k and the tail decays are set by the rates themselves, not by the
+# operator's overall factor, so this is the physical mass whatever κ̄ the amplitude was solved
+# in. Each tail is `_tail_mass(ψ_edge, κ_edge, Δ)` — ψ_edge²/(2κ_edge) as Δ → ∞ (an unbounded
+# side), or the boundary-segment mass at a finite gap.
 function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _norm_sq(x, ψ, κs, κL, κR)
     n = length(x)
     Z = _tail_mass(ψ[1], κL, x[1] - lo) + _tail_mass(ψ[n], κR, hi - x[n])
     for k in 1:n-1
@@ -613,33 +536,17 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T, l
     return Z
 end
 
-# Z = ∫ψ² and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ: the mass and the action of its Gram operator,
-# from one pass over the per-interval coth/csch coefficients. The leave-one-out expansion
-# needs both. Each tail decays at its own rate, and each interval integrates at its own.
-function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
-    n = length(x)
-    Gψ = zeros(T, n)
-    Z = ψ[1]^2 / (2κL) + ψ[n]^2 / (2κR)     # tails
-    Gψ[1] += ψ[1] / (2κL)
-    Gψ[n] += ψ[n] / (2κR)
-    for k in 1:n-1
-        κk = _kappa(κ, k)
-        θ = κk * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κk)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κk)
-        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-        Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
-        Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
-    end
-    return Z, Gψ
-end
+# `_norm_sq` for a piecewise-constant scale on the unbounded line.
+_norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
+    _norm_sq(x, ψ, κs, κL, κR, T(-Inf), T(Inf))
 
-# `_norm_sq_gram` with an optional natural boundary. `Gψᵢ = tail-mass(ψᵢ)/ψᵢ` at a boundary node
-# reduces to the unbounded `ψᵢ/(2κ_edge)` since the tail mass is homogeneous degree 2 in ψᵢ; the
-# `isinf` branch below takes the unbounded code path exactly rather than relying on that algebra.
+# Z = ∫ψ² and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ, with an optional natural boundary at `lo`/`hi`: the
+# mass and the action of its Gram operator, from one pass over the per-interval coth/csch
+# coefficients. The leave-one-out expansion needs both. Each tail decays at its own rate and
+# contributes `_tail_mass(ψ_edge, κ_edge, Δ)` to `Z`; `Gψᵢ = tail-mass(ψᵢ)/ψᵢ` at a boundary
+# node reduces to `ψᵢ/(2κ_edge)` as Δ → ∞ (an unbounded side) since the tail mass is homogeneous
+# degree 2 in ψᵢ.
 function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _norm_sq_gram(x, ψ, κ, κL, κR)
     n = length(x)
     Gψ = zeros(T, n)
     tl = _tail_mass(ψ[1], κL, x[1] - lo)
@@ -659,6 +566,10 @@ function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, h
     end
     return Z, Gψ
 end
+
+# `_norm_sq_gram` on the unbounded line.
+_norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _norm_sq_gram(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
@@ -687,18 +598,20 @@ function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
 end
 
 # ∫ψ⁴ dx = ∫Q² for the hyperbolic interpolant with exponential tails, as a sum of per-interval
-# closed forms. On each interval ψ solves ψ'' = κ²ψ, so u'² - κ²u² = E is constant and
-# d/dx(u³u') = 3u²u'² + κ²u⁴; integrating gives ∫u⁴ = ([u³u']ₖ^{k+1} - 3E ∫u²)/(4κ²). The
-# boundary and energy terms are written through coshθ - 1 = 2 sinh²(θ/2) and the endpoint
-# difference q - p, keeping them accurate for near-coincident points (θ → 0, where the naive
-# csch⁴ forms lose all precision) while staying finite for isolated points (θ → ∞). Used by
-# select_kappa_cv for the ∫Q² term.
+# closed forms, with an optional natural boundary at `lo`/`hi`. On each interval ψ solves
+# ψ'' = κ²ψ, so u'² - κ²u² = E is constant and d/dx(u³u') = 3u²u'² + κ²u⁴; integrating gives
+# ∫u⁴ = ([u³u']ₖ^{k+1} - 3E ∫u²)/(4κ²). The boundary and energy terms are written through
+# coshθ - 1 = 2 sinh²(θ/2) and the endpoint difference q - p, keeping them accurate for
+# near-coincident points (θ → 0, where the naive csch⁴ forms lose all precision) while staying
+# finite for isolated points (θ → ∞). Used by select_kappa_cv for the ∫Q² term.
 #
 # The derivation is local to one interval, so a piecewise-constant scale changes nothing but
-# which κ each term carries.
-function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
+# which κ each term carries. Each tail is `_tail_quartic(ψ_edge, κ_edge, Δ)` — ψ_edge⁴/(4κ_edge)
+# as Δ → ∞ (an unbounded side), or the boundary-segment quartic at a finite gap; the interior
+# sum is untouched by a boundary.
+function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     n = length(x)
-    Q2 = ψ[1]^4 / (4κL) + ψ[n]^4 / (4κR)    # tails: ∫ψ₁⁴ e^{4κL(x-x₁)} dx and its mirror
+    Q2 = _tail_quartic(ψ[1], κL, x[1] - lo) + _tail_quartic(ψ[n], κR, hi - x[n])
     for k in 1:n-1
         κk = _kappa(κ, k)
         p, q = ψ[k], ψ[k+1]
@@ -715,6 +628,10 @@ function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
     end
     return Q2
 end
+
+# `_int_quartic` on the unbounded line.
+_int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _int_quartic(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _int_quartic(x, ψ, κ, κ, κ)
 
 # ∫ψ̂⁴ over a boundary segment of gap Δ: ψ₁⁴(3θ + 2sinh 2θ + sinh(4θ)/4)/(8κ cosh⁴θ) at θ = κΔ,
@@ -729,30 +646,6 @@ function _tail_quartic(ψ1::T, κ::T, Δ::T) where {T}
     p = exp(-2θ)
     num = 6θ * p^2 - 2p * expm1(-4θ) - expm1(-8θ) / 4
     return ψ1^4 * num / (κ * (oneunit(T) + p)^4)
-end
-
-# `_int_quartic` with an optional natural boundary: the tail term ψ₁⁴/(4κ) becomes the boundary
-# segment's `_tail_quartic` at each finite gap. Defers to the unbounded form above when both `lo`
-# and `hi` are infinite; the interior sum is untouched by a boundary.
-function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _int_quartic(x, ψ, κ, κL, κR)
-    n = length(x)
-    Q2 = _tail_quartic(ψ[1], κL, x[1] - lo) + _tail_quartic(ψ[n], κR, hi - x[n])
-    for k in 1:n-1
-        κk = _kappa(κ, k)
-        p, q = ψ[k], ψ[k+1]
-        θ = κk * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        Δ = q - p
-        cm1 = 2 * sinh(θ / 2)^2
-        boundary = κk * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))
-        E = κk^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)
-        fdiag  = (ct - θ * cs^2) / (2κk)
-        fcross = cs * (θ * ct - one(T)) / (2κk)
-        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q
-        Q2 += (boundary - 3 * E * Iseg) / (4κk^2)
-    end
-    return Q2
 end
 
 # (dM/dκ) ψ: the κ-derivative of roughness_operator's coth/csch entries, applied to ψ. The tails are
@@ -1288,61 +1181,34 @@ function _sweep_coeffs(κ::T, h::T) where {T}
     return c₁, c₂, c₃, c₄
 end
 
-# α = L₀⁻¹ψ_cl at the nodes, mᵢ = α(xᵢ). With u∓ the solutions of 𝒜u = 0 decaying at ∓∞ and
-# C = v₋u₊ - u₋v₊ their flux Wronskian (constant, by Abel), Ĝ(x,y) = u₋(x∧y)u₊(x∨y)/C, so
-#   α(x) = [u₊(x)∫_{-∞}^x u₋ψ_cl + u₋(x)∫_x^∞ u₊ψ_cl] / (2λC).
-# Each tail fixes one solution: u₋ = e^{κL(x-x₁)} to the left of x₁ (normalized to 1 there,
-# whence v₋ = u₋/κL), and its mirror to the right. Since u∓ grow like e^{±∫κ}, they are
-# propagated — along with their accumulations — scaled by e^{∓∫κ}, which is what keeps the
-# recursions bounded; the scale factors cancel identically in α, so it is assembled from the
-# scaled quantities alone.
-function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T) where {T}
-    n = length(x)
-    û₋ = similar(ψ); v̂₋ = similar(ψ); Â = similar(ψ)   # u₋, v₋, ∫_{-∞}^x u₋ψ_cl
-    û₊ = similar(ψ); v̂₊ = similar(ψ); B̂ = similar(ψ)   # u₊, -v₊, ∫_x^∞ u₊ψ_cl
-    û₋[1] = one(T); v̂₋[1] = inv(κL); Â[1] = ψ[1] / (2κL)
-    for k in 1:n-1
-        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
-        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
-        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2      # e^{-θ}cosh θ, e^{-θ}sinh θ
-        Â[k+1] = e * Â[k] + û₋[k] * (ψ[k] * c₁ + ψ[k+1] * c₂) +
-                            κk * v̂₋[k] * (ψ[k] * c₃ + ψ[k+1] * c₄)
-        û₋[k+1] = û₋[k] * ch + κk * v̂₋[k] * sh
-        v̂₋[k+1] = û₋[k] * sh / κk + v̂₋[k] * ch
-    end
-    û₊[n] = one(T); v̂₊[n] = inv(κR); B̂[n] = ψ[n] / (2κR)
-    for k in n-1:-1:1
-        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
-        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
-        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2
-        B̂[k] = e * B̂[k+1] + û₊[k+1] * (ψ[k+1] * c₁ + ψ[k] * c₂) +
-                            κk * v̂₊[k+1] * (ψ[k+1] * c₃ + ψ[k] * c₄)
-        û₊[k] = û₊[k+1] * ch + κk * v̂₊[k+1] * sh
-        v̂₊[k] = û₊[k+1] * sh / κk + v̂₊[k+1] * ch
-    end
-    Ĉ = û₊[1] / κL + v̂₊[1]              # the Wronskian, in the scaled variables
-    return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
-end
-
-# `_node_alpha` with an optional natural boundary at `lo`/`hi`: the interior sweep is untouched,
-# and only the tail anchors change — the decaying tail's v̂₋[1] = 1/κL and Â[1] = ψ₁/(2κL) become
-# the boundary segment's Dirichlet-to-Neumann flux `tanh(θL)/κL` and its ∫u₋ψ_cl, which is
-# `_tail_mass(ψ₁, κL, ΔL)/ψ₁` (the same integral `_norm_sq` already needs, since u₋ and ψ_cl are
-# the same cosh arc up to normalization); mirror on the right. The Wronskian becomes
-# `û₊[1]·v̂₋[1] + v̂₊[1]`, which reduces to the unbounded `û₊[1]/κL + v̂₊[1]` when v̂₋[1] = 1/κL.
-# Defers to the unbounded form above when both `lo` and `hi` are infinite.
+# α = L₀⁻¹ψ_cl at the nodes, mᵢ = α(xᵢ), with an optional natural boundary at `lo`/`hi`. With u∓
+# the solutions of 𝒜u = 0 decaying at ∓∞ (or, at a finite boundary, the Dirichlet-to-Neumann
+# solution rooted at the wall) and C = v₋u₊ - u₋v₊ their flux Wronskian (constant, by Abel),
+# Ĝ(x,y) = u₋(x∧y)u₊(x∨y)/C, so
+#   α(x) = [u₊(x)∫_{lo}^x u₋ψ_cl + u₋(x)∫_x^{hi} u₊ψ_cl] / (2λC).
+# Each tail fixes one solution: u₋ = e^{κL(x-x₁)} to the left of x₁ when unbounded (normalized to
+# 1 there, whence v₋ = 1/κL) or the boundary segment's cosh arc when finite (v₋ = the
+# Dirichlet-to-Neumann flux `_tail_diag(κL, ΔL)/κL`), and its mirror to the right. Since u∓ grow
+# like e^{±∫κ}, they are propagated — along with their accumulations — scaled by e^{∓∫κ}, which
+# is what keeps the recursions bounded; the scale factors cancel identically in α, so it is
+# assembled from the scaled quantities alone. `Â[1] = ∫_{lo}^{x₁} u₋ψ_cl / ψ₁` is
+# `_tail_mass(ψ₁, κL, ΔL)/ψ₁` at a finite boundary (the same integral `_norm_sq` needs, since u₋
+# and ψ_cl are the same cosh arc up to normalization) or `ψ₁/(2κL)` unbounded; mirror on the
+# right. The Wronskian `Ĉ = û₊[1]·v̂₋[1] + v̂₊[1]` at a finite boundary specializes to
+# `û₊[1]/κL + v̂₊[1]` unbounded (v̂₋[1] = 1/κL there); the specialization is written explicitly
+# rather than folded into the product so the unbounded value picks up only the one rounding a
+# direct division does.
 function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _node_alpha(x, ψ, κ, κL, κR, λ)
     n = length(x)
-    û₋ = similar(ψ); v̂₋ = similar(ψ); Â = similar(ψ)
-    û₊ = similar(ψ); v̂₊ = similar(ψ); B̂ = similar(ψ)
+    û₋ = similar(ψ); v̂₋ = similar(ψ); Â = similar(ψ)   # u₋, v₋, ∫_{lo}^x u₋ψ_cl
+    û₊ = similar(ψ); v̂₊ = similar(ψ); B̂ = similar(ψ)   # u₊, -v₊, ∫_x^{hi} u₊ψ_cl
     û₋[1] = one(T)
     v̂₋[1] = isfinite(lo) ? _tail_diag(κL, x[1] - lo) / κL : inv(κL)
     Â[1]  = isfinite(lo) ? _tail_mass(ψ[1], κL, x[1] - lo) / ψ[1] : ψ[1] / (2κL)
     for k in 1:n-1
         κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
         c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
-        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2
+        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2      # e^{-θ}cosh θ, e^{-θ}sinh θ
         Â[k+1] = e * Â[k] + û₋[k] * (ψ[k] * c₁ + ψ[k+1] * c₂) +
                             κk * v̂₋[k] * (ψ[k] * c₃ + ψ[k+1] * c₄)
         û₋[k+1] = û₋[k] * ch + κk * v̂₋[k] * sh
@@ -1360,18 +1226,24 @@ function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T, lo:
         û₊[k] = û₊[k+1] * ch + κk * v̂₊[k+1] * sh
         v̂₊[k] = û₊[k+1] * sh / κk + v̂₊[k+1] * ch
     end
-    Ĉ = û₊[1] * v̂₋[1] + v̂₊[1]
+    Ĉ = isfinite(lo) ? û₊[1] * v̂₋[1] + v̂₊[1] : û₊[1] / κL + v̂₊[1]   # the Wronskian
     return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
 end
 
-# ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α. On each interval α solves 𝒜α = ψ_cl/(2λ) at constant κ against a
-# hyperbolic source, so it is the interpolant of its own nodal values mₖ plus the resonant
-# particular solution s·cosh(κs) that the source forces; the tails are the same computation
-# with ψ_cl ∝ e^{∓κ(x-x_edge)}, where α acquires the same resonant factor.
-function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T) where {T}
+# `_node_alpha` on the unbounded line.
+_node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T) where {T} =
+    _node_alpha(x, ψ, κ, κL, κR, λ, T(-Inf), T(Inf))
+
+# ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α, with an optional natural boundary at `lo`/`hi`. On each interval α
+# solves 𝒜α = ψ_cl/(2λ) at constant κ against a hyperbolic source, so it is the interpolant of
+# its own nodal values mₖ plus the resonant particular solution s·cosh(κs) that the source
+# forces; the interior sum is untouched by a boundary. Each tail is `_tail_psi_alpha` — the same
+# computation with ψ_cl ∝ e^{∓κ(x-x_edge)} and α acquiring the same resonant factor when
+# unbounded, or the boundary segment's closed form at a finite gap.
+function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T,
+                        lo::T, hi::T) where {T}
     n = length(x)
-    acc = ψ[1] * m[1] / (2κL) + ψ[1]^2 / (16λ * κL) +
-          ψ[n] * m[n] / (2κR) + ψ[n]^2 / (16λ * κR)
+    acc = _tail_psi_alpha(ψ[1], m[1], κL, λ, x[1] - lo) + _tail_psi_alpha(ψ[n], m[n], κR, λ, hi - x[n])
     for k in 1:n-1
         κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
         f = κk / (4λ)
@@ -1388,6 +1260,10 @@ function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, �
     end
     return acc
 end
+
+# `_int_psi_alpha` on the unbounded line.
+_int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T) where {T} =
+    _int_psi_alpha(x, ψ, m, κ, κL, κR, λ, T(-Inf), T(Inf))
 
 # ∫₀^Δ ψ(s)α(s) ds over a boundary segment (Neumann wall at s=0, node at s=Δ), or the unbounded
 # tail's closed form ψ₁m₁/(2κ) + ψ₁²/(16λκ) as Δ → ∞. On the segment ψ(s) = ψ₁cosh(κs)/cosh(θ)
@@ -1407,31 +1283,6 @@ function _tail_psi_alpha(ψ1::T, m1::T, κ::T, λ::T, Δ::T) where {T}
         return ψ1 * (B̃ * cr^2 + Ã * s * cr * sr)
     end
     return quadgk(ψα, zero(T), Δ; rtol = sqrt(eps(T)))[1]
-end
-
-# `_int_psi_alpha` with an optional natural boundary: the exponential-tail terms become the
-# boundary segments' `_tail_psi_alpha`. Defers to the unbounded form above when both `lo` and
-# `hi` are infinite; the interior sum is untouched by a boundary.
-function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T,
-                        lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _int_psi_alpha(x, ψ, m, κ, κL, κR, λ)
-    n = length(x)
-    acc = _tail_psi_alpha(ψ[1], m[1], κL, λ, x[1] - lo) + _tail_psi_alpha(ψ[n], m[n], κR, λ, hi - x[n])
-    for k in 1:n-1
-        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
-        f = κk / (4λ)
-        β = f * h * _cosh_ratio(θ, θ)
-        a₁ = m[k] + β * ψ[k]; a₂ = m[k+1] + β * ψ[k+1]
-        function ψα(s)
-            r = h - s
-            pr = _sinh_ratio(κk * r, θ); ps = _sinh_ratio(κk * s, θ)
-            α = a₁ * pr + a₂ * ps -
-                f * (ψ[k] * r * _cosh_ratio(κk * r, θ) + ψ[k+1] * s * _cosh_ratio(κk * s, θ))
-            return (ψ[k] * pr + ψ[k+1] * ps) * α
-        end
-        acc += quadgk(ψα, zero(h), h; rtol = sqrt(eps(T)))[1]
-    end
-    return acc
 end
 
 # Diagonal of the inverse of a symmetric tridiagonal, O(N), from its top-down and
@@ -1778,11 +1629,13 @@ end
 # functional is Z — so it holds for a piecewise-constant scale unchanged. The overall factor the
 # adaptive operator carries (see `roughness_operator`) leaves ψ and the leave-one-out densities
 # invariant: under M → cM the pieces move as φ → φ/√c, Z → Z/c, H → cH, (H⁻¹)ᵢᵢ → (H⁻¹)ᵢᵢ/c,
-# Gφ → Gφ/√c and v → v/c^{3/2}, and every term above is a ratio in which c cancels.
-function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
-    M = _operator(nodes, κ, κL, κR)
+# Gφ → Gφ/√c and v → v/c^{3/2}, and every term above is a ratio in which c cancels. An optional
+# natural boundary at `lo`/`hi` needs only the bounded `_operator` and `_norm_sq_gram`, per the
+# same argument.
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
-    Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR)
+    Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
     H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
     gii = _inv_diag(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
@@ -1791,38 +1644,14 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where 
     return ψ, looi
 end
 
-# `_loo_density` with an optional natural boundary. Nothing in the expansion above uses M's
-# entries beyond it being the fit's SPD operator, so a finite `lo`/`hi` needs only the bounded
-# `_operator` and `_norm_sq_gram`; defers to the unbounded form when both are infinite.
-function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _loo_density(nodes, w, κ, κL, κR)
-    M = _operator(nodes, κ, κL, κR, lo, hi)
-    φ = _solve_amplitude(M, w)
-    Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
-    H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
-    gii = _inv_diag(H)
-    v = ldiv!(ldlt!(H), Gφ)
-    ψ = φ ./ sqrt(Z)
-    looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
-    return ψ, looi
-end
+# `_loo_density` on the unbounded line.
+_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
 
-# Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
-# estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)².
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
-    ψ, looi = _loo_density(nodes, w, κ, κL, κR)
-    N = sum(w)
-    cross = zero(T)
-    for i in eachindex(w, looi)
-        cross += w[i] * looi[i]
-    end
-    return _int_quartic(nodes, ψ, κ, κL, κR) - 2 * cross / N
-end
-_lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
-
-# `_lscv` with an optional natural boundary; defers to the unbounded form when both are infinite.
+# Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ), with an optional
+# natural boundary at `lo`/`hi`: an unbiased estimate, up to the κ-independent ∫Q², of the
+# integrated squared error ∫(Q̂-Q)².
 function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _lscv(nodes, w, κ, κL, κR)
     ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
     N = sum(w)
     cross = zero(T)
@@ -1832,24 +1661,17 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
     return _int_quartic(nodes, ψ, κ, κL, κR, lo, hi) - 2 * cross / N
 end
 
-# Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
-# -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ): an estimate, up to a κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses
-# the same first-order leave-one-out densities as _lscv. A non-positive Q̂₋ᵢ (possible where the
-# first-order expansion overshoots) makes the log undefined; return NaN so the search rejects κ.
-function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
-    _, looi = _loo_density(nodes, w, κ, κL, κR)
-    s = zero(T)
-    for i in eachindex(w, looi)
-        looi[i] > 0 || return T(NaN)
-        s += w[i] * log(looi[i])
-    end
-    return -s / sum(w)
-end
-_klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
+# `_lscv` on the unbounded line.
+_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
+_lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
 
-# `_klcv` with an optional natural boundary; defers to the unbounded form when both are infinite.
+# Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
+# -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
+# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same first-order leave-one-out densities as
+# _lscv. A non-positive Q̂₋ᵢ (possible where the first-order expansion overshoots) makes the log
+# undefined; return NaN so the search rejects κ.
 function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    isinf(lo) && isinf(hi) && return _klcv(nodes, w, κ, κL, κR)
     _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
     s = zero(T)
     for i in eachindex(w, looi)
@@ -1858,6 +1680,11 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
     end
     return -s / sum(w)
 end
+
+# `_klcv` on the unbounded line.
+_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
+_klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
 
 """
     select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
