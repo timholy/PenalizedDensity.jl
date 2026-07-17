@@ -33,10 +33,9 @@ inter-node interval, and at the outermost nodes for the two tails, so the fit re
 a piecewise-constant scale: `d.κ[k]` is the rate on `(d.x[k], d.x[k+1])`, and `d.κL`,
 `d.κR` the tail rates. Making `κ` large where the density is high and small where it is
 low buys resolution where the data can pay for it. The penalty weight is `1/κ(x)²` on
-`(ψ')²`, which keeps the pressure to normalize spatially uniform. The exact goodness-of-fit
-machinery ([`chisq_reference`](@ref) and everything built on it) supports a varying `κ`;
-only the large-`N` approximation ([`expected_chisq`](@ref)`(d)`, `method=:largeN`) needs a
-constant one, and throws otherwise.
+`(ψ')²`, which keeps the pressure to normalize spatially uniform. The goodness-of-fit
+machinery ([`chisq_reference`](@ref) and everything built on it, including the large-`N`
+`method=:largeN` approximation) supports a varying `κ` exactly as it does a constant one.
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
@@ -1660,6 +1659,10 @@ discrete data, where the cross-validation scores are unbounded.
 
 `κs` must be sorted and positive, with at least three values to bracket the
 minimum.
+
+This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
+are derived for the unbounded line and do not generalize to a finite domain, so it always
+fits (and returns a scale for) the unbounded problem.
 """
 function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
@@ -1697,6 +1700,10 @@ computing a noisy numerical derivative.
 Returns the half-entropy scale `κ` (`h = 1/2`) together with the interval `[lo, hi]`
 bracketing `h ∈ [(1-level)/2, (1+level)/2]`; the default `level=0.2` spans `h ∈ [0.4, 0.6]`.
 Requires at least two distinct points.
+
+This selector takes no `support` keyword: the exact `κ → 0`/`κ → ∞` entropy limits it relies
+on are derived for the unbounded line, so it always fits (and returns a scale for) the
+unbounded problem.
 """
 function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1e-6)
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))

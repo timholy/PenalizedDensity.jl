@@ -1323,7 +1323,7 @@ end
 
     @testset "field Monte Carlo: bounded uniform (both walls, flagship)" begin
         # The flagship case: a natural boundary makes the flat field exactly representable,
-        # which no unbounded or spatially-varying-κ fit could do (CHUNK-B0's ceiling result).
+        # which no unbounded or spatially-varying-κ fit could do.
         Random.seed!(63)
         x = sort(rand(400) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, 1.0)); support=(0.0, 1.0))
@@ -1471,6 +1471,26 @@ end
         @test_throws "need at least 3 values in κs to bracket the minimum" select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
         @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; rtol=-1.0)
         @test_throws "rtol must be nonnegative" select_support([1.0, 2.0, 3.0]; rtol=-1.0)
+    end
+
+    @testset "_edge_spacing and _select_gap failure paths" begin
+        # Fewer than two points near the edge: unreachable through select_support itself (its
+        # upstream κ selection already demands at least two distinct points), so exercised
+        # directly, as the `_select_c` failure paths above are.
+        @test_throws ArgumentError PenalizedDensity._edge_spacing([5.0], :left)
+        @test_throws "need at least two distinct points to seed a boundary search" PenalizedDensity._edge_spacing([5.0], :left)
+
+        # Ten points coincide at the left edge: zero spacing to seed a search from. Reachable
+        # through the public API when many duplicates sit at one edge.
+        x = vcat(fill(0.0, 10), [100.0])
+        @test_throws ArgumentError select_support(x)
+        @test_throws "the 10 points nearest the left edge coincide" select_support(x)
+
+        # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
+        @test_throws ErrorException PenalizedDensity._select_gap(gap -> NaN, 1.0)
+        @test_throws "no resolvable boundary gap" PenalizedDensity._select_gap(gap -> NaN, 1.0)
+        @test_throws ErrorException PenalizedDensity._select_gap(gap -> -gap, 1.0)
+        @test_throws "kept running off its search bracket" PenalizedDensity._select_gap(gap -> -gap, 1.0)
     end
 
     @testset "generic indexing: OffsetVector input" begin
