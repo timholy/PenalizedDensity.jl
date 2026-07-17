@@ -5,7 +5,7 @@ using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcx
 using Statistics: Statistics, quantile
 
-export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, kappa_interval
+export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export cdf, quantile
@@ -1987,21 +1987,54 @@ const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum befor
 # Minimize `score(c)` over ln c, bracketed by a geometric grid about `c0` and recentered on
 # the best edge until the minimum falls strictly inside. Unresolvable candidates score
 # non-finite; treating those as +∞ lets the search step over them.
-function _select_c(score, c0::T) where {T}
+#
+# `span`/`ngrid`/`iters`/`maxshifts` default to the plug-in-scale search's own constants but
+# are independently tunable — `select_support` reuses this same coarse-grid-then-golden-with-
+# recentering pattern for both its finite-gap search (a wide span, since the gap's effect on
+# the score is gentle over a broad range) and its chained inner κ search (a narrow span about
+# the previous gap candidate's optimum). `reverse` visits the coarse grid from the wide end of
+# the bracket to the narrow end instead of the default low-to-high; `select_support`'s gap
+# search needs this so a stateful κ warm start (threaded through `score`) tracks gaps in the
+# wide-to-narrow order the coupling between gap and κ assumes. `label` names the candidate in
+# the two error messages.
+# `bounds`, when given, is an absolute `(lo, hi)` the search may never recenter past: an edge
+# minimum that coincides with a clamped bound is accepted outright rather than triggering
+# another shift, since there is nowhere sane left to look. `select_support`'s chained κ search
+# uses this to stay inside the data-scaled range `select_kappa_kl` itself would ever consider —
+# without it, a handful of gap candidates can warm-start each other up an unbounded chain into
+# a regime where the first-order LOO expansion is no longer trustworthy and spuriously reports
+# ever-improving scores (observed directly: KLCV score turning unboundedly negative for
+# κ ≳ 1e6 on data where every sane candidate sits below 1e4).
+function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::Int=_CITERS,
+                   maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
+                   bounds::Union{Nothing,Tuple{Real,Real}}=nothing) where {T}
     f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
-    lnspan = log(T(_CSPAN))
-    for _ in 0:_CSHIFTS
-        lncs = range(log(c0) - lnspan, log(c0) + lnspan; length=_CGRID)
-        scores = f.(lncs)
+    lnspan = log(T(span))
+    lnbounds = bounds === nothing ? nothing : (log(T(bounds[1])), log(T(bounds[2])))
+    for _ in 0:maxshifts
+        loln, hiln = log(c0) - lnspan, log(c0) + lnspan
+        if lnbounds !== nothing
+            loln, hiln = max(loln, lnbounds[1]), min(hiln, lnbounds[2])
+            loln < hiln || return exp(clamp(log(c0), lnbounds[1], lnbounds[2]))
+        end
+        lncs = range(loln, hiln; length=ngrid)
+        scores = Vector{T}(undef, ngrid)
+        for j in (reverse ? (ngrid:-1:1) : (1:ngrid))
+            scores[j] = f(lncs[j])
+        end
         all(==(typemax(T)), scores) &&
-            error("no resolvable smoothing scale anywhere in the search bracket around c = $c0")
+            error("no resolvable $label anywhere in the search bracket around c = $c0")
         i = argmin(scores)
         if i != firstindex(lncs) && i != lastindex(lncs)
-            return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters=_CITERS))
+            return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters))
+        end
+        if lnbounds !== nothing
+            i == firstindex(lncs) && lncs[i] <= lnbounds[1] && return exp(lnbounds[1])
+            i == lastindex(lncs) && lncs[i] >= lnbounds[2] && return exp(lnbounds[2])
         end
         c0 = exp(lncs[i])                       # recenter on the winning edge and search on
     end
-    error("the smoothing scale kept running off its search bracket after $_CSHIFTS expansions")
+    error("the $label kept running off its search bracket after $maxshifts expansions")
 end
 
 """
@@ -2044,13 +2077,13 @@ is the node-merging tolerance, as a fraction of the local smoothing length, matc
 candidate scale on a finite domain, as [`DensityEstimate`](@ref)'s `support` does; it is a
 fixed hyperparameter of the search, not itself selected, and is held fixed across every
 candidate `α`/`c`. Data outside `[a, b]`, or `a ≥ b`, throws a `DomainError`. Composing this
-selector with a boundary search that chooses `support` (and a constant `κ`) by the same
-cross-validation score is two documented steps, not one entry point: choose the support first,
-then pass it here, then fit `DensityEstimate(x, κ; support)` with the scale this returns.
-Because `support` is fixed throughout the `α` search, composing this way re-runs that search on
-each boundary arm's own domain, so `α` gets to respond to whatever regularity a boundary
-already bought (rather than being reused from an unbounded selection that saw a different
-edge).
+selector with [`select_support`](@ref) — which chooses `support` (and a constant `κ`) by the
+same cross-validation score — is two documented steps, not one entry point: call
+`select_support` first, then pass its `support` here, then fit `DensityEstimate(x, κ;
+support)` with the scale this returns. Because `support` is fixed throughout the `α` search,
+composing this way re-runs that search on each boundary arm's own domain, so `α` gets to
+respond to whatever regularity a boundary already bought (rather than being reused from an
+unbounded selection that saw a different edge).
 
 # Examples
 ```jldoctest
@@ -2117,6 +2150,212 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
         end
     end
     return best_α == 0 ? best_c : AdaptiveScale(best_c, best_α, p)
+end
+
+# Mean spacing of the `k` points nearest one edge of the sorted sample `xs`: the local scale a
+# finite-boundary search brackets around. A true edge's optimal boundary sits within a few such
+# spacings, and the score degrades only gently out to several tens.
+function _edge_spacing(xs::Vector{T}, side::Symbol; k::Int=10) where {T}
+    n = length(xs)
+    m = min(k, n)
+    m >= 2 || throw(ArgumentError("need at least two distinct points to seed a boundary search"))
+    spacing = side === :left ? (xs[m] - xs[1]) / (m - 1) : (xs[n] - xs[n-m+1]) / (m - 1)
+    spacing > 0 ||
+        throw(ArgumentError("the $m points nearest the $side edge coincide; cannot seed a " *
+                            "boundary search from a zero spacing"))
+    return spacing
+end
+
+# KLCV score at scale κ on the fixed support (lo, hi), merging at the tolerance κ implies. An
+# unresolvable candidate (too few surviving nodes, or a factorization that hits an exact zero
+# pivot) scores NaN, which `_select_c` treats as +∞ and steps over.
+function _support_klcv(xs::Vector{T}, rtol::T, κ::T, lo::T, hi::T) where {T}
+    nodes, w = _merge_presorted(xs, rtol / κ)
+    length(nodes) >= 2 || return T(NaN)
+    try
+        return _klcv(nodes, w, κ, κ, κ, lo, hi)
+    catch e
+        e isa ZeroPivotException && return T(NaN)
+        rethrow()
+    end
+end
+
+const _CHAIN_SPAN = 4.0    # the chained κ search's window, ×/÷ this factor about the warm start
+const _CHAIN_GRID = 9      # its coarse grid: smaller than the plug-in-scale search's, since the
+                           # window is narrow and it runs once per gap candidate
+const _CHAIN_ITERS = 12
+const _GAP_LO_MULT = 5.0   # the gap bracket's lower end, × the edge spacing — a hard floor,
+                           # never crossed even by recentering (see `_select_gap`)
+const _GAP_HI_MULT = 100.0 # the bracket's upper end, extensible outward
+const _GAP_GRID = 9
+const _GAP_ITERS = 12
+
+# Best κ at the fixed support (lo, hi): golden-section on ln κ in a window ×/÷`_CHAIN_SPAN`
+# about the warm start `κ0`, recentering at the window edge (the `_select_c` discipline,
+# reused directly) up to a bounded number of times before erring. `κ_bounds` caps the absolute
+# range (see `_select_c`'s note): without it, a chain of gap candidates can warm-start each
+# other beyond where the LOO expansion stays trustworthy.
+_select_kappa_at_support(xs::Vector{T}, rtol::T, lo::T, hi::T, κ0::T, κ_bounds::Tuple{T,T}) where {T} =
+    _select_c(κ -> _support_klcv(xs, rtol, κ, lo, hi), κ0;
+             span=_CHAIN_SPAN, ngrid=_CHAIN_GRID, iters=_CHAIN_ITERS, bounds=κ_bounds)
+
+# Golden-section-refined grid search for one side's boundary gap, over ln(gap) starting from
+# the bracket [`_GAP_LO_MULT`, `_GAP_HI_MULT`] × `spacing` and extending outward — never
+# inward, past the floor — when the grid's minimum sits at the high edge: a more distant wall
+# is always a safe direction to keep searching, since it converges to the unbounded fit as the
+# gap grows. The low edge is a hard floor, the tightest gap ever tried: within a few edge
+# spacings of the extreme data point, a natural (Neumann) boundary reflects the nearest
+# interior points back onto it and inflates that point's leave-one-out likelihood on *any*
+# sample, genuine edge or not — checked directly against a brute-force leave-one-out refit, so
+# this is a property of the reflecting boundary condition itself, not an artifact of the
+# package's first-order LOO expansion. Unlike `_select_c`'s two-sided recentering (which would
+# chase this reflection effect down to an arbitrarily tight, spurious gap on every sample,
+# hard-edge or smooth alike), only the outward direction is treated as informative.
+function _select_gap(score, spacing::T) where {T}
+    f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
+    lo0 = log(spacing) + log(T(_GAP_LO_MULT))
+    hi0 = log(spacing) + log(T(_GAP_HI_MULT))
+    for _ in 0:_CSHIFTS
+        lncs = range(lo0, hi0; length=_GAP_GRID)
+        scores = Vector{T}(undef, _GAP_GRID)
+        for j in _GAP_GRID:-1:1        # visit wide (large gap) to narrow (small gap)
+            scores[j] = f(lncs[j])
+        end
+        all(==(typemax(T)), scores) &&
+            error("no resolvable boundary gap anywhere in the search bracket above $(exp(lo0))")
+        i = argmin(scores)
+        i == firstindex(lncs) && return exp(lo0)     # hit the floor: accept it, don't recenter
+        i == lastindex(lncs) || return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters=_GAP_ITERS))
+        lo0, hi0 = hi0, hi0 + (hi0 - lo0)            # extend outward and search on
+    end
+    error("the boundary gap kept running off its search bracket after $_CSHIFTS expansions")
+end
+
+# Finite-boundary search for one side (:left or :right), the opposite side fixed at
+# `other_lo`/`other_hi`. `_select_gap` finds the gap; κ is re-optimized at every candidate by
+# `_select_kappa_at_support` in a window warm-started from the *previous* (wider) candidate's
+# optimum, so consecutive candidates' optima — which move continuously with the gap — stay
+# inside their narrow search window rather than triggering its recentering fallback. `κ0`
+# warm-starts the widest candidate. Returns the winning `(gap, κ, score)`; `score` is directly
+# comparable to the ∞ arm's (the same support with this side left unbounded).
+function _search_boundary(xs::Vector{T}, rtol::T, κ0::T, side::Symbol,
+                          other_lo::T, other_hi::T, κ_bounds::Tuple{T,T}) where {T}
+    spacing = _edge_spacing(xs, side)
+    κstate = Ref(κ0)
+    function score_gap(gap::T)
+        lo, hi = side === :left ? (xs[1] - gap, other_hi) : (other_lo, xs[end] + gap)
+        κ = _select_kappa_at_support(xs, rtol, lo, hi, κstate[], κ_bounds)
+        κstate[] = κ
+        return _support_klcv(xs, rtol, κ, lo, hi)
+    end
+    gap = _select_gap(score_gap, spacing)
+    lo, hi = side === :left ? (xs[1] - gap, other_hi) : (other_lo, xs[end] + gap)
+    κ = _select_kappa_at_support(xs, rtol, lo, hi, κstate[], κ_bounds)
+    return gap, κ, _support_klcv(xs, rtol, κ, lo, hi)
+end
+
+# Whether `challenger` beats `incumbent` by more than floating-point/golden-section noise: a
+# relative margin, not a bare `<`. A KLCV score carries ~1e-10-level noise from golden-section
+# refinement and summation order, and — per `_select_gap`'s note — a boundary at the gap floor
+# can match the unbounded score to within that noise on *any* sample; a genuine edge's gain is
+# orders of magnitude larger (percent-level), so the margin only screens out noise.
+const _SUPPORT_MARGIN = 1e-8
+_beats(challenger::T, incumbent::T) where {T} =
+    challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
+
+"""
+    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=1e-6) -> (; κ, support)
+
+Choose a domain `support = (a, b)` — either side possibly infinite — together with the
+smoothing scale `κ`, jointly, by the same Kullback–Leibler cross-validation score
+[`select_kappa_kl`](@ref) minimizes. Pass the result straight to [`DensityEstimate`](@ref):
+
+    r = select_support(x)
+    d = DensityEstimate(x, r.κ; support = r.support)
+
+Each side is searched independently and sequentially — the left boundary first (with the
+right side unbounded), then the right boundary against the left side's winner — and on each
+side the unbounded (`±Inf`) candidate always competes: that side gets a finite boundary only
+if the best finite candidate's KLCV beats the score of leaving it unbounded by more than a
+small margin (screening out golden-section/floating-point noise, not a real effect size). A
+wall is not always safe to add: placed too far past the data it can raise the KLCV score
+rather than lower it (a flat field props mass into an empty margin where a decaying tail would
+not), so a boundary is imposed only when it wins the same cross-validation that chooses `κ`,
+never assumed from the fact that one side of the data has an edge.
+
+A finite candidate on one side is a gap `Δ > 0`, the distance *outward* from the extreme data
+point on that side (`a = x₁ - Δ` on the left, `b = x_N + Δ` on the right), searched by
+golden-section on `ln Δ` over a bracket of `[5, 100]` times the mean spacing of the ten data
+points nearest that edge (extensible further outward, never inward). The lower end is a hard
+floor, not merely a starting guess: closer than a few edge spacings, a natural boundary
+reflects the nearest interior points back onto the extreme point and inflates its leave-one-out
+likelihood on *any* sample, edge or not, so gaps tighter than the floor are excluded rather
+than searched (this is a property of the reflecting boundary condition itself — confirmed
+against a brute-force leave-one-out refit — not a search artifact). `κ` is re-selected at every
+gap candidate rather than held fixed, because the two are coupled at a hard edge (the optimal
+`κ` can move to a fraction of its unbounded value once a wall is added); candidates are
+searched from the widest gap to the narrowest, and each candidate's `κ` search is warm-started
+in a narrow window about the *previous* candidate's optimum rather than repeating a full search
+from scratch, since `κ*` moves continuously with the gap.
+
+`kappa` (default [`select_kappa_kl`](@ref)) must share [`select_kappa_kl`](@ref)'s
+`(x; κs, rtol, support)` interface (as [`select_kappa_cv`](@ref) does) and is consulted at two
+points only: once at the start, to seed the unbounded arm's competing score and the first (and
+widest) gap candidate's `κ` warm start; and once at the end, to refine `κ` at the winning
+support over the full `κs` bracket a standalone call would use (the chained inner searches
+above use a narrower window, for speed). When neither side wins, the final support is
+`(-Inf, Inf)` and no refinement call is made — the returned `κ` *is* that first call, so
+`select_support(x).κ` equals `kappa(x; κs, rtol)` exactly on a family with nothing to gain from
+a boundary, not merely something close to it. The gap-path searches themselves score every
+candidate directly by the KLCV score `select_kappa_kl` uses, not by calling `kappa` per
+candidate.
+
+`κs` and `rtol` are passed through to `kappa` and set the golden-section bracket and the
+node-merging tolerance (a fraction of the local smoothing length) throughout the search.
+
+# Examples
+```jldoctest
+julia> x = -log.(1 .- (0.5:499.5) ./ 500);   # exponential draw: a jump edge at the left
+
+julia> r = select_support(x);
+
+julia> r.support[1] <= minimum(x) && r.support[2] == Inf   # never inward of the data
+true
+
+julia> d = DensityEstimate(x, r.κ; support = r.support);
+
+julia> d.lo == r.support[1] && d.hi == r.support[2]
+true
+```
+"""
+function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
+                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
+    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+    xs = _sorted_sample(x, T)
+    r = T(rtol)
+    # The chained κ search never leaves the data-scaled range `kappa` itself draws from — see
+    # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
+    κ_bounds = (T(minimum(κs)), T(maximum(κs)))
+
+    κ_inf = T(kappa(xs; κs, rtol))
+    score_cur = _support_klcv(xs, r, κ_inf, T(-Inf), T(Inf))
+    lo, hi, κcur = T(-Inf), T(Inf), κ_inf
+
+    gapL, κL, scoreL = _search_boundary(xs, r, κcur, :left, T(-Inf), hi, κ_bounds)
+    if _beats(scoreL, score_cur)
+        lo, κcur, score_cur = xs[1] - gapL, κL, scoreL
+    end
+
+    gapR, κR, scoreR = _search_boundary(xs, r, κcur, :right, lo, T(Inf), κ_bounds)
+    if _beats(scoreR, score_cur)
+        hi, κcur = xs[end] + gapR, κR
+    end
+
+    κ = isinf(lo) && isinf(hi) ? κ_inf : T(kappa(xs; κs, rtol, support=(lo, hi)))
+    return (; κ, support=(lo, hi))
 end
 
 end # module

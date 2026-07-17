@@ -1276,6 +1276,103 @@ end
     end
 end
 
+@testset "select_support: joint boundary and κ selection" begin
+    # A Student-t(5)-like heavy-tailed draw and a two-component mixture, built from `randn`
+    # alone (no extra test dependency): t5 as a normal over the root-mean-square of five more
+    # normals, the classical variance-mixture construction.
+    _t5(rng) = randn(rng) / sqrt(sum(abs2, randn(rng, 5)) / 5)
+
+    @testset "smooth families decline in every replicate" begin
+        families = (
+            ("gaussian", rng -> randn(rng, 500)),
+            ("t5-like heavy tail", rng -> [_t5(rng) for _ in 1:500]),
+            ("two-component mixture", rng -> vcat(randn(rng, 250) .- 2, randn(rng, 250) .+ 2)),
+        )
+        for (name, gen) in families, seed in 1:3
+            x = gen(Xoshiro(hash((:smoothsupport, name, seed))))
+            r = select_support(x)
+            @test r.support == (-Inf, Inf)
+            # Structural, not coincidental: when neither side wins, the returned κ *is* the
+            # plain `select_kappa_kl(x)` call, not merely close to it.
+            @test r.κ === select_kappa_kl(x)
+        end
+    end
+
+    @testset "exponential: finite left, infinite right" begin
+        for seed in 1:3
+            x = -log.(1 .- rand(Xoshiro(hash((:expsupport, seed))), 1000))
+            r = select_support(x)
+            @test isfinite(r.support[1]) && r.support[2] == Inf
+            xs = sort(x)
+            spacing = PenalizedDensity._edge_spacing(xs, :left)
+            gap = xs[1] - r.support[1]
+            @test 0 < gap < 20 * spacing
+            # The selected (κ, support) fit beats the plain unbounded selection on the same
+            # KLCV score that chooses both.
+            klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
+            κunb = select_kappa_kl(x)
+            klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
+            @test klsel < klunb
+        end
+    end
+
+    @testset "uniform: finite on both sides" begin
+        for seed in 1:3
+            x = rand(Xoshiro(hash((:unifsupport, seed))), 1000)
+            r = select_support(x)
+            @test isfinite(r.support[1]) && isfinite(r.support[2])
+            xs = sort(x)
+            spL = PenalizedDensity._edge_spacing(xs, :left)
+            spR = PenalizedDensity._edge_spacing(xs, :right)
+            @test 0 < xs[1] - r.support[1] < 20 * spL
+            @test 0 < r.support[2] - xs[end] < 20 * spR
+            klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
+            κunb = select_kappa_kl(x)
+            klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
+            @test klsel < klunb
+        end
+    end
+
+    @testset "χ²₁: finite left boundary (divergent edge)" begin
+        for seed in 1:3
+            x = randn(Xoshiro(hash((:chisqsupport, seed))), 500) .^ 2
+            r = select_support(x)
+            @test isfinite(r.support[1]) && r.support[2] == Inf
+        end
+    end
+
+    @testset "input validation" begin
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; rtol=-1.0)
+        @test_throws "rtol must be nonnegative" select_support([1.0, 2.0, 3.0]; rtol=-1.0)
+    end
+
+    @testset "generic indexing: OffsetVector input" begin
+        x = -log.(1 .- rand(Xoshiro(72), 500))
+        r1 = select_support(x)
+        r2 = select_support(OffsetVector(x, -250))
+        @test r1.κ == r2.κ && r1.support == r2.support
+    end
+
+    @testset "seeded reproducibility" begin
+        x = -log.(1 .- rand(Xoshiro(73), 500))
+        r1 = select_support(x)
+        r2 = select_support(x)
+        @test r1.κ === r2.κ && r1.support === r2.support
+    end
+
+    @testset "efficiency (reported, not asserted — see the test log)" begin
+        xbig = randn(Xoshiro(74), 50_000)
+        t1 = @elapsed select_kappa_kl(xbig)
+        t2 = @elapsed select_support(xbig)
+        @info "select_support efficiency at N=50000" t_select_kappa_kl=t1 t_select_support=t2 ratio=t2 / t1
+        @test isfinite(t2)   # the search completes; the timing itself is reported, not gated
+    end
+end
+
 @testset "code quality (Aqua)" begin
     Aqua.test_all(PenalizedDensity)
 end
