@@ -60,8 +60,7 @@ exponential tail with a `cosh` arc pinned flat at the wall, so a discontinuous o
 is exactly zero outside `[a, b]`, [`cdf`](@ref) reaches exactly `0` at `a` and `1` at `b`, and
 every data point must lie in `[a, b]` (checked at fit time; a violation, or `a ≥ b`, throws a
 `DomainError`). The goodness-of-fit machinery ([`chisq_reference`](@ref) and everything built on
-it) is not yet supported on a finite support and throws there; a plain (unbounded) fit is
-unaffected.
+it) supports a finite support as well.
 
 Passing `κ` as a keyword, `DensityEstimate(x; κ)`, is deprecated in favor of the
 positional form.
@@ -1326,6 +1325,46 @@ function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T) whe
     return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
 end
 
+# `_node_alpha` with an optional natural boundary at `lo`/`hi`: the interior sweep is untouched,
+# and only the tail anchors change — the decaying tail's v̂₋[1] = 1/κL and Â[1] = ψ₁/(2κL) become
+# the boundary segment's Dirichlet-to-Neumann flux `tanh(θL)/κL` and its ∫u₋ψ_cl, which is
+# `_tail_mass(ψ₁, κL, ΔL)/ψ₁` (the same integral `_norm_sq` already needs, since u₋ and ψ_cl are
+# the same cosh arc up to normalization); mirror on the right. The Wronskian becomes
+# `û₊[1]·v̂₋[1] + v̂₊[1]`, which reduces to the unbounded `û₊[1]/κL + v̂₊[1]` when v̂₋[1] = 1/κL.
+# Defers to the unbounded form above when both `lo` and `hi` are infinite.
+function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _node_alpha(x, ψ, κ, κL, κR, λ)
+    n = length(x)
+    û₋ = similar(ψ); v̂₋ = similar(ψ); Â = similar(ψ)
+    û₊ = similar(ψ); v̂₊ = similar(ψ); B̂ = similar(ψ)
+    û₋[1] = one(T)
+    v̂₋[1] = isfinite(lo) ? _tail_diag(κL, x[1] - lo) / κL : inv(κL)
+    Â[1]  = isfinite(lo) ? _tail_mass(ψ[1], κL, x[1] - lo) / ψ[1] : ψ[1] / (2κL)
+    for k in 1:n-1
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
+        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2
+        Â[k+1] = e * Â[k] + û₋[k] * (ψ[k] * c₁ + ψ[k+1] * c₂) +
+                            κk * v̂₋[k] * (ψ[k] * c₃ + ψ[k+1] * c₄)
+        û₋[k+1] = û₋[k] * ch + κk * v̂₋[k] * sh
+        v̂₋[k+1] = û₋[k] * sh / κk + v̂₋[k] * ch
+    end
+    û₊[n] = one(T)
+    v̂₊[n] = isfinite(hi) ? _tail_diag(κR, hi - x[n]) / κR : inv(κR)
+    B̂[n]  = isfinite(hi) ? _tail_mass(ψ[n], κR, hi - x[n]) / ψ[n] : ψ[n] / (2κR)
+    for k in n-1:-1:1
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        c₁, c₂, c₃, c₄ = _sweep_coeffs(κk, h)
+        e = exp(-θ); ch = (1 + e * e) / 2; sh = -expm1(-2θ) / 2
+        B̂[k] = e * B̂[k+1] + û₊[k+1] * (ψ[k+1] * c₁ + ψ[k] * c₂) +
+                            κk * v̂₊[k+1] * (ψ[k+1] * c₃ + ψ[k] * c₄)
+        û₊[k] = û₊[k+1] * ch + κk * v̂₊[k+1] * sh
+        v̂₊[k] = û₊[k+1] * sh / κk + v̂₊[k+1] * ch
+    end
+    Ĉ = û₊[1] * v̂₋[1] + v̂₊[1]
+    return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
+end
+
 # ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α. On each interval α solves 𝒜α = ψ_cl/(2λ) at constant κ against a
 # hyperbolic source, so it is the interpolant of its own nodal values mₖ plus the resonant
 # particular solution s·cosh(κs) that the source forces; the tails are the same computation
@@ -1338,6 +1377,51 @@ function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, �
         κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
         f = κk / (4λ)
         β = f * h * _cosh_ratio(θ, θ)               # (κ h coth θ)/(4λ)
+        a₁ = m[k] + β * ψ[k]; a₂ = m[k+1] + β * ψ[k+1]
+        function ψα(s)
+            r = h - s
+            pr = _sinh_ratio(κk * r, θ); ps = _sinh_ratio(κk * s, θ)
+            α = a₁ * pr + a₂ * ps -
+                f * (ψ[k] * r * _cosh_ratio(κk * r, θ) + ψ[k+1] * s * _cosh_ratio(κk * s, θ))
+            return (ψ[k] * pr + ψ[k+1] * ps) * α
+        end
+        acc += quadgk(ψα, zero(h), h; rtol = sqrt(eps(T)))[1]
+    end
+    return acc
+end
+
+# ∫₀^Δ ψ(s)α(s) ds over a boundary segment (Neumann wall at s=0, node at s=Δ), or the unbounded
+# tail's closed form ψ₁m₁/(2κ) + ψ₁²/(16λκ) as Δ → ∞. On the segment ψ(s) = ψ₁cosh(κs)/cosh(θ)
+# (θ = κΔ) and α solves 𝒜α = ψ/(2λ) with a vanishing flux at s=0: since 𝒜(s·sinh(κs)) =
+# -(2/κ)cosh(κs) and s·sinh(κs) already has zero flux at s=0, the particular solution
+# Ã·s·sinh(κs)/cosh(θ) (Ã = -κψ₁/(4λ)) needs only a cosh(κs)/cosh(θ) term added to match
+# α(Δ) = m₁: α(s) = [B̃·cosh(κs) + Ã·s·sinh(κs)]/cosh(θ), B̃ = m₁ - Ã·Δ·tanh(θ). Writing ψ and α
+# through `_cosh_ratio2`/`_sinh_ratio2` keeps every term O(1) at θ up to where `_tanh_stable`
+# itself stays accurate (θ ~ 500 and beyond), never evaluating a raw cosh/sinh of θ or κs.
+function _tail_psi_alpha(ψ1::T, m1::T, κ::T, λ::T, Δ::T) where {T}
+    isfinite(Δ) || return ψ1 * m1 / (2κ) + ψ1^2 / (16λ * κ)
+    θ = κ * Δ
+    Ã = -κ * ψ1 / (4λ)
+    B̃ = m1 - Ã * Δ * _tanh_stable(θ)
+    function ψα(s)
+        cr = _cosh_ratio2(κ * s, θ); sr = _sinh_ratio2(κ * s, θ)
+        return ψ1 * (B̃ * cr^2 + Ã * s * cr * sr)
+    end
+    return quadgk(ψα, zero(T), Δ; rtol = sqrt(eps(T)))[1]
+end
+
+# `_int_psi_alpha` with an optional natural boundary: the exponential-tail terms become the
+# boundary segments' `_tail_psi_alpha`. Defers to the unbounded form above when both `lo` and
+# `hi` are infinite; the interior sum is untouched by a boundary.
+function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T,
+                        lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _int_psi_alpha(x, ψ, m, κ, κL, κR, λ)
+    n = length(x)
+    acc = _tail_psi_alpha(ψ[1], m[1], κL, λ, x[1] - lo) + _tail_psi_alpha(ψ[n], m[n], κR, λ, hi - x[n])
+    for k in 1:n-1
+        κk = _kappa(κ, k); h = x[k+1] - x[k]; θ = κk * h
+        f = κk / (4λ)
+        β = f * h * _cosh_ratio(θ, θ)
         a₁ = m[k] + β * ψ[k]; a₂ = m[k+1] + β * ψ[k+1]
         function ψα(s)
             r = h - s
@@ -1374,27 +1458,24 @@ A spatially varying `κ` (see [`DensityEstimate`](@ref)) is supported: the nodal
 the fluctuation field is `2λ` times the same tridiagonal operator the fit assembles, whatever
 the scale, so the law stays exact and `O(N)`.
 
-Not yet supported for a fit with a finite `support` (see [`DensityEstimate`](@ref)): the exact
-reference distribution on a bounded domain is future work, and this throws rather than silently
-applying the unbounded theory to a fit where it does not apply.
+A finite `support` (see [`DensityEstimate`](@ref)) is supported too: the fluctuation field's
+natural (Neumann) boundary condition makes `M̂` the Dirichlet-to-Neumann map of the boundary
+segments as well as the interior, and the same identity `G₀⁻¹ = 2λM̂` holds with `M̂` the
+bounded operator the fit already assembles.
 """
 function chisq_reference(d::DensityEstimate{T}) where {T}
-    isinf(d.lo) && isinf(d.hi) ||
-        throw(ArgumentError("chisq_reference is not yet supported for a finite-support fit " *
-                            "(support=($(d.lo), $(d.hi))); the exact reference distribution on " *
-                            "a bounded domain is future work"))
     x, ψ, w, λ = d.x, d.ψ, d.w, d.λ
-    κ, κL, κR = d.κ, d.κL, d.κR
+    κ, κL, κR, lo, hi = d.κ, d.κL, d.κR, d.lo, d.hi
     n = length(x)
-    m = _node_alpha(x, ψ, κ, κL, κR, λ)                # mₖ = ∫ψ_cl(x) G₀(xₖ,x) dx
+    m = _node_alpha(x, ψ, κ, κL, κR, λ, lo, hi)        # mₖ = ∫ψ_cl(x) G₀(xₖ,x) dx
     # C₀⁻¹ = G₀⁻¹ + S = 2λM̂ + diag(2wᵢ/ψᵢ²);  b = (I + G₀S)⁻¹m solves C₀⁻¹b = G₀⁻¹m. The
     # assembly carries the reference scale κ̄, which G₀⁻¹ = 2λM̂ does not admit: divide it out.
-    M = _operator(x, κ, κL, κR)
+    M = _operator(x, κ, κL, κR, lo, hi)
     f = 2λ / _reference_scale(κ, κL, κR)
     S = 2 .* w ./ ψ.^2
     C0inv = SymTridiagonal(f .* M.dv .+ S, f .* M.ev)
     b = C0inv \ (f .* (M * m))
-    Vφ = _int_psi_alpha(x, ψ, m, κ, κL, κR, λ) - sum(m .* S .* b)         # Var(∫ψ_cl δψ)
+    Vφ = _int_psi_alpha(x, ψ, m, κ, κL, κR, λ, lo, hi) - sum(m .* S .* b)  # Var(∫ψ_cl δψ)
     # Reduced tridiagonal tri = D^{-1/2} C₀⁻¹ D^{-1/2} and rank-one direction g.
     D = 2 .* S; sq = sqrt.(D)                          # D = 4wᵢ/ψᵢ²
     tri = SymTridiagonal(C0inv.dv ./ D, C0inv.ev ./ (sq[1:n-1] .* sq[2:n]))
