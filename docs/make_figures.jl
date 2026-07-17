@@ -112,3 +112,39 @@ axislegend(axk; position=:rt, framevisible=false)
 xlims!(axk, 0, 6); ylims!(axk, 1, 2000)
 
 save(joinpath(ASSETS, "adaptive_kappa.png"), fig3; px_per_unit=2)
+
+# --- Fourth figure: a hard edge, unbounded leak vs. a wall that stops it exactly ------
+# An exponential draw jumps from 0 to 1 at x = 0. The unbounded fit's exponential tail can only
+# approximate that jump by decaying into x < 0; select_support's Neumann wall represents it
+# exactly. Same seed and sample as the tutorial's "Fitting a hard edge" section.
+Random.seed!(11)
+N = 1500
+xe = -log.(1 .- rand(N))
+exppdf(t) = t >= 0 ? exp(-t) : 0.0
+
+κe = select_kappa_kl(xe)
+d_unbounded = DensityEstimate(xe, κe)
+re = select_support(xe)
+d_bounded = DensityEstimate(xe, re.κ; support=re.support)
+
+fig4 = Figure(size=(880, 400), fontsize=15)
+
+ax1 = Axis(fig4[1, 1]; xlabel="x", ylabel="probability density",
+           title="Exponential sample: full range")
+g1 = range(-0.05, 4.0; length=900)
+lines!(ax1, g1, exppdf.(g1); color=:black, linestyle=:dash, linewidth=2, label="true density")
+lines!(ax1, g1, d_unbounded.(g1); color=:steelblue, linewidth=2.5, label="unbounded")
+lines!(ax1, g1, d_bounded.(g1); color=:crimson, linewidth=2.5, label="bounded (select_support)")
+axislegend(ax1; position=:rt, framevisible=false)
+xlims!(ax1, -0.05, 4.0); ylims!(ax1, -0.03, 1.15)
+
+ax2 = Axis(fig4[1, 2]; xlabel="x", ylabel="probability density",
+           title="Near the edge: leak vs. wall")
+g2 = range(-0.01, 0.05; length=900)
+lines!(ax2, g2, exppdf.(g2); color=:black, linestyle=:dash, linewidth=2, label="true density")
+lines!(ax2, g2, d_unbounded.(g2); color=:steelblue, linewidth=2.5, label="unbounded")
+lines!(ax2, g2, d_bounded.(g2); color=:crimson, linewidth=2.5, label="bounded")
+axislegend(ax2; position=:rb, framevisible=false)
+xlims!(ax2, -0.01, 0.05); ylims!(ax2, -0.03, 1.15)
+
+save(joinpath(ASSETS, "bounded_edge.png"), fig4; px_per_unit=2)

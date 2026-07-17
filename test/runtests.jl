@@ -25,17 +25,22 @@ end
 
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
 # field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
-# exact reference distribution must reproduce, at a constant or a varying scale alike.
+# exact reference distribution must reproduce, at a constant or a varying scale alike, on ℝ or
+# on a bounded support.
 #
 # The field's precision is L = 2λ𝒜 + 2Σ(wᵢ/ψᵢ²)δ(x-xᵢ), 𝒜u = -(κ(x)⁻²u′)′ + u, discretized
 # conservatively: each cell of the grid contributes (2λ/κ²)(Δδψ)²/h to the gradient energy
 # and 2λ·h to the mass. The grid contains every node, so κ is single-valued on each cell and
-# the point sources land on grid points exactly. Nothing here shares an assembly, a Green's
-# function, or a recursion with the package. Returns the χ² samples.
+# the point sources land on grid points exactly. A finite `d.lo`/`d.hi` terminates the grid
+# there instead of padding into a decaying tail; the conservative stencil already has no term
+# coupling a grid edge to anything past it, so ending the grid exactly at the wall *is* the
+# natural (Neumann) boundary condition, not an approximation to it. Nothing here shares an
+# assembly, a Green's function, or a recursion with the package. Returns the χ² samples.
 function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     x, ψ, λ = d.x, d.ψ, d.λ
     κ(k) = k == 0 ? d.κL : k > length(d.x) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
-    bnds = vcat(first(x) - pad / d.κL, x, last(x) + pad / d.κR)
+    bnds = vcat(isfinite(d.lo) ? d.lo : first(x) - pad / d.κL, x,
+                isfinite(d.hi) ? d.hi : last(x) + pad / d.κR)
     y = Float64[]
     for k in 1:length(bnds)-1                       # ≈ per_len points per local length 1/κ
         npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per_len))
@@ -71,11 +76,11 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     return chis
 end
 
-# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale (it needs only
+# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale, bounded or not (it needs only
 # Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1). A wrong nodal precision or a wrong α breaks it.
 function green_identity(d)
-    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ)
-    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR)
+    m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ, d.lo, d.hi)
+    M = PenalizedDensity._operator(d.x, d.κ, d.κL, d.κR, d.lo, d.hi)
     f = 2d.λ / PenalizedDensity._reference_scale(d.κ, d.κL, d.κR)
     S = 2 .* d.w ./ d.ψ.^2
     b = SymTridiagonal(f .* M.dv .+ S, f .* M.ev) \ (f .* (M * m))
@@ -609,8 +614,8 @@ end
         @testset "alphas and pilot are honored" begin
             κ = select_kappa_adaptive(chisq1; alphas=(1.0,))
             @test κ isa AdaptiveScale && κ.α == 1.0
-            # A pilot hook: any callable returning a positive scale from the sample.
-            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot=select_kappa_ms)
+            # pilot_selector: any callable returning a positive scale from the sample.
+            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot_selector=select_kappa_ms)
             @test κms isa AdaptiveScale
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
@@ -658,7 +663,7 @@ end
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
             @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
             @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
-            @test_throws "pilot must return a positive scale" select_kappa_adaptive(chisq1; pilot=_ -> 0.0)
+            @test_throws "pilot_selector must return a positive scale" select_kappa_adaptive(chisq1; pilot_selector=_ -> 0.0)
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
@@ -906,6 +911,608 @@ end
         @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_kl([1.0, 2.0]; κs=[1.0, 2.0])
         @test_throws ArgumentError select_kappa_kl([3.0])                        # need ≥ 2 distinct
         @test_throws "need at least two distinct points to select κ" select_kappa_kl([3.0])
+    end
+end
+
+@testset "bounded support (natural/Neumann boundary)" begin
+    # Independent reference fit: assembled from scratch with `tanh`/`sech` and `coth`/`csch`
+    # (Base's hyperbolic functions, not the package's e^{-2θ}-based stable forms), sharing no
+    # arithmetic with the bounded-support code under test. Mirrors the standalone derivation
+    # the closed forms below were checked against.
+    _tail_diag_ref(κ, Δ) = isfinite(Δ) ? tanh(κ * Δ) : 1.0
+    function _tail_mass_ref(ψ1, κ, Δ)
+        isfinite(Δ) || return ψ1^2 / (2κ)
+        u = κ * Δ
+        return ψ1^2 * (tanh(u) + u * sech(u)^2) / (2κ)
+    end
+    function _bounded_operator_ref(x::Vector{Float64}, κ::Float64, a::Float64, b::Float64)
+        n = length(x)
+        d = zeros(n); e = zeros(n - 1)
+        d[1] += _tail_diag_ref(κ, x[1] - a)
+        d[n] += _tail_diag_ref(κ, b - x[n])
+        for k in 1:n-1
+            θ = κ * (x[k+1] - x[k])
+            d[k] += coth(θ); d[k+1] += coth(θ); e[k] = -csch(θ)
+        end
+        return SymTridiagonal(d, e)
+    end
+    function _bounded_norm_sq_ref(x::Vector{Float64}, ψ::Vector{Float64}, κ::Float64, a::Float64, b::Float64)
+        n = length(x)
+        Z = _tail_mass_ref(ψ[1], κ, x[1] - a) + _tail_mass_ref(ψ[n], κ, b - x[n])
+        for k in 1:n-1
+            θ = κ * (x[k+1] - x[k]); ct, cs = coth(θ), csch(θ)
+            fdiag = (ct - θ * cs^2) / (2κ); fcross = cs * (θ * ct - 1) / (2κ)
+            Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        end
+        return Z
+    end
+    function _bounded_fit_ref(xs_sorted::Vector{Float64}, κ::Float64, a::Float64, b::Float64;
+                              rtol::Float64 = cbrt(eps(Float64)))
+        nodes, weights = PenalizedDensity._merge_presorted(xs_sorted, rtol / κ)
+        M = _bounded_operator_ref(nodes, κ, a, b)
+        ψ = PenalizedDensity._solve_amplitude(M, weights)
+        Z = _bounded_norm_sq_ref(nodes, ψ, κ, a, b)
+        ψ ./= sqrt(Z)
+        return (; x = nodes, w = weights, ψ, κ, a, b)
+    end
+
+    @testset "unbounded regression" begin
+        Random.seed!(41)
+        x = randn(1500)
+        for κ in (0.7, 6.0)
+            d1 = DensityEstimate(x, κ)
+            d2 = DensityEstimate(x, κ; support=(-Inf, Inf))
+            @test d1.x == d2.x && d1.w == d2.w && d1.ψ == d2.ψ && d1.κ == d2.κ &&
+                  d1.κL == d2.κL && d1.κR == d2.κR && d1.λ == d2.λ
+            @test d1.lo == -Inf && d1.hi == Inf
+            far = 1e4 / κ
+            dfar = DensityEstimate(x, κ; support=(minimum(x) - far, maximum(x) + far))
+            @test maximum(abs.(dfar.ψ .- d1.ψ)) / maximum(d1.ψ) < 1e-12
+        end
+    end
+
+    @testset "reproduces the reference fit node-for-node" begin
+        for (name, xgen, κ, support) in (
+                ("exponential", rng -> -log.(1 .- rand(rng, 800)), 12.0, (0.0, Inf)),
+                ("uniform",     rng -> rand(rng, 800),              18.0, (0.0, 1.0)),
+                ("chisq1",      rng -> randn(rng, 800) .^ 2,        25.0, (0.0, Inf)))
+            rng = Xoshiro(hash((:boundedref, name)))
+            x = sort(xgen(rng))
+            ref = _bounded_fit_ref(x, κ, support...)
+            d = DensityEstimate(x, κ; support)
+            @test d.x == ref.x
+            @test maximum(abs.(d.ψ .- ref.ψ) ./ ref.ψ) < 1e-9
+        end
+    end
+
+    @testset "_norm_sq_gram matches _norm_sq on a bounded fit" begin
+        # No caller yet threads a finite support into `_norm_sq_gram` (its only consumer,
+        # `_loo_density`, stays unbounded-only), but its generalized tail terms must already be
+        # self-consistent: Z = ψᵀGψ, and Z itself must agree with `_norm_sq`.
+        Random.seed!(47)
+        x = sort(rand(30) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 7.0; support=(0.0, 1.0))
+        Zgram, Gψ = PenalizedDensity._norm_sq_gram(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
+        Z = PenalizedDensity._norm_sq(d.x, d.ψ, d.κ, d.lo, d.hi)
+        @test Zgram ≈ Z rtol = 1e-13
+        @test sum(d.ψ .* Gψ) ≈ Z rtol = 1e-13
+    end
+
+    @testset "mass" begin
+        Random.seed!(42)
+        x = sort(rand(400))
+        d = DensityEstimate(x, 30.0; support=(0.0, 1.0))
+        @test cdf(d, 1.0) == 1
+        @test cdf(d, 0.0) == 0
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-10)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-10)
+        right, Er = quadgk(d, d.x[end], 1.0; rtol=1e-10)
+        @test max(El, Ei, Er) < 1e-8
+        @test abs(left + interior + right - 1) < 1e-9
+    end
+
+    @testset "cdf ∘ quantile round trip; monotonicity across the boundary" begin
+        Random.seed!(43)
+        x = sort(rand(200) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 10.0; support=(0.0, 1.0))
+        for q in vcat(0.0, exp10.(-12:2:-2), 0.1:0.1:0.9, 1 .- exp10.(-12:2:-2), 1.0)
+            @test cdf(d, quantile(d, q)) ≈ q atol = 1e-9
+        end
+        @test quantile(d, 0.0) == 0.0
+        @test quantile(d, 1.0) == 1.0
+        g = collect(range(-0.05, 1.05; length=3000))
+        @test issorted(cdf(d, g))
+    end
+
+    @testset "evaluation is exactly zero outside the support" begin
+        Random.seed!(44)
+        x = sort(rand(100) .* 0.5 .+ 0.25)
+        d = DensityEstimate(x, 12.0; support=(0.0, 1.0))
+        @test d(-0.1) == 0 && d(1.1) == 0
+        @test amplitude(d, -0.1) == 0 && amplitude(d, 1.1) == 0
+        @test d(0.0) > 0 && d(1.0) > 0     # jump edge: nonzero right up to the wall
+        @test amplitude(d, prevfloat(0.0)) == 0
+        @test amplitude(d, nextfloat(1.0)) == 0
+    end
+
+    @testset "input validation" begin
+        @test_throws DomainError DensityEstimate([0.5, 1.5], 1.0; support=(0.0, 1.0))
+        @test_throws "lies outside the support" DensityEstimate([0.5, 1.5], 1.0; support=(0.0, 1.0))
+        @test_throws DomainError DensityEstimate([-0.5, 0.5], 1.0; support=(0.0, 1.0))
+        @test_throws "lies outside the support" DensityEstimate([-0.5, 0.5], 1.0; support=(0.0, 1.0))
+        @test_throws DomainError DensityEstimate([0.5], 1.0; support=(1.0, 0.0))
+        @test_throws "support must satisfy a < b" DensityEstimate([0.5], 1.0; support=(1.0, 0.0))
+        @test_throws DomainError DensityEstimate([0.5], 1.0; support=(0.5, 0.5))
+        @test_throws "support must satisfy a < b" DensityEstimate([0.5], 1.0; support=(0.5, 0.5))
+    end
+
+    @testset "chisq family runs on a bounded fit" begin
+        d = DensityEstimate(sort(rand(Xoshiro(45), 50)), 10.0; support=(0.0, 1.0))
+        r = chisq_reference(d)
+        @test r isa ChisqReference
+        @test expected_chisq(d) == r.mean > 0
+        @test 0 <= chisq_ccdf(d, 1.0) <= 1
+        @test chisq_pdf(d, 1.0) >= 0
+        @test 0 <= pvalue(d, t -> 1.0) <= 1
+    end
+
+    @testset "cross-validation on a bounded fit" begin
+        @testset "unbounded regression" begin
+            Random.seed!(51)
+            x = randn(800)
+            xs = sort(x); w = ones(length(xs))
+            for κ0 in (1.2, 5.0, 15.0)
+                @test PenalizedDensity._klcv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._klcv(xs, w, κ0)
+                @test PenalizedDensity._lscv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._lscv(xs, w, κ0)
+            end
+            @test select_kappa_kl(x) == select_kappa_kl(x; support=(-Inf, Inf))
+            @test select_kappa_cv(x) == select_kappa_cv(x; support=(-Inf, Inf))
+        end
+
+        @testset "_int_quartic: boundary segment vs scale-matched quadrature" begin
+            Random.seed!(52)
+            x = sort(rand(300))
+            d = DensityEstimate(x, 25.0; support=(0.0, 1.0))
+            Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
+            # Sum scale-matched sub-segments (node-to-node plus the two boundary segments)
+            # rather than one quadgk spanning the whole support, per the harness's spike-forest
+            # discipline: a single call can converge to a misleadingly small error estimate.
+            total = quadgk(t -> d(t)^2, d.lo, d.x[1]; rtol=1e-13)[1]
+            for k in 1:length(d.x)-1
+                total += quadgk(t -> d(t)^2, d.x[k], d.x[k+1]; rtol=1e-13)[1]
+            end
+            total += quadgk(t -> d(t)^2, d.x[end], d.hi; rtol=1e-13)[1]
+            @test Q2 ≈ total rtol = 1e-10
+        end
+
+        @testset "brute-force validation of the leave-one-out expansion" begin
+            function klcv_refit_b(nodes, weights, κ, lo, hi)
+                s = 0.0
+                for i in eachindex(nodes)
+                    keep = [j for j in eachindex(nodes) if j != i]
+                    s += weights[i] * log(DensityEstimate(nodes[keep], κ; support=(lo, hi))(nodes[i]))
+                end
+                return -s / sum(weights)
+            end
+            function lscv_refit_b(nodes, weights, κ, lo, hi)
+                cross = 0.0
+                for i in eachindex(nodes)
+                    keep = [j for j in eachindex(nodes) if j != i]
+                    cross += weights[i] * DensityEstimate(nodes[keep], κ; support=(lo, hi))(nodes[i])
+                end
+                di = DensityEstimate(nodes, κ; support=(lo, hi))
+                Q2 = PenalizedDensity._int_quartic(di.x, di.ψ, di.κ, di.κL, di.κR, di.lo, di.hi)
+                return Q2 - 2cross / sum(weights)
+            end
+            # Exponential (a hard left edge) and uniform (both edges hard), N a few hundred, at
+            # several κ including each family's own KLCV-selected scale. Tolerances match the
+            # unbounded suite's (`select_kappa_kl`/`select_kappa_cv` testsets above): KLCV's
+            # equal per-node weighting under the log is most sensitive to sparse tail nodes,
+            # where the first-order expansion is least accurate, so it gets the looser bound.
+            for (name, xgen, support) in (
+                    ("exponential", rng -> -log.(1 .- rand(rng, 300)), (0.0, Inf)),
+                    ("uniform",     rng -> rand(rng, 300),              (0.0, 1.0)))
+                rng = Xoshiro(hash((:boundedcv, name)))
+                x = sort(xgen(rng))
+                lo, hi = support
+                nodes, w = PenalizedDensity._merge_presorted(x, 0.0)
+                κsel = select_kappa_kl(x; support)
+                for κ0 in (κsel * 0.5, κsel, κsel * 1.5)
+                    a_kl = PenalizedDensity._klcv(nodes, w, κ0, κ0, κ0, lo, hi)
+                    b_kl = klcv_refit_b(nodes, w, κ0, lo, hi)
+                    @test a_kl ≈ b_kl rtol = 2e-2
+                    a_ls = PenalizedDensity._lscv(nodes, w, κ0, κ0, κ0, lo, hi)
+                    b_ls = lscv_refit_b(nodes, w, κ0, lo, hi)
+                    @test a_ls ≈ b_ls rtol = 5e-3
+                end
+            end
+        end
+
+        @testset "selector: bounded vs unbounded κ on a hard-edge family" begin
+            x = -log.(1 .- (0.5:1999.5) ./ 2000)   # exponential, a jump edge at the left
+            κ_unb = select_kappa_kl(x)
+            κ_bnd = select_kappa_kl(x; support=(0.0, Inf))
+            @test κ_bnd != κ_unb
+            @test κ_bnd < κ_unb    # the boundary itself represents the edge, so cross-validation
+                                    # asks for less compensating smoothing, not more
+            nodes, w = PenalizedDensity._merge_presorted(sort(x), 0.0)
+            klcv_bnd = PenalizedDensity._klcv(nodes, w, κ_bnd, κ_bnd, κ_bnd, 0.0, Inf)
+            klcv_unb = PenalizedDensity._klcv(nodes, w, κ_unb, κ_unb, κ_unb, 0.0, Inf)
+            @test klcv_bnd < klcv_unb   # the bounded fit at its own selection beats it at the
+                                        # unbounded selection, on the bounded fit's own score
+        end
+
+        @testset "select_kappa_kl / select_kappa_cv: input validation" begin
+            @test_throws DomainError select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws "support must satisfy a < b" select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+            @test_throws DomainError select_kappa_cv([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+        end
+
+        @testset "generic indexing: OffsetVector through select_kappa_kl(; support)" begin
+            Random.seed!(53)
+            x = rand(300)
+            κ = select_kappa_kl(x; support=(0.0, 1.0))
+            κo = select_kappa_kl(OffsetArray(x, -150); support=(0.0, 1.0))
+            @test κo == κ
+        end
+    end
+
+    @testset "quantile precision near q = 1 (complement inversion)" begin
+        Random.seed!(54)
+        x = sort(rand(200) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 10.0; support=(0.0, 1.0))
+        for q in (1 - 1e-12, 1 - 1e-10, 1 - 1e-8, 1 - 1e-4)
+            y = quantile(d, q)
+            @test cdf(d, y) ≈ q atol = 4 * eps(1.0)
+        end
+    end
+
+    @testset "_boundary_mass_from_node stays cancellation-free as v → u" begin
+        Random.seed!(55)
+        for _ in 1:50
+            κ = exp(6 * rand() - 3)
+            u = exp(8 * rand() - 2)
+            ψ = 1.0 + rand()
+            for ε in (1e-3, 1e-9, 1e-15)
+                v = u * (1 - ε)
+                m = PenalizedDensity._boundary_mass_from_node(ψ, κ, v, u)
+                # Reference from the raw (unstabilized) closed form, in BigFloat so its own
+                # cancellation is below the comparison tolerance.
+                ub, vb, κb, ψb = big(u), big(v), big(κ), big(ψ)
+                mref = Float64(ψb^2 * ((ub - vb) * sech(ub)^2 +
+                                       cosh(ub + vb) * sinh(ub - vb) / cosh(ub)^2) / (2κb))
+                @test m ≈ mref rtol = 1e-12
+            end
+        end
+    end
+
+    @testset "AdaptiveScale composition" begin
+        x = -log.(1 .- (0.5:999.5) ./ 1000)
+        κ = select_kappa_adaptive(x)
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test d.lo == 0.0 && d.hi == Inf
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-8)
+        right, Er = quadgk(d, d.x[end], d.x[end] + 60; rtol=1e-8)
+        @test max(El, Ei, Er) < 1e-6
+        @test abs(left + interior + right - 1) < 1e-6
+    end
+
+    @testset "generic indexing: OffsetVector with support" begin
+        x = [-1.5, 0.2, 0.2, 1.1, 3.4]
+        d = DensityEstimate(x, 1.1; support=(-2.0, 4.0))
+        do_ = DensityEstimate(OffsetArray(x, -3), 1.1; support=(-2.0, 4.0))
+        @test do_.x == d.x && do_.ψ ≈ d.ψ && do_.lo == d.lo && do_.hi == d.hi
+        @test do_(0.7) ≈ d(0.7)
+    end
+
+    @testset "stress: extreme and vanishing boundary gaps" begin
+        # θ_L ≈ 500: far past where raw cosh/sinh would overflow.
+        d = DensityEstimate([0.0, 1.0], 1.0; support=(-500.0, 501.0))
+        @test all(isfinite, d.ψ) && isfinite(d.λ)
+        @test d(-500.0) >= 0 && isfinite(d(-500.0))
+        @test d(-500.1) == 0
+
+        # θ_L ≈ 1e-8: the boundary sits essentially at the node.
+        dn = DensityEstimate([0.0, 1.0], 1.0; support=(-1e-8, 1.0 + 1e-8))
+        @test all(isfinite, dn.ψ)
+        @test cdf(dn, -1e-8) == 0
+        @test cdf(dn, 1.0 + 1e-8) == 1
+
+        # Single-node fits, one and both walls finite: the analytic solution
+        # ψ = √(w / (tanh(κΔl) + tanh(κΔr))), since M is the 1×1 matrix
+        # tanh(κΔl) + tanh(κΔr) with no interior terms.
+        Random.seed!(46)
+        for _ in 1:20
+            κ = exp(6 * rand() - 3)
+            Δl = exp(8 * rand() - 2)
+            Δr = exp(8 * rand() - 2)
+            w = 1.0 + 3 * rand()
+            M = PenalizedDensity.roughness_operator([0.0], κ, -Δl, Δr)
+            φ = PenalizedDensity._solve_amplitude(M, [w])
+            φexact = sqrt(w / (tanh(κ * Δl) + tanh(κ * Δr)))
+            @test only(φ) ≈ φexact rtol = 1e-5
+
+            # One wall finite, the other unbounded: the unbounded side's tail entry is 1,
+            # the finite side's Δr = Inf limit of the same analytic solution.
+            Mhalf = PenalizedDensity.roughness_operator([0.0], κ, -Δl, Inf)
+            φhalf = PenalizedDensity._solve_amplitude(Mhalf, [w])
+            φhalf_exact = sqrt(w / (tanh(κ * Δl) + 1))
+            @test only(φhalf) ≈ φhalf_exact rtol = 1e-5
+        end
+    end
+end
+
+@testset "goodness of fit: exact reference on a bounded fit" begin
+    @testset "unbounded regression" begin
+        Random.seed!(60)
+        x = randn(150)
+        d = DensityEstimate(x, select_kappa_ms(x))
+        r = chisq_reference(d)
+        d2 = DensityEstimate(x, d.κ; support=(-Inf, Inf))
+        r2 = chisq_reference(d2)
+        @test r2.tri.dv == r.tri.dv && r2.tri.ev == r.tri.ev && r2.g == r.g && r2.mean == r.mean
+
+        # A far wall (1e4 smoothing lengths out) reproduces the unbounded reference closely.
+        far = 1e4 / d.κ
+        dfar = DensityEstimate(x, d.κ; support=(minimum(x) - far, maximum(x) + far))
+        rfar = chisq_reference(dfar)
+        @test maximum(abs.(rfar.tri.dv .- r.tri.dv) ./ abs.(r.tri.dv)) < 1e-10
+        @test maximum(abs.(rfar.g .- r.g) ./ abs.(r.g)) < 1e-10
+        @test abs(rfar.mean - r.mean) / r.mean < 1e-10
+        @test abs(chisq_ccdf(rfar, r.mean) - chisq_ccdf(r, r.mean)) < 1e-8
+    end
+
+    @testset "Green's identity on bounded fits" begin
+        # 4Σᵢwᵢbᵢ/ψᵢ = 1 needs only Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1 (see `green_identity`
+        # above), so it exercises the bounded `_node_alpha`/`_operator` together on constant and
+        # one- and two-sided supports.
+        for (name, xgen, κ, support) in (
+                ("uniform, both walls",   rng -> rand(rng, 300),                    15.0, (0.0, 1.0)),
+                ("exponential, one wall", rng -> -log.(1 .- rand(rng, 300)),        12.0, (0.0, Inf)),
+                ("triangular, both walls", rng -> rand(rng, 300) .+ rand(rng, 300), 10.0, (0.0, 2.0)))
+            rng = Xoshiro(hash((:b4green, name)))
+            x = sort(xgen(rng))
+            d = DensityEstimate(x, κ; support)
+            @test green_identity(d) ≈ 1 rtol = 1e-5
+        end
+        # Composed with adaptive κ.
+        xa = sort!(randn(Xoshiro(9), 300) .^ 2)
+        da = DensityEstimate(xa, select_kappa_adaptive(xa; support=(0.0, Inf)); support=(0.0, Inf))
+        @test green_identity(da) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "FD ground truth: m and ∫ψα converge to the closed forms at O(δ²)" begin
+        # As the unbounded suite's analogous check above, but the grid now runs exactly from
+        # `d.lo` to `d.hi` instead of a padded tail: the conservative stencil's Neumann condition
+        # falls out of ending the grid there, per `fieldmc_chisq`'s comment.
+        Random.seed!(62)
+        x = sort(rand(60) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 6.0; support=(0.0, 1.0))
+        errs = map((100, 400)) do per
+            xn, ψ, λ = d.x, d.ψ, d.λ
+            κ(k) = k == 0 ? d.κL : k > length(xn) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
+            bnds = vcat(d.lo, xn, d.hi)
+            y = Float64[]
+            for k in 1:length(bnds)-1
+                npts = max(2, ceil(Int, (bnds[k+1] - bnds[k]) * κ(k - 1) * per))
+                append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
+            end
+            push!(y, last(bnds)); m = length(y); δ = diff(y)
+            cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
+            mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
+            p = copy(mass); q = zeros(m - 1)
+            for j in 1:m-1
+                c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
+            end
+            ψy = amplitude(d, y)
+            αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
+            mfd = [αfd[searchsortedfirst(y, xi)] for xi in xn]
+            mex = PenalizedDensity._node_alpha(xn, ψ, d.κ, d.κL, d.κR, λ, d.lo, d.hi)
+            (maximum(abs.(mex .- mfd) ./ abs.(mfd)),
+             abs(PenalizedDensity._int_psi_alpha(xn, ψ, mex, d.κ, d.κL, d.κR, λ, d.lo, d.hi) -
+                 sum(mass .* ψy .* αfd)) / sum(mass .* ψy .* αfd))
+        end
+        @test all(<(2e-4), errs[1]) && all(<(2e-5), errs[2])
+        @test all(first(errs) ./ last(errs) .> 10)
+    end
+
+    @testset "field Monte Carlo: bounded uniform (both walls, flagship)" begin
+        # The flagship case: a natural boundary makes the flat field exactly representable,
+        # which no unbounded or spatially-varying-κ fit could do.
+        Random.seed!(63)
+        x = sort(rand(400) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, 1.0)); support=(0.0, 1.0))
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=11)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "field Monte Carlo: bounded exponential (one wall)" begin
+        Random.seed!(64)
+        x = sort(-log.(1 .- rand(400)))
+        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, Inf)); support=(0.0, Inf))
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=12)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+
+    @testset "field Monte Carlo: bounded fit with adaptive κ" begin
+        Random.seed!(65)
+        x = sort!(randn(Xoshiro(66), 300) .^ 2)
+        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test maximum(d.κ) / minimum(d.κ) > 1e4
+        r = chisq_reference(d)
+        chis = fieldmc_chisq(d; nsamp=60_000, seed=13)
+        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        for z in quantile(chis, (0.3, 0.6, 0.9))
+            @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
+        end
+        @test green_identity(d) ≈ 1 rtol = 1e-5
+    end
+end
+
+@testset "select_kappa_adaptive: fixed support" begin
+    @testset "runs on a bounded domain and composes into a normalized fit" begin
+        # Exponential on its natural support: runs, and the returned scale composes into a
+        # normalized bounded fit.
+        x = -log.(1 .- rand(Xoshiro(70), 500))
+        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test d.lo == 0.0 && d.hi == Inf
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-8)
+        right, Er = quadgk(d, d.x[end], d.x[end] + 60; rtol=1e-8)
+        @test max(El, Ei, Er) < 1e-6
+        @test abs(left + interior + right - 1) < 1e-6
+
+        # Uniform on its true (0, 1) support: the machinery must run and the composed fit must
+        # normalize; which α wins (possibly 0, the boundary already having fixed the edge) is
+        # not asserted.
+        xu = rand(Xoshiro(71), 500)
+        κu = select_kappa_adaptive(xu; support=(0.0, 1.0))
+        @test κu isa Real || κu isa AdaptiveScale
+        du = DensityEstimate(xu, κu; support=(0.0, 1.0))
+        @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
+        mass, _ = quadgk(du, 0.0, 1.0; rtol=1e-8)
+        @test mass ≈ 1 atol=1e-4
+    end
+
+    @testset "input validation" begin
+        @test_throws DomainError select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+        @test_throws "support must satisfy a < b" select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+        @test_throws DomainError select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+        @test_throws "lies outside the support" select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+    end
+end
+
+@testset "select_support: joint boundary and κ selection" begin
+    # A Student-t(5)-like heavy-tailed draw and a two-component mixture, built from `randn`
+    # alone (no extra test dependency): t5 as a normal over the root-mean-square of five more
+    # normals, the classical variance-mixture construction.
+    _t5(rng) = randn(rng) / sqrt(sum(abs2, randn(rng, 5)) / 5)
+
+    @testset "smooth families decline in every replicate" begin
+        families = (
+            ("gaussian", rng -> randn(rng, 500)),
+            ("t5-like heavy tail", rng -> [_t5(rng) for _ in 1:500]),
+            ("two-component mixture", rng -> vcat(randn(rng, 250) .- 2, randn(rng, 250) .+ 2)),
+        )
+        for (name, gen) in families, seed in 1:3
+            x = gen(Xoshiro(hash((:smoothsupport, name, seed))))
+            r = select_support(x)
+            @test r.support == (-Inf, Inf)
+            # Structural, not coincidental: when neither side wins, the returned κ *is* the
+            # plain `select_kappa_kl(x)` call, not merely close to it.
+            @test r.κ === select_kappa_kl(x)
+        end
+    end
+
+    @testset "exponential: finite left, infinite right" begin
+        for seed in 1:3
+            x = -log.(1 .- rand(Xoshiro(hash((:expsupport, seed))), 1000))
+            r = select_support(x)
+            @test isfinite(r.support[1]) && r.support[2] == Inf
+            xs = sort(x)
+            spacing = PenalizedDensity._edge_spacing(xs, :left)
+            gap = xs[1] - r.support[1]
+            @test 0 < gap < 20 * spacing
+            # The selected (κ, support) fit beats the plain unbounded selection on the same
+            # KLCV score that chooses both.
+            klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
+            κunb = select_kappa_kl(x)
+            klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
+            @test klsel < klunb
+        end
+    end
+
+    @testset "uniform: finite on both sides" begin
+        for seed in 1:3
+            x = rand(Xoshiro(hash((:unifsupport, seed))), 1000)
+            r = select_support(x)
+            @test isfinite(r.support[1]) && isfinite(r.support[2])
+            xs = sort(x)
+            spL = PenalizedDensity._edge_spacing(xs, :left)
+            spR = PenalizedDensity._edge_spacing(xs, :right)
+            @test 0 < xs[1] - r.support[1] < 20 * spL
+            @test 0 < r.support[2] - xs[end] < 20 * spR
+            klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
+            κunb = select_kappa_kl(x)
+            klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
+            @test klsel < klunb
+        end
+    end
+
+    @testset "χ²₁: finite left boundary (divergent edge)" begin
+        for seed in 1:3
+            x = randn(Xoshiro(hash((:chisqsupport, seed))), 500) .^ 2
+            r = select_support(x)
+            @test isfinite(r.support[1]) && r.support[2] == Inf
+        end
+    end
+
+    @testset "input validation" begin
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws "κs must be sorted and positive" select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
+        @test_throws "need at least 3 values in κs to bracket the minimum" select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; rtol=-1.0)
+        @test_throws "rtol must be nonnegative" select_support([1.0, 2.0, 3.0]; rtol=-1.0)
+    end
+
+    @testset "_edge_spacing and _select_gap failure paths" begin
+        # Fewer than two points near the edge: unreachable through select_support itself (its
+        # upstream κ selection already demands at least two distinct points), so exercised
+        # directly, as the `_select_c` failure paths above are.
+        @test_throws ArgumentError PenalizedDensity._edge_spacing([5.0], :left)
+        @test_throws "need at least two distinct points to seed a boundary search" PenalizedDensity._edge_spacing([5.0], :left)
+
+        # Ten points coincide at the left edge: zero spacing to seed a search from. Reachable
+        # through the public API when many duplicates sit at one edge.
+        x = vcat(fill(0.0, 10), [100.0])
+        @test_throws ArgumentError select_support(x)
+        @test_throws "the 10 points nearest the left edge coincide" select_support(x)
+
+        # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
+        @test_throws ErrorException PenalizedDensity._select_gap(gap -> NaN, 1.0)
+        @test_throws "no resolvable boundary gap" PenalizedDensity._select_gap(gap -> NaN, 1.0)
+        @test_throws ErrorException PenalizedDensity._select_gap(gap -> -gap, 1.0)
+        @test_throws "kept running off its search bracket" PenalizedDensity._select_gap(gap -> -gap, 1.0)
+    end
+
+    @testset "generic indexing: OffsetVector input" begin
+        x = -log.(1 .- rand(Xoshiro(72), 500))
+        r1 = select_support(x)
+        r2 = select_support(OffsetVector(x, -250))
+        @test r1.κ == r2.κ && r1.support == r2.support
+    end
+
+    @testset "seeded reproducibility" begin
+        x = -log.(1 .- rand(Xoshiro(73), 500))
+        r1 = select_support(x)
+        r2 = select_support(x)
+        @test r1.κ === r2.κ && r1.support === r2.support
+    end
+
+    @testset "efficiency (reported, not asserted — see the test log)" begin
+        xbig = randn(Xoshiro(74), 50_000)
+        t1 = @elapsed select_kappa_kl(xbig)
+        t2 = @elapsed select_support(xbig)
+        @info "select_support efficiency at N=50000" t_select_kappa_kl=t1 t_select_support=t2 ratio=t2 / t1
+        @test isfinite(t2)   # the search completes; the timing itself is reported, not gated
     end
 end
 

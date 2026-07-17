@@ -42,6 +42,16 @@ z = randn(4000).^2                   # χ²₁: the density diverges at x = 0
 d = DensityEstimate(z, select_kappa_adaptive(z))
 ```
 
+The domain itself may be bounded: `support = (a, b)` fits a hard edge exactly (zero density
+outside, rather than a fast-decaying approximation), and `select_support` finds `a`/`b` from the
+data the same way the scale is selected:
+
+```julia
+w = -log.(1 .- rand(1500))           # exponential: a jump edge at x = 0
+r = select_support(w)
+d = DensityEstimate(w, r.κ; support = r.support)
+```
+
 See the [documentation](https://timholy.github.io/PenalizedDensity.jl/dev/) for a full
 tutorial and the API reference.
 
