@@ -203,6 +203,104 @@ where ``\kappa \propto \hat p^\alpha`` has no contrast to exploit:
 select_kappa_adaptive(rand(2000)) isa Real   # nothing to buy: the constant scale wins
 ```
 
+## Fitting a hard edge
+
+A varying scale sharpens resolution near a feature, but it still fits an amplitude built from
+exponential tails, which extend over all of ``\mathbb{R}``. When the true density has a genuine
+edge — zero on one side, nonzero on the other — no choice of ``\kappa(x)`` reproduces that
+exactly: the fit always leaks a sliver of mass across the line. [`DensityEstimate`](@ref)'s
+`support` keyword fixes this directly, by imposing a natural (Neumann) boundary condition at a
+finite endpoint rather than approximating it with decay; [`select_support`](@ref) chooses that
+endpoint from the data, the same way the other selectors choose ``\kappa``.
+
+As an example, take a sample from the standard exponential distribution, whose density jumps
+from `0` to `1` at ``x=0``:
+
+```@example bounded
+using PenalizedDensity, Random, Statistics
+
+Random.seed!(11)
+N = 1500
+x = -log.(1 .- rand(N))                 # exponential(1): a jump edge at x = 0
+
+κ_const = select_kappa_kl(x)
+d_unbounded = DensityEstimate(x, κ_const)
+
+(κ = round(κ_const; digits=1), leaked_mass = round(cdf(d_unbounded, 0.0); digits=4))
+```
+
+`leaked_mass` is [`cdf`](@ref)`(d_unbounded, 0.0)`, the fitted probability of landing on the
+wrong side of the true edge: about one percent of the fit's mass sits below `x = 0`, where the
+true density is exactly zero. [`select_support`](@ref) finds a left wall that removes this
+directly:
+
+```@example bounded
+r = select_support(x)
+d_bounded = DensityEstimate(x, r.κ; support = r.support)
+
+(wall = round(r.support[1]; digits=5), κ = round(r.κ; digits=2), cdf_at_wall = cdf(d_bounded, r.support[1]))
+```
+
+`cdf_at_wall` is exactly `0`, not merely small: mass cannot cross a natural boundary. Note also
+that the selected scale drops to about a fifth of `κ_const` — the unbounded fit was
+over-sharpening to fight the leak, and no longer needs to once the wall is doing that job (the search
+re-optimizes `κ` at every boundary candidate; see
+[`select_support`](@ref)'s docstring). The wall itself sits close to the data:
+
+```@example bounded
+spacing = PenalizedDensity._edge_spacing(sort(x), :left)   # mean spacing of the 10 points nearest the edge
+gap = minimum(x) - r.support[1]
+round(gap / spacing; digits=2)
+```
+
+which is the search's hard floor: **`select_support` never places a wall closer than five mean
+edge-spacings to the data, because a boundary any closer reflects the nearest interior points
+back onto themselves and inflates their leave-one-out likelihood on any sample, edge or not, not
+only this one.** On a genuine hard edge this floor is usually where the search lands, as it does
+here; a smooth sample has no edge to find in the first place, and the search says so plainly by
+returning the unbounded candidate:
+
+```@example bounded
+xg = randn(1500)
+rg = select_support(xg)
+
+(support = rg.support, κ_matches_plain_selection = rg.κ === select_kappa_kl(xg))
+```
+
+`support == (-Inf, Inf)` and the returned `κ` is not merely close to `select_kappa_kl(xg)` but
+*identical* to it — the unbounded candidate always competes, and here it wins outright.
+
+To combine a boundary with a varying scale, pass the chosen
+`support` on to [`select_kappa_adaptive`](@ref) so that its own search runs on the bounded domain:
+
+```@example bounded
+κ_composed = select_kappa_adaptive(x; support = r.support)
+d_composed = DensityEstimate(x, κ_composed; support = r.support)
+
+(α = κ_composed.α, c = round(κ_composed.c; digits=2))
+```
+
+We can test whether this fit is a genuine improvement by generating independent data from
+the same underlying distribution:
+
+```@example bounded
+xtest = -log.(1 .- rand(N))
+loglik(d) = mean(log.(d.(xtest)))
+
+(unbounded = round(loglik(d_unbounded); digits=3),
+ bounded = round(loglik(d_bounded); digits=3),
+ bounded_and_adaptive = round(loglik(d_composed); digits=3))
+```
+
+The wall accounts for essentially all of the gain here: once it has absorbed the edge's leak,
+little irregularity is left in an otherwise-exponential interior, and
+the two scores agree to within the noise of a fresh `N`-point sample. The picture below makes
+the boundary's effect on the fit itself concrete — the unbounded estimate (blue) trailing off
+below `x = 0` where the true density (dashed) is zero, against the bounded estimate (crimson),
+pinned flat at the wall:
+
+![An exponential jump edge: leaking mass past x=0 versus a wall that stops it exactly](assets/bounded_edge.png)
+
 ## Goodness of fit
 
 Because the estimate is a genuine likelihood fit, you can ask how well a *specific* model
@@ -250,4 +348,5 @@ than overstating it:
 ```
 
 All of this — the exact law and the `:largeN` shape alike — works unchanged on a fit at a
-varying scale: both are read from the same reference the fit assembles, in the same ``O(N)``.
+varying scale or a finite `support`: both are read from the same reference the fit assembles,
+in the same ``O(N)``.

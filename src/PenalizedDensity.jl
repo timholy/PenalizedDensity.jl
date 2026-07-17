@@ -34,8 +34,8 @@ a piecewise-constant scale: `d.κ[k]` is the rate on `(d.x[k], d.x[k+1])`, and `
 `d.κR` the tail rates. Making `κ` large where the density is high and small where it is
 low buys resolution where the data can pay for it. The penalty weight is `1/κ(x)²` on
 `(ψ')²`, which keeps the pressure to normalize spatially uniform. The goodness-of-fit
-machinery ([`chisq_reference`](@ref) and everything built on it, including the large-`N`
-`method=:largeN` approximation) supports a varying `κ` exactly as it does a constant one.
+machinery ([`chisq_reference`](@ref) and everything built on it supports a varying `κ`
+exactly as it does a constant one.
 
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
