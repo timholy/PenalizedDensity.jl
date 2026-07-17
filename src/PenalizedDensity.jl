@@ -476,6 +476,12 @@ _operator(x::Vector{T}, κ::T, κL::T, κR::T) where {T} = roughness_operator(x,
 _operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
     roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR))
 
+# `_operator` with an optional natural boundary at `lo`/`hi`. Each defers to the corresponding
+# `roughness_operator` above, which itself defers to the unbounded form when both are infinite.
+_operator(x::Vector{T}, κ::T, κL::T, κR::T, lo::T, hi::T) where {T} = roughness_operator(x, κ, lo, hi)
+_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T} =
+    roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
+
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
 function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
     s = zero(T)
@@ -712,6 +718,44 @@ function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T}
     return Q2
 end
 _int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _int_quartic(x, ψ, κ, κ, κ)
+
+# ∫ψ̂⁴ over a boundary segment of gap Δ: ψ₁⁴(3θ + 2sinh 2θ + sinh(4θ)/4)/(8κ cosh⁴θ) at θ = κΔ,
+# the unbounded tail's ψ₁⁴/(4κ) being its θ → ∞ limit. Rewritten in p = e^{-2θ}, cosh⁴θ =
+# (1+p)⁴/(16p²), and the near-1 differences as expm1(-4θ) = p²-1, expm1(-8θ) = p⁴-1, this stays
+# accurate as θ → 0 (each expm1 term individually cancellation-free, and their sum has no
+# cross-term cancellation — all three contributions are non-negative) and finite well past where
+# raw cosh/sinh would overflow (θ ~ 500).
+function _tail_quartic(ψ1::T, κ::T, Δ::T) where {T}
+    isfinite(Δ) || return ψ1^4 / (4κ)
+    θ = κ * Δ
+    p = exp(-2θ)
+    num = 6θ * p^2 - 2p * expm1(-4θ) - expm1(-8θ) / 4
+    return ψ1^4 * num / (κ * (oneunit(T) + p)^4)
+end
+
+# `_int_quartic` with an optional natural boundary: the tail term ψ₁⁴/(4κ) becomes the boundary
+# segment's `_tail_quartic` at each finite gap. Defers to the unbounded form above when both `lo`
+# and `hi` are infinite; the interior sum is untouched by a boundary.
+function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _int_quartic(x, ψ, κ, κL, κR)
+    n = length(x)
+    Q2 = _tail_quartic(ψ[1], κL, x[1] - lo) + _tail_quartic(ψ[n], κR, hi - x[n])
+    for k in 1:n-1
+        κk = _kappa(κ, k)
+        p, q = ψ[k], ψ[k+1]
+        θ = κk * (x[k+1] - x[k])
+        ct, cs = coth(θ), csch(θ)
+        Δ = q - p
+        cm1 = 2 * sinh(θ / 2)^2
+        boundary = κk * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))
+        E = κk^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)
+        fdiag  = (ct - θ * cs^2) / (2κk)
+        fcross = cs * (θ * ct - one(T)) / (2κk)
+        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q
+        Q2 += (boundary - 3 * E * Iseg) / (4κk^2)
+    end
+    return Q2
+end
 
 # (dM/dκ) ψ: the κ-derivative of roughness_operator's coth/csch entries, applied to ψ. The tails are
 # κ-independent and drop out.
@@ -1659,6 +1703,22 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where 
     return ψ, looi
 end
 
+# `_loo_density` with an optional natural boundary. Nothing in the expansion above uses M's
+# entries beyond it being the fit's SPD operator, so a finite `lo`/`hi` needs only the bounded
+# `_operator` and `_norm_sq_gram`; defers to the unbounded form when both are infinite.
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _loo_density(nodes, w, κ, κL, κR)
+    M = _operator(nodes, κ, κL, κR, lo, hi)
+    φ = _solve_amplitude(M, w)
+    Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
+    H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
+    gii = _inv_diag(H)
+    v = ldiv!(ldlt!(H), Gφ)
+    ψ = φ ./ sqrt(Z)
+    looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
+    return ψ, looi
+end
+
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ): an unbiased
 # estimate, up to the κ-independent ∫Q², of the integrated squared error ∫(Q̂-Q)².
 function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
@@ -1671,6 +1731,18 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
     return _int_quartic(nodes, ψ, κ, κL, κR) - 2 * cross / N
 end
 _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
+
+# `_lscv` with an optional natural boundary; defers to the unbounded form when both are infinite.
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _lscv(nodes, w, κ, κL, κR)
+    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+    N = sum(w)
+    cross = zero(T)
+    for i in eachindex(w, looi)
+        cross += w[i] * looi[i]
+    end
+    return _int_quartic(nodes, ψ, κ, κL, κR, lo, hi) - 2 * cross / N
+end
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ): an estimate, up to a κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses
@@ -1686,6 +1758,18 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T}
     return -s / sum(w)
 end
 _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
+
+# `_klcv` with an optional natural boundary; defers to the unbounded form when both are infinite.
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+    isinf(lo) && isinf(hi) && return _klcv(nodes, w, κ, κL, κR)
+    _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+    s = zero(T)
+    for i in eachindex(w, looi)
+        looi[i] > 0 || return T(NaN)
+        s += w[i] * log(looi[i])
+    end
+    return -s / sum(w)
+end
 
 """
     select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
@@ -1712,10 +1796,16 @@ rounded data instead resemble a discrete distribution, for which `LSCV` decrease
 as `κ → ∞` (finer scales keep resolving the atoms); `select_kappa_cv` then returns a large `κ`.
 Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
 
+`support = (a, b)` (default `(-Inf, Inf)`) fits and cross-validates on a finite domain, as
+[`DensityEstimate`](@ref)'s `support` does; it is a fixed hyperparameter of the search, not
+itself selected, and is held fixed across every candidate `κ`. Data outside `[a, b]`, or
+`a ≥ b`, throws a `DomainError`.
+
 `κs` must be sorted and positive, with at least three values to bracket the minimum.
 """
-select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6) =
-    _select_by_score(_lscv, x, κs, rtol)
+select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+               support::Tuple{Real,Real}=(-Inf, Inf)) =
+    _select_by_score(_lscv, x, κs, rtol, support)
 
 """
     select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
@@ -1748,28 +1838,39 @@ increases without bound as `κ → ∞` (leaving out one of many coincident copi
 fit); `select_kappa_kl` then returns a large `κ`. Prefer [`select_kappa_ms`](@ref) or
 [`kappa_interval`](@ref), which stay bounded, in that regime.
 
+`support = (a, b)` (default `(-Inf, Inf)`) fits and cross-validates on a finite domain, as
+[`DensityEstimate`](@ref)'s `support` does; it is a fixed hyperparameter of the search, not
+itself selected, and is held fixed across every candidate `κ`. Data outside `[a, b]`, or
+`a ≥ b`, throws a `DomainError`.
+
 `κs` must be sorted and positive, with at least three values to bracket the minimum.
 """
-select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6) =
-    _select_by_score(_klcv, x, κs, rtol)
+select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+               support::Tuple{Real,Real}=(-Inf, Inf)) =
+    _select_by_score(_klcv, x, κs, rtol, support)
 
-# Minimize a per-κ score over ln κ, bracketed by the grid κs. `scorefun(nodes, w, κ)` returns the
-# score for the merged nodes/weights at scale κ. A near-coincident pair left unmerged at very large
-# κ can drive the fit to a non-finite score; those are treated as +∞ so the search never selects a
-# degenerate scale.
-function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real)
+# Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
+# search. `scorefun(nodes, w, κ, κ, κ, lo, hi)` returns the score for the merged nodes/weights at
+# scale κ. A near-coincident pair left unmerged at very large κ can drive the fit to a non-finite
+# score; those are treated as +∞ so the search never selects a degenerate scale.
+function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
+                          support::Tuple{Real,Real})
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+    a, b = support
+    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
+    slo, shi = T(a), T(b)
+    _check_support(xs, slo, shi)
     r = T(rtol)
-    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ); isfinite(v) ? v : typemax(T))
+    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi); isfinite(v) ? v : typemax(T))
     lnκ = log.(T.(κs))
     i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
-    lo = lnκ[max(i - 1, firstindex(lnκ))]
-    hi = lnκ[min(i + 1, lastindex(lnκ))]
-    return exp(_golden_min(l -> score(exp(l)), lo, hi))
+    loκ = lnκ[max(i - 1, firstindex(lnκ))]
+    hiκ = lnκ[min(i + 1, lastindex(lnκ))]
+    return exp(_golden_min(l -> score(exp(l)), loκ, hiκ))
 end
 
 """

@@ -1051,6 +1051,111 @@ end
         @test_throws ArgumentError pvalue(d, t -> 1.0)
     end
 
+    @testset "cross-validation on a bounded fit" begin
+        @testset "unbounded regression" begin
+            Random.seed!(51)
+            x = randn(800)
+            xs = sort(x); w = ones(length(xs))
+            for κ0 in (1.2, 5.0, 15.0)
+                @test PenalizedDensity._klcv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._klcv(xs, w, κ0)
+                @test PenalizedDensity._lscv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._lscv(xs, w, κ0)
+            end
+            @test select_kappa_kl(x) == select_kappa_kl(x; support=(-Inf, Inf))
+            @test select_kappa_cv(x) == select_kappa_cv(x; support=(-Inf, Inf))
+        end
+
+        @testset "_int_quartic: boundary segment vs scale-matched quadrature" begin
+            Random.seed!(52)
+            x = sort(rand(300))
+            d = DensityEstimate(x, 25.0; support=(0.0, 1.0))
+            Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
+            # Sum scale-matched sub-segments (node-to-node plus the two boundary segments)
+            # rather than one quadgk spanning the whole support, per the harness's spike-forest
+            # discipline: a single call can converge to a misleadingly small error estimate.
+            total = quadgk(t -> d(t)^2, d.lo, d.x[1]; rtol=1e-13)[1]
+            for k in 1:length(d.x)-1
+                total += quadgk(t -> d(t)^2, d.x[k], d.x[k+1]; rtol=1e-13)[1]
+            end
+            total += quadgk(t -> d(t)^2, d.x[end], d.hi; rtol=1e-13)[1]
+            @test Q2 ≈ total rtol = 1e-10
+        end
+
+        @testset "brute-force validation of the leave-one-out expansion" begin
+            function klcv_refit_b(nodes, weights, κ, lo, hi)
+                s = 0.0
+                for i in eachindex(nodes)
+                    keep = [j for j in eachindex(nodes) if j != i]
+                    s += weights[i] * log(DensityEstimate(nodes[keep], κ; support=(lo, hi))(nodes[i]))
+                end
+                return -s / sum(weights)
+            end
+            function lscv_refit_b(nodes, weights, κ, lo, hi)
+                cross = 0.0
+                for i in eachindex(nodes)
+                    keep = [j for j in eachindex(nodes) if j != i]
+                    cross += weights[i] * DensityEstimate(nodes[keep], κ; support=(lo, hi))(nodes[i])
+                end
+                di = DensityEstimate(nodes, κ; support=(lo, hi))
+                Q2 = PenalizedDensity._int_quartic(di.x, di.ψ, di.κ, di.κL, di.κR, di.lo, di.hi)
+                return Q2 - 2cross / sum(weights)
+            end
+            # Exponential (a hard left edge) and uniform (both edges hard), N a few hundred, at
+            # several κ including each family's own KLCV-selected scale. Tolerances match the
+            # unbounded suite's (`select_kappa_kl`/`select_kappa_cv` testsets above): KLCV's
+            # equal per-node weighting under the log is most sensitive to sparse tail nodes,
+            # where the first-order expansion is least accurate, so it gets the looser bound.
+            for (name, xgen, support) in (
+                    ("exponential", rng -> -log.(1 .- rand(rng, 300)), (0.0, Inf)),
+                    ("uniform",     rng -> rand(rng, 300),              (0.0, 1.0)))
+                rng = Xoshiro(hash((:boundedcv, name)))
+                x = sort(xgen(rng))
+                lo, hi = support
+                nodes, w = PenalizedDensity._merge_presorted(x, 0.0)
+                κsel = select_kappa_kl(x; support)
+                for κ0 in (κsel * 0.5, κsel, κsel * 1.5)
+                    a_kl = PenalizedDensity._klcv(nodes, w, κ0, κ0, κ0, lo, hi)
+                    b_kl = klcv_refit_b(nodes, w, κ0, lo, hi)
+                    @test a_kl ≈ b_kl rtol = 2e-2
+                    a_ls = PenalizedDensity._lscv(nodes, w, κ0, κ0, κ0, lo, hi)
+                    b_ls = lscv_refit_b(nodes, w, κ0, lo, hi)
+                    @test a_ls ≈ b_ls rtol = 5e-3
+                end
+            end
+        end
+
+        @testset "selector: bounded vs unbounded κ on a hard-edge family" begin
+            x = -log.(1 .- (0.5:1999.5) ./ 2000)   # exponential, a jump edge at the left
+            κ_unb = select_kappa_kl(x)
+            κ_bnd = select_kappa_kl(x; support=(0.0, Inf))
+            @test κ_bnd != κ_unb
+            @test κ_bnd < κ_unb    # the boundary itself represents the edge, so cross-validation
+                                    # asks for less compensating smoothing, not more
+            nodes, w = PenalizedDensity._merge_presorted(sort(x), 0.0)
+            klcv_bnd = PenalizedDensity._klcv(nodes, w, κ_bnd, κ_bnd, κ_bnd, 0.0, Inf)
+            klcv_unb = PenalizedDensity._klcv(nodes, w, κ_unb, κ_unb, κ_unb, 0.0, Inf)
+            @test klcv_bnd < klcv_unb   # the bounded fit at its own selection beats it at the
+                                        # unbounded selection, on the bounded fit's own score
+        end
+
+        @testset "select_kappa_kl / select_kappa_cv: input validation" begin
+            @test_throws DomainError select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws "support must satisfy a < b" select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+            @test_throws DomainError select_kappa_cv([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+        end
+
+        @testset "generic indexing: OffsetVector through select_kappa_kl(; support)" begin
+            Random.seed!(53)
+            x = rand(300)
+            κ = select_kappa_kl(x; support=(0.0, 1.0))
+            κo = select_kappa_kl(OffsetArray(x, -150); support=(0.0, 1.0))
+            @test κo == κ
+        end
+    end
+
     @testset "quantile precision near q = 1 (complement inversion)" begin
         Random.seed!(54)
         x = sort(rand(200) .* 0.6 .+ 0.2)
