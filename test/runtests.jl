@@ -909,6 +909,205 @@ end
     end
 end
 
+@testset "bounded support (natural/Neumann boundary)" begin
+    # Independent reference fit: assembled from scratch with `tanh`/`sech` and `coth`/`csch`
+    # (Base's hyperbolic functions, not the package's e^{-2θ}-based stable forms), sharing no
+    # arithmetic with the bounded-support code under test. Mirrors the standalone derivation
+    # the closed forms below were checked against.
+    _tail_diag_ref(κ, Δ) = isfinite(Δ) ? tanh(κ * Δ) : 1.0
+    function _tail_mass_ref(ψ1, κ, Δ)
+        isfinite(Δ) || return ψ1^2 / (2κ)
+        u = κ * Δ
+        return ψ1^2 * (tanh(u) + u * sech(u)^2) / (2κ)
+    end
+    function _bounded_operator_ref(x::Vector{Float64}, κ::Float64, a::Float64, b::Float64)
+        n = length(x)
+        d = zeros(n); e = zeros(n - 1)
+        d[1] += _tail_diag_ref(κ, x[1] - a)
+        d[n] += _tail_diag_ref(κ, b - x[n])
+        for k in 1:n-1
+            θ = κ * (x[k+1] - x[k])
+            d[k] += coth(θ); d[k+1] += coth(θ); e[k] = -csch(θ)
+        end
+        return SymTridiagonal(d, e)
+    end
+    function _bounded_norm_sq_ref(x::Vector{Float64}, ψ::Vector{Float64}, κ::Float64, a::Float64, b::Float64)
+        n = length(x)
+        Z = _tail_mass_ref(ψ[1], κ, x[1] - a) + _tail_mass_ref(ψ[n], κ, b - x[n])
+        for k in 1:n-1
+            θ = κ * (x[k+1] - x[k]); ct, cs = coth(θ), csch(θ)
+            fdiag = (ct - θ * cs^2) / (2κ); fcross = cs * (θ * ct - 1) / (2κ)
+            Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        end
+        return Z
+    end
+    function _bounded_fit_ref(xs_sorted::Vector{Float64}, κ::Float64, a::Float64, b::Float64;
+                              rtol::Float64 = cbrt(eps(Float64)))
+        nodes, weights = PenalizedDensity._merge_presorted(xs_sorted, rtol / κ)
+        M = _bounded_operator_ref(nodes, κ, a, b)
+        ψ = PenalizedDensity._solve_amplitude(M, weights)
+        Z = _bounded_norm_sq_ref(nodes, ψ, κ, a, b)
+        ψ ./= sqrt(Z)
+        return (; x = nodes, w = weights, ψ, κ, a, b)
+    end
+
+    @testset "unbounded regression" begin
+        Random.seed!(41)
+        x = randn(1500)
+        for κ in (0.7, 6.0)
+            d1 = DensityEstimate(x, κ)
+            d2 = DensityEstimate(x, κ; support=(-Inf, Inf))
+            @test d1.x == d2.x && d1.w == d2.w && d1.ψ == d2.ψ && d1.κ == d2.κ &&
+                  d1.κL == d2.κL && d1.κR == d2.κR && d1.λ == d2.λ
+            @test d1.lo == -Inf && d1.hi == Inf
+            far = 1e4 / κ
+            dfar = DensityEstimate(x, κ; support=(minimum(x) - far, maximum(x) + far))
+            @test maximum(abs.(dfar.ψ .- d1.ψ)) / maximum(d1.ψ) < 1e-12
+        end
+    end
+
+    @testset "reproduces the reference fit node-for-node" begin
+        for (name, xgen, κ, support) in (
+                ("exponential", rng -> -log.(1 .- rand(rng, 800)), 12.0, (0.0, Inf)),
+                ("uniform",     rng -> rand(rng, 800),              18.0, (0.0, 1.0)),
+                ("chisq1",      rng -> randn(rng, 800) .^ 2,        25.0, (0.0, Inf)))
+            rng = Xoshiro(hash((:boundedref, name)))
+            x = sort(xgen(rng))
+            ref = _bounded_fit_ref(x, κ, support...)
+            d = DensityEstimate(x, κ; support)
+            @test d.x == ref.x
+            @test maximum(abs.(d.ψ .- ref.ψ) ./ ref.ψ) < 1e-9
+        end
+    end
+
+    @testset "_norm_sq_gram matches _norm_sq on a bounded fit" begin
+        # No caller yet threads a finite support into `_norm_sq_gram` (its only consumer,
+        # `_loo_density`, stays unbounded-only), but its generalized tail terms must already be
+        # self-consistent: Z = ψᵀGψ, and Z itself must agree with `_norm_sq`.
+        Random.seed!(47)
+        x = sort(rand(30) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 7.0; support=(0.0, 1.0))
+        Zgram, Gψ = PenalizedDensity._norm_sq_gram(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
+        Z = PenalizedDensity._norm_sq(d.x, d.ψ, d.κ, d.lo, d.hi)
+        @test Zgram ≈ Z rtol = 1e-13
+        @test sum(d.ψ .* Gψ) ≈ Z rtol = 1e-13
+    end
+
+    @testset "mass" begin
+        Random.seed!(42)
+        x = sort(rand(400))
+        d = DensityEstimate(x, 30.0; support=(0.0, 1.0))
+        @test cdf(d, 1.0) == 1
+        @test cdf(d, 0.0) == 0
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-10)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-10)
+        right, Er = quadgk(d, d.x[end], 1.0; rtol=1e-10)
+        @test max(El, Ei, Er) < 1e-8
+        @test abs(left + interior + right - 1) < 1e-9
+    end
+
+    @testset "cdf ∘ quantile round trip; monotonicity across the boundary" begin
+        Random.seed!(43)
+        x = sort(rand(200) .* 0.6 .+ 0.2)
+        d = DensityEstimate(x, 10.0; support=(0.0, 1.0))
+        for q in vcat(0.0, exp10.(-12:2:-2), 0.1:0.1:0.9, 1 .- exp10.(-12:2:-2), 1.0)
+            @test cdf(d, quantile(d, q)) ≈ q atol = 1e-9
+        end
+        @test quantile(d, 0.0) == 0.0
+        @test quantile(d, 1.0) == 1.0
+        g = collect(range(-0.05, 1.05; length=3000))
+        @test issorted(cdf(d, g))
+    end
+
+    @testset "evaluation is exactly zero outside the support" begin
+        Random.seed!(44)
+        x = sort(rand(100) .* 0.5 .+ 0.25)
+        d = DensityEstimate(x, 12.0; support=(0.0, 1.0))
+        @test d(-0.1) == 0 && d(1.1) == 0
+        @test amplitude(d, -0.1) == 0 && amplitude(d, 1.1) == 0
+        @test d(0.0) > 0 && d(1.0) > 0     # jump edge: nonzero right up to the wall
+        @test amplitude(d, prevfloat(0.0)) == 0
+        @test amplitude(d, nextfloat(1.0)) == 0
+    end
+
+    @testset "input validation" begin
+        @test_throws DomainError DensityEstimate([0.5, 1.5], 1.0; support=(0.0, 1.0))
+        @test_throws "lies outside the support" DensityEstimate([0.5, 1.5], 1.0; support=(0.0, 1.0))
+        @test_throws DomainError DensityEstimate([-0.5, 0.5], 1.0; support=(0.0, 1.0))
+        @test_throws "lies outside the support" DensityEstimate([-0.5, 0.5], 1.0; support=(0.0, 1.0))
+        @test_throws DomainError DensityEstimate([0.5], 1.0; support=(1.0, 0.0))
+        @test_throws "support must satisfy a < b" DensityEstimate([0.5], 1.0; support=(1.0, 0.0))
+        @test_throws DomainError DensityEstimate([0.5], 1.0; support=(0.5, 0.5))
+        @test_throws "support must satisfy a < b" DensityEstimate([0.5], 1.0; support=(0.5, 0.5))
+    end
+
+    @testset "chisq family throws on a bounded fit" begin
+        d = DensityEstimate(sort(rand(Xoshiro(45), 50)), 10.0; support=(0.0, 1.0))
+        @test_throws ArgumentError chisq_reference(d)
+        @test_throws "not yet supported for a finite-support fit" chisq_reference(d)
+        @test_throws ArgumentError expected_chisq(d)
+        @test_throws ArgumentError chisq_ccdf(d, 1.0)
+        @test_throws ArgumentError chisq_pdf(d, 1.0)
+        @test_throws ArgumentError pvalue(d, t -> 1.0)
+    end
+
+    @testset "AdaptiveScale composition" begin
+        x = -log.(1 .- (0.5:999.5) ./ 1000)
+        κ = select_kappa_adaptive(x)
+        d = DensityEstimate(x, κ; support=(0.0, Inf))
+        @test d.lo == 0.0 && d.hi == Inf
+        left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
+        interior, Ei = quadgk(d, d.x...; rtol=1e-8)
+        right, Er = quadgk(d, d.x[end], d.x[end] + 60; rtol=1e-8)
+        @test max(El, Ei, Er) < 1e-6
+        @test abs(left + interior + right - 1) < 1e-6
+    end
+
+    @testset "generic indexing: OffsetVector with support" begin
+        x = [-1.5, 0.2, 0.2, 1.1, 3.4]
+        d = DensityEstimate(x, 1.1; support=(-2.0, 4.0))
+        do_ = DensityEstimate(OffsetArray(x, -3), 1.1; support=(-2.0, 4.0))
+        @test do_.x == d.x && do_.ψ ≈ d.ψ && do_.lo == d.lo && do_.hi == d.hi
+        @test do_(0.7) ≈ d(0.7)
+    end
+
+    @testset "stress: extreme and vanishing boundary gaps" begin
+        # θ_L ≈ 500: far past where raw cosh/sinh would overflow.
+        d = DensityEstimate([0.0, 1.0], 1.0; support=(-500.0, 501.0))
+        @test all(isfinite, d.ψ) && isfinite(d.λ)
+        @test d(-500.0) >= 0 && isfinite(d(-500.0))
+        @test d(-500.1) == 0
+
+        # θ_L ≈ 1e-8: the boundary sits essentially at the node.
+        dn = DensityEstimate([0.0, 1.0], 1.0; support=(-1e-8, 1.0 + 1e-8))
+        @test all(isfinite, dn.ψ)
+        @test cdf(dn, -1e-8) == 0
+        @test cdf(dn, 1.0 + 1e-8) == 1
+
+        # Single-node fits, one and both walls finite: the analytic solution
+        # ψ = √(w / (tanh(κΔl) + tanh(κΔr))), since M is the 1×1 matrix
+        # tanh(κΔl) + tanh(κΔr) with no interior terms.
+        Random.seed!(46)
+        for _ in 1:20
+            κ = exp(6 * rand() - 3)
+            Δl = exp(8 * rand() - 2)
+            Δr = exp(8 * rand() - 2)
+            w = 1.0 + 3 * rand()
+            M = PenalizedDensity.roughness_operator([0.0], κ, -Δl, Δr)
+            φ = PenalizedDensity._solve_amplitude(M, [w])
+            φexact = sqrt(w / (tanh(κ * Δl) + tanh(κ * Δr)))
+            @test only(φ) ≈ φexact rtol = 1e-5
+
+            # One wall finite, the other unbounded: the unbounded side's tail entry is 1,
+            # the finite side's Δr = Inf limit of the same analytic solution.
+            Mhalf = PenalizedDensity.roughness_operator([0.0], κ, -Δl, Inf)
+            φhalf = PenalizedDensity._solve_amplitude(Mhalf, [w])
+            φhalf_exact = sqrt(w / (tanh(κ * Δl) + 1))
+            @test only(φhalf) ≈ φhalf_exact rtol = 1e-5
+        end
+    end
+end
+
 @testset "code quality (Aqua)" begin
     Aqua.test_all(PenalizedDensity)
 end
