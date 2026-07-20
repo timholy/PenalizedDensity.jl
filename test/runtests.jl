@@ -570,6 +570,75 @@ end
         @test parent(gaussianize_gradient(d64, xo)) == gaussianize_gradient(d64, [-0.5, 0.0, 0.5])
     end
 
+    @testset "gaussianize: bounded support and per-interval κ" begin
+        Φ(t) = PenalizedDensity._Φ(t)
+        φ(t) = exp(-t^2 / 2) / sqrt(2π)
+
+        # A fit is Gaussianized correctly when Φ(gaussianize) reproduces its own cdf, the map
+        # inverts, and ln φ(y) + logjac = ln Q̂(x) — the change of variables. These held only for
+        # the unbounded, scalar-κ fit; they must now hold for a finite support and a
+        # per-interval κ as well, over the interior *and* the boundary segments.
+        Random.seed!(202)
+        xb = clamp.(0.5 .+ 0.18 .* randn(400), 1e-3, 1 - 1e-3)
+        adaptive = DensityEstimate(randn(400) .^ 2 .+ 0.1 .* randn(400),
+                                   select_kappa_adaptive(randn(400) .^ 2))
+        fits = (("bounded [0,1]",     DensityEstimate(xb, 8.0; support = (0.0, 1.0))),
+                ("one-sided [0,Inf)", DensityEstimate(xb, 8.0; support = (0.0, Inf))),
+                ("one-sided (-Inf,1]",DensityEstimate(xb, 8.0; support = (-Inf, 1.0))),
+                ("per-interval κ",    adaptive))
+        for (label, d) in fits
+            @testset "$label" begin
+                lo = isfinite(d.lo) ? d.lo : d.x[1] - 3
+                hi = isfinite(d.hi) ? d.hi : d.x[end] + 3
+                # cdf identity, sampled across the whole support including both boundary segments.
+                for t in range(lo, hi; length = 121)
+                    c = cdf(d, t)
+                    1e-12 < c < 1 - 1e-12 || continue
+                    @test Φ(gaussianize(d, t)) ≈ c rtol = 1e-11
+                end
+                # Round trip wherever the density is resolvable.
+                for t in range(lo, hi; length = 151)
+                    d(t) > 1e-8 || continue
+                    @test ungaussianize(d, gaussianize(d, t)) ≈ t atol = 1e-9
+                end
+                # Change of variables and the log-derivative, inset from the walls where y is finite.
+                for t in range(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo); length = 41)
+                    (; y, logjac) = gaussianize_logjacobian(d, t)
+                    @test y == gaussianize(d, t)
+                    @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-8
+                end
+                # Monotone across the support.
+                @test issorted(gaussianize(d, collect(range(lo, hi; length = 1001))))
+            end
+        end
+
+        # Out-of-support convention for a compact support: honest ±Inf, and the inverse maps a
+        # saturated Gaussian back to the wall.
+        db = DensityEstimate(xb, 8.0; support = (0.0, 1.0))
+        @test gaussianize(db, -0.05) == -Inf && gaussianize(db, 1.05) == Inf
+        @test gaussianize_logjacobian(db, -0.05).logjac == -Inf
+        @test gaussianize_logjacobian(db, 1.05).logjac == -Inf
+        @test ungaussianize(db, -50.0) == 0.0 && ungaussianize(db, 50.0) == 1.0
+        # A one-sided support keeps the honest exponential tail on the unbounded side.
+        dr = DensityEstimate(xb, 8.0; support = (0.0, Inf))
+        @test gaussianize(dr, -0.05) == -Inf
+        @test isfinite(gaussianize(dr, 5.0)) && gaussianize(dr, Inf) == Inf
+
+        # Distributional: draws from a bounded fit Gaussianize to N(0, 1).
+        Random.seed!(303)
+        u = rand(4000)
+        du = DensityEstimate(u, select_kappa_kl(u); support = (0.0, 1.0))
+        y = gaussianize(du, u)
+        @test abs(mean(y)) < 0.05 && abs(var(y) - 1) < 0.07
+        counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
+        @test sum((counts .- 400) .^ 2 ./ 400) < 30     # χ²₉; multinomial noise only
+
+        # Generic indexing on a bounded fit: array methods preserve axes.
+        xo = OffsetArray([0.2, 0.5, 0.8], -2)
+        @test axes(gaussianize(du, xo)) == axes(xo)
+        @test parent(gaussianize(du, xo)) == gaussianize(du, [0.2, 0.5, 0.8])
+    end
+
     @testset "generic indexing: OffsetArray input" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
         d = DensityEstimate(x, 1.1)
