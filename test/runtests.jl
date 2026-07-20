@@ -415,6 +415,161 @@ end
         @test parent(quantile(d64, qo)) == quantile(d64, [0.1, 0.5, 0.9])
     end
 
+    @testset "gaussianize: transport, inverse, and log-Jacobian" begin
+        Φ(t) = PenalizedDensity._Φ(t)
+        φ(t) = exp(-t^2 / 2) / sqrt(2π)
+
+        # Single point: exactly Laplace(x₀, rate 2κ), whose Gaussianizing map has an
+        # elementary reference through Φ.
+        κ = 1.5; x0 = 2.0
+        d = DensityEstimate([x0], κ)
+        lap_cdf(x) = x <= x0 ? exp(2κ * (x - x0)) / 2 : 1 - exp(-2κ * (x - x0)) / 2
+        for x in (-3.0, 0.0, 2.5, 7.0)
+            @test Φ(gaussianize(d, x)) ≈ lap_cdf(x) rtol = 1e-13
+        end
+        @test abs(gaussianize(d, x0)) < 1e-8          # median maps to ≈ 0
+        # The map's derivative at the median: Q(x₀)/φ(0) = κ√(2π).
+        @test gaussianize_gradient(d, x0) ≈ κ * sqrt(2π) rtol = 1e-8
+
+        # Limits, NaN.
+        @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
+        @test ungaussianize(d, -Inf) == -Inf && ungaussianize(d, Inf) == Inf
+        @test isnan(gaussianize(d, NaN)) && isnan(ungaussianize(d, NaN))
+        nanlj = gaussianize_logjacobian(d, NaN)
+        @test isnan(nanlj.y) && isnan(nanlj.logjac)
+        @test gaussianize_logjacobian(d, Inf).logjac == -Inf   # dy/dx → 0 in the tails
+        @test gaussianize_gradient(d, Inf) == 0
+
+        # Multi-node fits across smoothing regimes, from smooth (θ ≪ 1) to isolated
+        # points (θ ≫ 1).
+        Random.seed!(21)
+        x = randn(60)
+        for κ in (0.5, 3.0, 40.0)
+            d = DensityEstimate(x, κ)
+            lo, hi = d.x[1], d.x[end]
+            # Definition: Φ(gaussianize) reproduces the cdf at full relative precision.
+            for t in range(lo - 8 / κ, hi + 8 / κ; length = 41)
+                c = cdf(d, t)
+                1e-12 < c < 1 - 1e-12 || continue
+                @test Φ(gaussianize(d, t)) ≈ c rtol = 1e-12
+            end
+            # Inverse consistency with quantile ∘ Φ where Φ(y) carries full precision.
+            for y in (-2.0, -0.5, 0.0, 1.0, 2.0)
+                @test ungaussianize(d, y) ≈ quantile(d, Φ(y)) atol = 1e-10
+            end
+            # y-side round trip, from the bulk to far beyond linear-space Φ (|y| > 38.6
+            # underflows Φ; the log-space tail forms carry it without saturation).
+            for y in vcat(-37.5:2.5:37.5, [-300.0, -50.0, 50.0, 300.0])
+                @test gaussianize(d, ungaussianize(d, y)) ≈ y rtol = 1e-11 atol = 1e-11
+            end
+            # x-side round trip wherever the density is not vanishingly small (where the
+            # CDF is numerically flat, x cannot be recovered from it) …
+            for t in range(lo - 5 / κ, hi + 5 / κ; length = 101)
+                d(t) > 1e-8 || continue
+                @test ungaussianize(d, gaussianize(d, t)) ≈ t atol = 1e-9
+            end
+            # … and deep into both exponential tails, where it is closed-form.
+            for t in (lo - 500 / κ, lo - 50 / κ, hi + 50 / κ, hi + 500 / κ)
+                @test ungaussianize(d, gaussianize(d, t)) ≈ t rtol = 1e-13
+            end
+            # Monotone on a fine grid spanning both tails.
+            g = collect(range(lo - 10 / κ, hi + 10 / κ; length = 2001))
+            @test issorted(gaussianize(d, g))
+            # Derivative against central finite differences, interior and tails.
+            for t in vcat(collect(range(lo - 3 / κ, hi + 3 / κ; length = 41)),
+                          lo - 50 / κ, hi + 50 / κ)
+                h = 1e-6 / κ
+                fd = (gaussianize(d, t + h) - gaussianize(d, t - h)) / (2h)
+                @test gaussianize_gradient(d, t) ≈ fd rtol = 1e-4
+            end
+            # The log-Jacobian is the log-derivative, and it makes the change of
+            # variables exact: ln φ(y) + logjac = ln Q̂(x).
+            for t in range(lo - 3 / κ, hi + 3 / κ; length = 41)
+                (; y, logjac) = gaussianize_logjacobian(d, t)
+                @test y == gaussianize(d, t)
+                @test exp(logjac) ≈ gaussianize_gradient(d, t) rtol = 1e-13
+                @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-9
+            end
+            # Deep-tail log-Jacobian: finite, and consistent with the map's slope.
+            for t in (lo - 200 / κ, hi + 200 / κ)
+                lj = gaussianize_logjacobian(d, t).logjac
+                @test isfinite(lj)
+                h = 1e-5 / κ
+                fd = (gaussianize(d, t + h) - gaussianize(d, t - h)) / (2h)
+                @test lj ≈ log(fd) rtol = 1e-4
+            end
+        end
+
+        # Distributional: draws from the fit (inverse-CDF sampling) Gaussianize to
+        # N(0, 1) — moments and an equiprobable-bin χ² against the standard normal.
+        Random.seed!(77)
+        xtr = randn(1000)
+        df = DensityEstimate(xtr, select_kappa_kl(xtr))
+        u = rand(5000)
+        y = gaussianize(df, quantile(df, u))
+        m = mean(y); v = var(y)
+        @test abs(m) < 0.05 && abs(v - 1) < 0.07
+        counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
+        @test sum((counts .- 500) .^ 2 ./ 500) < 30     # χ²₉; multinomial noise only
+        # Fresh draws from the underlying truth Gaussianize approximately (fit error).
+        yfresh = gaussianize(df, randn(5000))
+        @test abs(mean(yfresh)) < 0.1 && abs(var(yfresh) - 1) < 0.15
+
+        # ungaussianize(d, Z) with Z ~ N(0,1) samples the fit: compare tail masses.
+        z = randn(5000)
+        xs = ungaussianize(df, z)
+        @test mean(xs .< quantile(df, 0.25)) ≈ 0.25 atol = 0.03
+
+        # An isolated far node (θ = κ·Δx = 240): every branch stays finite, monotone,
+        # and invertible across the numerically flat valley.
+        di = DensityEstimate([0.0, 1.0, 2.0, 50.0], 5.0)
+        yi = gaussianize(di, collect(range(-3.0, 53.0; length = 501)))
+        @test all(isfinite, yi) && issorted(yi)
+        for y in (-40.0, -5.0, 0.0, 5.0, 40.0)
+            @test gaussianize(di, ungaussianize(di, y)) ≈ y atol = 1e-11
+        end
+
+        # Affine equivariance: x → s·x + b with κ → κ/s preserves y exactly and shifts
+        # the log-Jacobian by -ln s.
+        Random.seed!(33)
+        xa = randn(500)
+        d0 = DensityEstimate(xa, 2.5)
+        for (s, b) in ((1e-8, 3.0), (1e6, -20.0))
+            ds = DensityEstimate(s .* xa .+ b, 2.5 / s)
+            for t in range(-3, 3; length = 21)
+                @test gaussianize(ds, s * t + b) ≈ gaussianize(d0, t) atol = 1e-7
+                @test gaussianize_logjacobian(ds, s * t + b).logjac ≈
+                      gaussianize_logjacobian(d0, t).logjac - log(s) atol = 1e-6
+            end
+        end
+
+        # Float32 fits give Float32 results that agree with the Float64 fit, including
+        # the deep-tail branch (Φ(y) underflows Float32 below y ≈ -9.3).
+        d32 = DensityEstimate(Float32[-1, 0, 1], 1.0f0)
+        d64 = DensityEstimate([-1.0, 0.0, 1.0], 1.0)
+        @test @inferred(gaussianize(d32, 0.5f0)) isa Float32
+        @test @inferred(ungaussianize(d32, 0.5f0)) isa Float32
+        @test @inferred(gaussianize_gradient(d32, 0.5f0)) isa Float32
+        @test @inferred(gaussianize_logjacobian(d32, 0.5f0)).logjac isa Float32
+        @test gaussianize(d32, 0.5f0) ≈ gaussianize(d64, 0.5) atol = 1e-5
+        y32 = gaussianize(d32, -30.0f0)
+        @test y32 isa Float32 && isfinite(y32)
+        @test ungaussianize(d32, y32) ≈ -30.0f0 rtol = 1e-6
+
+        # Generic indexing: array methods preserve the argument's axes.
+        xo = OffsetArray([-0.5, 0.0, 0.5], -2)
+        @test axes(gaussianize(d64, xo)) == axes(xo)
+        @test parent(gaussianize(d64, xo)) == gaussianize(d64, [-0.5, 0.0, 0.5])
+        yo = OffsetArray([-1.0, 0.0, 1.0], 7)
+        @test axes(ungaussianize(d64, yo)) == axes(yo)
+        @test parent(ungaussianize(d64, yo)) == ungaussianize(d64, [-1.0, 0.0, 1.0])
+        ljo = gaussianize_logjacobian(d64, xo)
+        @test axes(ljo.y) == axes(xo) && axes(ljo.logjac) == axes(xo)
+        @test parent(ljo.y) == gaussianize(d64, [-0.5, 0.0, 0.5])
+        @test axes(gaussianize_gradient(d64, xo)) == axes(xo)
+        @test parent(gaussianize_gradient(d64, xo)) == gaussianize_gradient(d64, [-0.5, 0.0, 0.5])
+    end
+
     @testset "generic indexing: OffsetArray input" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
         d = DensityEstimate(x, 1.1)
