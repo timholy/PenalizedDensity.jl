@@ -866,6 +866,69 @@ end
         @test kappa_interval([0.0, 0.0, 1.0, 5.0]; level = 0.4).κ > 0
     end
 
+    @testset "entropy and negentropy" begin
+        # Single-point fit is an exact Laplace(rate 2κ) density, variance σ² = 1/(2κ²): the
+        # plug-in Ĥ = -ln κ (biased relative to the exact H = 1 - ln κ at this extreme
+        # small-sample size), and negentropy is the gap to the matched Gaussian's entropy.
+        κ = 1.5
+        d = DensityEstimate([2.0], κ)
+        @test entropy(d) ≈ -log(κ)
+        @test negentropy(d) ≈ log(2π * ℯ / (2κ^2)) / 2 - entropy(d)
+
+        # Brute-force reference: quadrature entropy and negentropy from the fitted density
+        # itself (not the plug-in estimator), to isolate the closed-form mean/variance and
+        # the -∫Q ln Q dx integral from any small-sample plug-in bias.
+        function quad_entropy(d)
+            lo, hi = d.x[1] - 20 / d.κ, d.x[end] + 20 / d.κ
+            integrate(t -> (q = d(t); q > 0 ? -q * log(q) : 0.0), lo, hi)
+        end
+        quad_negentropy(d, σ²) = log(2π * ℯ * σ²) / 2 - quad_entropy(d)
+
+        Random.seed!(42)
+        N = 5_000
+        families = (
+            laplace = rand(N) .- rand(N),
+            uniform = 4 .* rand(N) .- 2,
+            bimodal = vcat(randn(N ÷ 2) .- 3, randn(N ÷ 2) .+ 3),
+        )
+        for (name, x) in pairs(families)
+            κ = select_kappa_ms(x)
+            d = DensityEstimate(x, κ)
+            @test negentropy(d) > 0
+            @test negentropy(d) ≈ quad_negentropy(d, var(x)) rtol = 0.1
+        end
+
+        # Gaussian samples: negentropy fluctuates near 0 and shrinks with N.
+        negs = map((200, 2_000, 20_000)) do n
+            Random.seed!(1)
+            xn = randn(n)
+            dn = DensityEstimate(xn, select_kappa_ms(xn))
+            abs(negentropy(dn))
+        end
+        @test issorted(negs; rev=true)
+
+        # Affine invariance: x ↦ a·x + b with κ ↦ κ/|a| is the corresponding fit (package's
+        # scale equivariance), and negentropy is invariant under it, for a > 0 and a < 0.
+        Random.seed!(9)
+        x = 1.7 .* randn(2_000) .+ 0.3
+        κ0 = select_kappa_ms(x)
+        d0 = DensityEstimate(x, κ0)
+        for a in (4.5, -3.0)
+            b = -2.1
+            da = DensityEstimate(a .* x .+ b, κ0 / abs(a))
+            @test negentropy(da) ≈ negentropy(d0) rtol = 1e-6
+        end
+
+        # Generic indexing: OffsetArray input gives an identical result.
+        d_off = DensityEstimate(OffsetArray(x, -750), κ0)
+        @test negentropy(d_off) == negentropy(d0)
+
+        # Translation far from the origin must not corrupt the variance via cancellation
+        # in M2 - M1²: node positions are large (~1e8) while the spread stays O(1).
+        dfar = DensityEstimate(x .+ 1e8, κ0)
+        @test negentropy(dfar) ≈ negentropy(d0) rtol = 1e-6
+    end
+
     @testset "large κ stays finite (no sinh overflow)" begin
         Random.seed!(3)
         x = randn(300)
