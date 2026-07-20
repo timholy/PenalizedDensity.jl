@@ -34,8 +34,7 @@ pvalue(d, x -> exp(-x^2/2)/√(2π))    # test a model (here a standard normal)
 
 `κ` may also *vary across the data*, resolving densities a single scale cannot — a divergent
 or discontinuous edge, a kink, a heavy tail. `select_kappa_adaptive` chooses such a scale by
-the same cross-validation, and falls back to a constant one when adaptivity does not earn its
-keep:
+the same cross-validation, and falls back to a constant one when adaptivity cannot be justified:
 
 ```julia
 z = randn(4000).^2                   # χ²₁: the density diverges at x = 0
