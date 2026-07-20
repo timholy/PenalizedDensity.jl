@@ -929,6 +929,150 @@ end
         @test negentropy(dfar) ≈ negentropy(d0) rtol = 1e-6
     end
 
+    @testset "held-out entropy and negentropy" begin
+        Random.seed!(17)
+        x = 1.2 .* randn(400) .+ 0.5
+        κ = select_kappa_kl(x)
+        d = DensityEstimate(x, κ)
+        ye = 1.2 .* randn(150) .+ 0.5          # independent evaluation batch
+
+        # entropy(d, ye) is the plug-in -(2/M) Σ ln ψ(yⱼ) at the held-out points.
+        M = length(ye)
+        @test entropy(d, ye) ≈ -2 * sum(log(amplitude(d, y)) for y in ye) / M
+
+        # negentropy(d, ye) = ½ln(2πe s²) - entropy, with s² the empirical (population)
+        # variance of ye. That Gaussian term equals -(1/M) Σ ln 𝒩(yⱼ) at ye's own MLE
+        # moments, so the reference is itself a held-out expectation.
+        m = sum(ye) / M
+        s² = sum((y - m)^2 for y in ye) / M
+        gaussref = -sum(log(exp(-(y - m)^2 / (2s²)) / sqrt(2π * s²)) for y in ye) / M
+        @test log(2π * ℯ * s²) / 2 ≈ gaussref
+        @test negentropy(d, ye) ≈ log(2π * ℯ * s²) / 2 - entropy(d, ye)
+
+        # Affine invariance: entropy shifts by ln|a|, negentropy is invariant (a > 0, a < 0).
+        for a in (2.5, -0.7)
+            b = 1.3
+            da = DensityEstimate(a .* x .+ b, κ / abs(a))
+            yea = a .* ye .+ b
+            @test entropy(da, yea) - entropy(d, ye) ≈ log(abs(a)) atol = 1e-8
+            @test negentropy(da, yea) ≈ negentropy(d, ye) atol = 1e-8
+        end
+
+        # Generic indexing: OffsetArray evaluation points give identical results.
+        yeo = OffsetArray(ye, -75)
+        @test entropy(d, yeo) == entropy(d, ye)
+        @test negentropy(d, yeo) == negentropy(d, ye)
+
+        @test_throws ArgumentError entropy(d, Float64[])
+        @test_throws ArgumentError negentropy(d, Float64[])
+    end
+
+    @testset "evaluation-point log-density gradient" begin
+        # ∂ln Q̂(y)/∂y = 2ψ'(y)/ψ(y), against central finite differences away from the
+        # nodes (where ψ' — and hence the log-density slope — has a kink), across κ regimes.
+        nodes = [-1.3, -0.4, 0.2, 0.5, 1.1, 2.0]
+        for κ in (0.3, 1.5, 8.0, 40.0)
+            d = DensityEstimate(nodes, κ)
+            h = 1e-6
+            for y in range(-3.0, 4.0; length = 121)
+                minimum(abs.(y .- d.x)) < 0.05 && continue
+                fd = (log(d(y + h)) - log(d(y - h))) / (2h)
+                @test logdensity_eval_gradient(d, y) ≈ fd rtol = 1e-4 atol = 1e-6
+            end
+            # In the tails ψ ∝ e^{∓κ|·|}, so the slope is exactly ±2κ.
+            @test logdensity_eval_gradient(d, nodes[1] - 3.0) ≈ 2κ
+            @test logdensity_eval_gradient(d, nodes[end] + 3.0) ≈ -2κ
+        end
+    end
+
+    @testset "node-position log-density gradient" begin
+        # gᵢ = ∂/∂xᵢ Σⱼ cⱼ ln Q̂(yⱼ), by the implicit-function adjoint, against central
+        # finite differences that refit at perturbed node positions. Fits are built through
+        # _fit on distinct nodes (no merging) so the perturbation stays within one cell.
+        function L_of_nodes(xn, w, κ, ye, c)
+            dd = PenalizedDensity._fit(collect(float.(xn)), collect(float.(w)), float(κ))
+            sum(cj * log(dd(y)) for (y, cj) in zip(ye, c))
+        end
+        Random.seed!(23)
+        for κ in (0.3, 1.5, 8.0, 40.0)
+            xn = sort(randn(7)) .* 1.3
+            w = ones(7)
+            d = PenalizedDensity._fit(copy(xn), copy(w), Float64(κ))
+            # evaluation points span both tails and the interior, none at a node
+            ye = Float64[minimum(xn) - 0.7, minimum(xn) - 0.1, -0.33, 0.07, 0.44, 0.9,
+                         maximum(xn) + 0.15, maximum(xn) + 0.8]
+            c = collect(range(0.5, 1.5; length = length(ye)))   # nontrivial weights
+            an = logdensity_node_gradient(d, ye, c)
+            h = 1e-6
+            fd = map(eachindex(xn)) do i
+                xp = copy(xn); xp[i] += h
+                xm = copy(xn); xm[i] -= h
+                (L_of_nodes(xp, w, κ, ye, c) - L_of_nodes(xm, w, κ, ye, c)) / (2h)
+            end
+            @test an ≈ fd rtol = 1e-4
+        end
+
+        # Near-coincident node pair (θ ≈ 0.05) exercises the small-θ hyperbolic forms.
+        xn = [-1.0, -0.02, 0.03, 1.0, 2.0]; w = ones(5); κ = 1.0
+        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        ye = Float64[-1.7, -0.4, 0.5, 1.4, 2.6]; c = fill(0.2, 5)
+        an = logdensity_node_gradient(d, ye, c)
+        h = 1e-7
+        fd = map(eachindex(xn)) do i
+            xp = copy(xn); xp[i] += h
+            xm = copy(xn); xm[i] -= h
+            (L_of_nodes(xp, w, κ, ye, c) - L_of_nodes(xm, w, κ, ye, c)) / (2h)
+        end
+        @test an ≈ fd rtol = 1e-4
+
+        # Weighted multiplicities (w > 1) are handled like distinct points.
+        xn = sort(randn(5)); w = [1.0, 3.0, 1.0, 2.0, 1.0]; κ = 1.2
+        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        ye = Float64[xn[1] - 0.5, -0.2, 0.3, xn[end] + 0.4]; c = [0.7, 1.1, 0.9, 1.3]
+        an = logdensity_node_gradient(d, ye, c)
+        h = 1e-6
+        fd = map(eachindex(xn)) do i
+            xp = copy(xn); xp[i] += h
+            xm = copy(xn); xm[i] -= h
+            (L_of_nodes(xp, w, κ, ye, c) - L_of_nodes(xm, w, κ, ye, c)) / (2h)
+        end
+        @test an ≈ fd rtol = 1e-4
+
+        # Default weights are all ones (the plain sum of log densities).
+        d = PenalizedDensity._fit(sort(randn(6)), ones(6), 1.0)
+        ye = [-0.5, 0.2, 0.8]
+        @test logdensity_node_gradient(d, ye) ≈ logdensity_node_gradient(d, ye, ones(3))
+
+        # The two halves compose into ∂entropy(d, ye)/∂(node positions): since the Gaussian
+        # reference of negentropy(d, ye) depends only on ye, the node gradient of entropy is
+        # -logdensity_node_gradient with uniform 1/M weights.
+        Random.seed!(11)
+        xn = sort(randn(6)); w = ones(6); κ = 1.7
+        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        ye = Float64[-1.4, -0.3, 0.25, 0.9, 2.1]; M = length(ye)
+        an = .-logdensity_node_gradient(d, ye, fill(1 / M, M))
+        h = 1e-6
+        fd = map(eachindex(xn)) do i
+            xp = copy(xn); xp[i] += h
+            xm = copy(xn); xm[i] -= h
+            (entropy(PenalizedDensity._fit(xp, copy(w), κ), ye) -
+             entropy(PenalizedDensity._fit(xm, copy(w), κ), ye)) / (2h)
+        end
+        @test an ≈ fd rtol = 1e-4
+
+        # One adjoint solve regardless of batch size: allocations depend on the node count N,
+        # not the evaluation count M.
+        xn = sort(randn(500)); w = ones(500); d = PenalizedDensity._fit(copy(xn), copy(w), 2.0)
+        span(nb) = collect(range(minimum(xn) - 1, maximum(xn) + 1; length = nb))
+        ye_small, ye_big = span(200), span(4000)
+        c_small, c_big = fill(1 / 200, 200), fill(1 / 4000, 4000)
+        logdensity_node_gradient(d, ye_small, c_small)    # compile
+        logdensity_node_gradient(d, ye_big, c_big)
+        a_small = @allocated logdensity_node_gradient(d, ye_small, c_small)
+        a_big = @allocated logdensity_node_gradient(d, ye_big, c_big)
+        @test a_small == a_big
+    end
+
     @testset "large κ stays finite (no sinh overflow)" begin
         Random.seed!(3)
         x = randn(300)
