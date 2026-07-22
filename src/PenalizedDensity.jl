@@ -2148,7 +2148,7 @@ function _default_κs(x::AbstractVector{<:Real})
 end
 
 """
-    select_kappa_ms(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+    select_kappa_ms(x; κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
 the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
@@ -2172,7 +2172,7 @@ search, bracketed by the grid `κs`. This is a principled convention rather than
 optimum: `S` has no exact stationary point in `κ`, so the flattest point depends on measuring
 sensitivity in `ln κ`.
 """
-function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
@@ -2188,7 +2188,7 @@ function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=
 end
 
 """
-    kappa_interval(x; level=0.2, rtol=1e-6) -> (; κ, lo, hi)
+    kappa_interval(x; level=0.2, rtol=cbrt(eps(T))) -> (; κ, lo, hi)
 
 Principled smoothing-scale selection returning a point value and an interval of plausible
 scales. `κ` is the half-entropy scale — the `h = 1/2` point of the entropy fraction `h(κ)`
@@ -2216,7 +2216,7 @@ of the multiplicities (`ln N` for distinct points). The normalized quantity
 is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
 `h = 1/2` is returned as `κ`.
 """
-function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1e-6)
+function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=cbrt(eps(float(eltype(x)))))
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
@@ -2347,7 +2347,7 @@ _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
 _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -2378,12 +2378,12 @@ segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a first-order exp
 in the dropped point's weight, so no per-point refitting is needed. The score is minimized by a
 golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
-select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =
     _select_by_score(_lscv, x, κs, rtol, support)
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
 minimizing the mean negative leave-one-out log-likelihood
@@ -2421,7 +2421,7 @@ Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a first-order expansion o
 dropped point's weight, so no per-point refitting is needed and the score costs `O(N)`. The score
 is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
-select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =
     _select_by_score(_klcv, x, κs, rtol, support)
 
@@ -2849,7 +2849,7 @@ _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
 
 """
-    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=1e-6) -> (; κ, support)
+    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> (; κ, support)
 
 Choose a domain `support = (a, b)` — either side possibly infinite — together with the
 smoothing scale `κ`, jointly, by the same Kullback–Leibler cross-validation score
@@ -2921,7 +2921,7 @@ searches themselves score every candidate directly by the KLCV score `select_kap
 not by calling `kappa` per candidate.
 """
 function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
-                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
