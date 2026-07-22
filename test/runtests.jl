@@ -605,7 +605,10 @@ end
                 for t in range(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo); length = 41)
                     (; y, logjac) = gaussianize_logjacobian(d, t)
                     @test y == gaussianize(d, t)
-                    @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-8
+                    # The cdf behind y is a quadrature at rtol = √eps, so the identity
+                    # cannot hold tighter than that; most points land near 1e-10, a few
+                    # near the quadrature tolerance itself.
+                    @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-7
                 end
                 # Monotone across the support.
                 @test issorted(gaussianize(d, collect(range(lo, hi; length = 1001))))

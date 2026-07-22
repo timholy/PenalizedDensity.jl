@@ -457,16 +457,27 @@ to impose normalization.
 
 Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
 along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
-Newton decrement `λ² = ∇FᵀΔ` drops below a relative tolerance, or when the line search can
-no longer decrease `F`.
+Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
+roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
+tolerance. Reaching `maxiter` throws.
 """
 function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) where {T<:AbstractFloat}
     n = length(w)
     ψ = fill(oneunit(T), n)             # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
     Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
-    ctol = cbrt(eps(T))^2               # relative Newton-decrement tolerance
+    # The correction Δ is what the next step would subtract, so in the quadratic
+    # regime it is the remaining error in ψ. Testing F instead — or the Newton
+    # decrement, which predicts the same difference — constrains a quantity that
+    # is stationary at the minimizer, and is satisfied while ψ is still wrong by
+    # the square root of the tolerance; that error would carry into Z, λ, and the
+    # density.
+    stol = eps(T)^(3//4)                # relative tolerance on the Newton correction
+    W = sum(w)                          # total multiplicity, the scale of F's two terms
     Fψ = _objective(M, w, ψ)
+    prevstep = T(Inf)
+    unguarded = false                   # has a step been taken without the Armijo test?
+    converged = false
     for _ in 1:maxiter
         mul!(g, M, ψ)
         @. g -= w / ψ                    # ∇F = Mψ - w./ψ
@@ -475,16 +486,43 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
         Δ .= g
         ldiv!(ldlt!(SymTridiagonal(Hdv, Hev)), Δ)   # Δ = (∇²F)⁻¹ ∇F
         decrement = dot(g, Δ)               # Newton decrement λ² = ∇Fᵀ(∇²F)⁻¹∇F ≥ 0
-        decrement <= ctol * max(oneunit(T), abs(Fψ)) && break
+        step = zero(T)
+        for i in eachindex(Δ, ψ)
+            step = max(step, abs(Δ[i]) / ψ[i])   # ψ > 0 throughout
+        end
+        # Roundoff floors the attainable correction at a level set by the
+        # conditioning of ∇²F, and on a widely spread sample that floor can sit
+        # well above `stol`; stopping when the correction ceases to fall covers
+        # that case. The floor is only meaningful once F has stopped resolving
+        # the decrease the step predicts, which is what `unguarded` records —
+        # while the Armijo test is still informative the correction may plateau
+        # for a step or two without the iteration being finished.
+        if step <= stol || (unguarded && step >= prevstep)
+            converged = true
+            break
+        end
+        prevstep = step
         # Largest α ≤ 1 keeping ψ - αΔ strictly positive, then Armijo backtracking.
         α = one(T)
         for i in eachindex(ψ, Δ)
             Δ[i] > 0 && (α = min(α, ψ[i] / Δ[i]))
         end
         α < one(T) && (α *= oftype(α, 0.99))
+        # Armijo compares two values of F differing by α·decrement/4. F is a
+        # difference of terms of size W accumulated over n nodes, so rounding
+        # leaves it uncertain by roughly √n·eps·(|F| + W); a predicted decrease
+        # below that carries no information, and rejecting the step on it stalls
+        # the iteration into halving α when it should be squaring the error.
+        # Such a step is deep enough into the quadratic regime to take unguarded.
+        if α * decrement / 4 <= 4 * sqrt(T(n)) * eps(T) * (abs(Fψ) + W)
+            unguarded = true
+            @. ψ -= α * Δ
+            Fψ = _objective(M, w, ψ)
+            continue
+        end
         armijo = false
         local Fnew
-        while α >= eps(T)
+        while α * step >= eps(T)        # below this ψ - αΔ rounds back to ψ
             @. ψnew = ψ - α * Δ
             Fnew = _objective(M, w, ψnew)
             if Fnew <= Fψ - α * decrement / 4
@@ -493,10 +531,17 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
             end
             α /= 2
         end
-        armijo || break                     # no decrease available ⇒ converged to rounding
+        # Backtracking ran out of room: no positive step both keeps ψ inside the
+        # orthant and moves it by more than rounding, so ψ is stationary to the
+        # precision available. That is a converged fit, not a failed one.
+        if !armijo
+            converged = true
+            break
+        end
         copyto!(ψ, ψnew)
         Fψ = Fnew
     end
+    converged || error("Newton did not converge in $maxiter iterations; the fit is unreliable")
     return ψ
 end
 _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:AbstractFloat} =
