@@ -851,17 +851,19 @@ function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
     return out
 end
 
-# ln ψ(t) in the left tail, unbounded branch identical to `log(_left_tail_amplitude(...))`
-# (so `_logdensity_sorted` reduces to its pre-existing arithmetic when `lo = -Inf`); the finite
-# branch uses `_logcosh` so it stays finite well past where `cosh` itself would overflow.
+# ln ψ(t) in the left tail. Every branch stays in the log domain: the unbounded arm as a
+# sum rather than the logarithm of a product, the bounded arm through `_logcosh`. The tails
+# are where a log-density is worth having precisely because ψ itself has underflowed to
+# zero, so forming the amplitude first would return -Inf over the whole region the
+# logarithm exists to describe.
 _log_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
     isfinite(lo) ? log(ψ1) + _logcosh(κ * (x - lo)) - _logcosh(κ * (x1 - lo)) :
-                   log(ψ1 * exp(κ * (x - x1)))
+                   log(ψ1) + κ * (x - x1)
 
 # Mirror of `_log_left_tail_amplitude` for the right tail.
 _log_right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
     isfinite(hi) ? log(ψn) + _logcosh(κ * (hi - x)) - _logcosh(κ * (hi - xn)) :
-                   log(ψn * exp(-κ * (x - xn)))
+                   log(ψn) - κ * (x - xn)
 
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)

@@ -1310,6 +1310,34 @@ end
         @test all(isfinite, amplitude(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
     end
 
+    @testset "log-density stays finite where the density underflows" begin
+        Random.seed!(11)
+        x = randn(200)
+        κ = 1.5
+        d = DensityEstimate(x, κ)
+        # Far enough out that ψ itself is zero in double precision, which is the
+        # regime a log-density exists to serve.
+        far = [d.x[1] - 1500.0, d.x[1] - 700.0, d.x[end] + 700.0, d.x[end] + 1500.0]
+        ℓ = PenalizedDensity._logdensity_sorted(d, sort(far))
+        @test all(isfinite, ℓ)
+        @test any(t -> amplitude(d, t) == 0, far)
+
+        # Beyond the outermost nodes the log-density is exactly linear with slope
+        # ±2κ, so the closed form is available independently of the recurrence.
+        for t in (d.x[1] - 1500.0, d.x[1] - 700.0)
+            @test PenalizedDensity._logdensity_sorted(d, [t])[1] ≈
+                  2 * (log(d.ψ[1]) + d.κL * (t - d.x[1]))
+        end
+        for t in (d.x[end] + 700.0, d.x[end] + 1500.0)
+            @test PenalizedDensity._logdensity_sorted(d, [t])[1] ≈
+                  2 * (log(d.ψ[end]) - d.κR * (t - d.x[end]))
+        end
+
+        # Where the density has not underflowed the two routes must agree.
+        near = sort(d.x[1] .- [0.5, 2.0, 5.0])
+        @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude(d, near))
+    end
+
     @testset "input validation" begin
         @test_throws ArgumentError DensityEstimate(Float64[], 1.0)
         @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[], 1.0)
