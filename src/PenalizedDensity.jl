@@ -1695,8 +1695,10 @@ end
     expected_chisq(d::DensityEstimate) -> ⟨χ²⟩
     expected_chisq(ref::ChisqReference) -> ⟨χ²⟩
 
-Mean of the reference distribution of [`chisq`](@ref), in the exact finite-`N` theory
-(Holy 1997, Eqs. 16–18). Defined at any scale, constant or spatially varying.
+Mean of the reference distribution of [`chisq`](@ref) — the finite-`N` generalized-χ² law
+of the quadratic fluctuation approximation (Holy 1997, Eqs. 16–18), whose standing as a
+null distribution [`chisq_reference`](@ref) sets out. Defined at any scale, constant or
+spatially varying.
 
 Given a `DensityEstimate`, [`chisq_reference`](@ref) is assembled internally; to draw
 several quantities from one fit, build the reference once and pass it here and to
@@ -1707,7 +1709,7 @@ expected_chisq(d::DensityEstimate) = chisq_reference(d).mean
 # Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 
-# ── Exact reference distribution of χ² (Holy 1997, Eqs. 16–18) ───────────────
+# ── Finite-N reference distribution of χ² (Holy 1997, Eqs. 16–18) ────────────
 #
 # χ²(δψ) = 4 Σᵢ wᵢ (δψ(xᵢ)/ψ_cl(xᵢ))² is a quadratic form in the Gaussian
 # fluctuation field of Eq. 16 (precision L = -ℓ²∂² + 2λ + 2Σ wₖδ(x-xₖ)/ψₖ²,
@@ -1735,9 +1737,10 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
     ChisqReference
 
 Precomputed reference distribution of the goodness-of-fit statistic [`chisq`](@ref)
-for one fit, in the exact finite-`N` theory (Holy 1997, Eqs. 16–18). The statistic is
-a quadratic form in the Gaussian fluctuation field, so its law is a generalized
-chi-squared; this object stores the `O(N)` data — a symmetric tridiagonal matrix and a
+for one fit (Holy 1997, Eqs. 16–18). The statistic is a quadratic form in the Gaussian
+fluctuation field, so its law is a generalized chi-squared, evaluated here at finite `N`
+with no large-`N` limit; see [`chisq_reference`](@ref) for the approximation it rests on.
+This object stores the `O(N)` data — a symmetric tridiagonal matrix and a
 rank-one constraint vector — that its density and tail probabilities are computed from.
 
 Build one with [`chisq_reference`](@ref) and reuse it across many evaluations of
@@ -1896,11 +1899,20 @@ end
 """
     chisq_reference(d::DensityEstimate) -> ChisqReference
 
-Assemble the exact reference distribution of [`chisq`](@ref) for the fit `d`, following
+Assemble the reference distribution of [`chisq`](@ref) for the fit `d`, following
 Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
 [`chisq_ccdf`](@ref)/[`chisq_pdf`](@ref)/[`pvalue`](@ref) rather than rebuilding it. A
 spatially varying `κ` and a finite `support` (see [`DensityEstimate`](@ref)) are both
-supported, and the law stays exact and `O(N)` in either case.
+supported, and the law stays `O(N)` in either case.
+
+The law is exact for the Gaussian fluctuation field of the Laplace approximation about
+the fit, and it is evaluated at finite `N` (corresponding to `method = :exact`; the
+large-N limit is `method = :largeN`).
+
+It is not, by itself, a finite-sample frequentist null distribution for data drawn from
+the fitted density; it is a Bayesian measure of likelihood among distributions sharing
+the same roughness penalty. Its calibration as a frequentist null distribution need not
+be distribution-free.
 
 # Extended help
 
@@ -1994,11 +2006,12 @@ end
     chisq_ccdf(ref::ChisqReference, z; method=:exact)  -> P(χ² ≥ z)
 
 Upper-tail (survival) probability of the reference χ² distribution at `z`. Evaluated at an
-observed statistic it is a p-value; see [`pvalue`](@ref).
+observed statistic it is a diagnostic significance; see [`pvalue`](@ref), and
+[`chisq_reference`](@ref) for the sense in which it is and is not a p-value.
 
 `method=:exact` (default) uses the finite-`N` generalized-χ² law via Imhof inversion of
 [`chisq_reference`](@ref)`(d)`. `method=:largeN` uses the inverse-Gaussian (Wald) shape of
-the large-`N` limit (Eq. 26), parameterized by the exact mean [`expected_chisq`](@ref); it
+the large-`N` limit (Eq. 26), parameterized by the mean [`expected_chisq`](@ref); it
 is a closed form, far cheaper per call, and — like the exact law — defined at every scale.
 Pass a prebuilt [`ChisqReference`](@ref) to avoid reassembling it across calls.
 """
@@ -2052,6 +2065,9 @@ chisq_pdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
 
 Significance of the fit of a trial density `Q`: the probability that the reference χ²
 distribution exceeds the observed [`chisq`](@ref)`(d, Q)`, i.e. `chisq_ccdf(d, chisq(d, Q))`.
+The reference law is that of the quadratic fluctuation approximation, so this is a
+diagnostic significance whose calibration is density-dependent; see
+[`chisq_reference`](@ref).
 
 `method` is as in [`chisq_ccdf`](@ref). To test several trial densities against one fit,
 build the reference once with [`chisq_reference`](@ref) and call `pvalue(ref, chisq(d, Q))`.
