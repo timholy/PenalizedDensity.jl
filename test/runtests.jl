@@ -1,5 +1,6 @@
 using PenalizedDensity
 using LinearAlgebra: SymTridiagonal, ZeroPivotException
+using LogExpFunctions: logaddexp
 using OffsetArrays
 using QuadGK: quadgk
 using Random, Statistics
@@ -809,6 +810,15 @@ end
             @test p(far) == 0
             @test k(far) == k.κmin == 1e-6 * k.c
 
+            # A shallow exponent keeps the rule off its floor even where the pilot density
+            # has underflowed, which is the only regime that can tell the scalar and batch
+            # paths apart: both must read the log-density, not the density.
+            ks = AdaptiveScale(3.0, 5e-3, p)
+            deep = last(chisq1) .+ [10.0, 15.0, 20.0]
+            @test all(t -> p(t) == 0, deep)
+            @test all(t -> ks(t) > ks.κmin, deep)
+            @test PenalizedDensity._kappa_sorted(ks, deep, Float64) == ks.(deep)
+
             @test sprint(show, k) ==
                   "AdaptiveScale(c=3.0, α=0.5) over a pilot with $(length(p.x)) nodes"
         end
@@ -1336,6 +1346,56 @@ end
         # Where the density has not underflowed the two routes must agree.
         near = sort(d.x[1] .- [0.5, 2.0, 5.0])
         @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude(d, near))
+    end
+
+    @testset "log-density stays finite inside a wide gap" begin
+        # κ·gap ≈ 3000: both sinh arcs underflow in the middle of the interval, so the
+        # amplitude is zero over a region where the log-density is finite.
+        xs = [-1000.0, -999.0, 0.0, 999.0, 1000.0]
+        κ = 3.0
+        d = DensityEstimate(xs, κ)
+        mid = [-750.0, -500.0, -250.0, 250.0, 500.0, 750.0]
+        @test all(t -> amplitude(d, t) == 0, mid)
+        @test all(isfinite, logdensity(d, mid))
+
+        # Deep inside the gap each arc is a pure exponential decay from its own node,
+        # ψ ≈ ψ_k e^{-κ(x - x_k)} + ψ_{k+1} e^{-κ(x_{k+1} - x)}, which pins the value
+        # without reference to the sinh recurrence.
+        for t in mid
+            k = searchsortedlast(xs, t)
+            @test logdensity(d, t) ≈ 2 * logaddexp(log(d.ψ[k]) - κ * (t - xs[k]),
+                                                   log(d.ψ[k+1]) - κ * (xs[k+1] - t))
+        end
+    end
+
+    @testset "logdensity" begin
+        Random.seed!(5)
+        d = DensityEstimate(randn(150), 1.2)
+
+        # Agrees with the amplitude wherever the amplitude has not underflowed.
+        ts = collect(range(d.x[1] - 3, d.x[end] + 3; length = 500))
+        @test logdensity(d, ts) ≈ 2 .* log.(amplitude(d, ts))
+        @test logdensity(d, ts[17]) == logdensity(d, ts)[17]      # scalar matches array
+
+        # The scalar path and the sorted-batch sweep are two routes to one quantity.
+        far = sort(vcat(ts, d.x[1] .- [1e4, 1500.0], d.x[end] .+ [1500.0, 1e4]))
+        @test logdensity(d, far) == PenalizedDensity._logdensity_sorted(d, far)
+
+        # Array shape and axes are preserved; matches `map` over the same points.
+        m = reshape(ts[1:12], 3, 4)
+        @test size(logdensity(d, m)) == (3, 4)
+        @test logdensity(d, m) == map(t -> logdensity(d, t), m)
+        to = OffsetArray(ts[1:20], -7)
+        @test axes(logdensity(d, to)) == axes(to)
+        @test logdensity(d, to) == OffsetArray(logdensity(d, ts[1:20]), -7)
+
+        # Outside a finite support the density is exactly zero, so ln Q = -Inf.
+        db = DensityEstimate(clamp.(randn(150), -1.9, 1.9), 1.2; support = (-2.0, 2.0))
+        @test logdensity(db, -2.5) == -Inf
+        @test logdensity(db, 2.5) == -Inf
+        @test isfinite(logdensity(db, 0.0))
+        # The bounded tails run through `logcosh` and stay finite to the boundary.
+        @test all(isfinite, logdensity(db, range(-2, 2; length = 200)))
     end
 
     @testset "input validation" begin

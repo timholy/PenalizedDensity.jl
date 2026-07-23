@@ -386,6 +386,11 @@ well. Scoring on points that did not build the fit is what makes the held-out fo
 informative: unlike the in-sample value, it is not inflated by concentrating the density
 onto the fit sample, the same reason [`select_kappa_cv`](@ref) cross-validates.
 
+The log density itself is [`logdensity`](@ref), and it can be used to circumvent
+density underflows to zero once ``2\kappa`` times the distance to the nearest
+node exceeds about 745. `logdensity(d, x)` holds throughout that region, where
+`log(d(x))` would give `-Inf`.
+
 The derivatives of the log density are exposed directly:
 [`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,
 and [`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities

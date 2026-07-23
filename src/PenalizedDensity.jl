@@ -1,6 +1,7 @@
 module PenalizedDensity
 
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
+using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
 using Statistics: Statistics, quantile
@@ -9,7 +10,7 @@ export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, sel
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
-export logdensity_eval_gradient, logdensity_node_gradient
+export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile
 export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
 
@@ -825,11 +826,52 @@ function _amplitude(d::DensityEstimate{T}, k::Integer, x::Real) where {T}
     return ψ[k] * _sinh_ratio(a, a + b) + ψ[k+1] * _sinh_ratio(b, a + b)
 end
 
-# ln Q(t) = 2 ln ψ(t) at every position of the sorted vector `ts`, advancing through the
-# nodes alongside `ts` in one pass. Evaluating pointwise would binary-search for each
-# position, and a plug-in scale is realized on O(N) positions for every candidate it scores.
-# The logarithm keeps the far tails informative where Q itself underflows to zero; outside a
-# finite support Q is by construction zero, i.e. ln Q = -Inf.
+"""
+    logdensity(d::DensityEstimate, x)
+
+Evaluate the log fitted density `ln Q̂(x) == 2 ln ψ(x)` at real `x`, which may
+be a scalar or an array. `-Inf` outside a finite `support` (see
+[`DensityEstimate`](@ref)), where the density is exactly zero.
+
+Prefer this to `log(d(x))` or `2 * log(amplitude(d, x))`, as `logdensity` avoids
+the underflow that would occur when evaluating the density directly. The result
+is finite and linear in `x`. See [`logdensity_eval_gradient`](@ref) for
+its derivative.
+
+# Examples
+
+```jldoctest
+julia> d = DensityEstimate([-1.0, 0.0, 1.0], 1.0);
+
+julia> logdensity(d, 0.0) ≈ 2 * log(amplitude(d, 0.0))
+true
+
+julia> amplitude(d, -800.0), isfinite(logdensity(d, -800.0))
+(0.0, true)
+```
+"""
+logdensity(d::DensityEstimate, x::Real) = _logdensity(d, x)
+logdensity(d::DensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi), x)
+
+# ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`, and the two must be kept
+# so: a caller reaching either one for the same quantity may not get a different answer.
+function _logdensity(d::DensityEstimate{T}, x::Real) where {T}
+    xs = d.x
+    n = length(xs)
+    if x <= xs[1]
+        x < d.lo && return T(-Inf)
+        return 2 * _log_left_tail_amplitude(d.ψ[1], d.κL, x, xs[1], d.lo)
+    elseif x >= xs[n]
+        x > d.hi && return T(-Inf)
+        return 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, x, xs[n], d.hi)
+    end
+    return 2 * _log_amplitude(d, searchsortedlast(xs, x), x)
+end
+
+# ln Q(t) at every position of the sorted vector `ts`, advancing through the nodes alongside
+# `ts` in one pass. Evaluating pointwise would binary-search for each position, and a plug-in
+# scale is realized on O(N) positions for every candidate it scores. Same branches as
+# `_logdensity`, differing only in how the enclosing interval is found.
 function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
     xs = d.x
     n = length(xs)
@@ -845,24 +887,37 @@ function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
         elseif t >= xs[n]
             out[i] = t > d.hi ? T(-Inf) : 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, t, xs[n], d.hi)
         else
-            out[i] = 2 * log(_amplitude(d, k, t))
+            out[i] = 2 * _log_amplitude(d, k, t)
         end
     end
     return out
 end
 
+# ln ψ(x) inside interval k, the log-domain mirror of `_amplitude(d, k, x)`. Both sinh arcs
+# are formed in the log domain and combined with `logaddexp`, so the result holds wherever
+# ψ itself underflows: at κ(xs[k+1] - xs[k]) ≳ 1490 the arcs vanish in the middle of the
+# interval, which is where a log density is most worth having. ψ is strictly positive by
+# construction (`_solve_amplitude` keeps it so), hence `log(ψ[k])` is always real.
+function _log_amplitude(d::DensityEstimate, k::Integer, x::Real)
+    xs, ψ = d.x, d.ψ
+    κ = _kappa(d, k)
+    a = κ * (xs[k+1] - x)           # a, b ≥ 0 and a + b = θ
+    b = κ * (x - xs[k])
+    return logaddexp(log(ψ[k]) + logabssinh(a), log(ψ[k+1]) + logabssinh(b)) - logabssinh(a + b)
+end
+
 # ln ψ(t) in the left tail. Every branch stays in the log domain: the unbounded arm as a
-# sum rather than the logarithm of a product, the bounded arm through `_logcosh`. The tails
+# sum rather than the logarithm of a product, the bounded arm through `logcosh`. The tails
 # are where a log-density is worth having precisely because ψ itself has underflowed to
 # zero, so forming the amplitude first would return -Inf over the whole region the
 # logarithm exists to describe.
 _log_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
-    isfinite(lo) ? log(ψ1) + _logcosh(κ * (x - lo)) - _logcosh(κ * (x1 - lo)) :
+    isfinite(lo) ? log(ψ1) + logcosh(κ * (x - lo)) - logcosh(κ * (x1 - lo)) :
                    log(ψ1) + κ * (x - x1)
 
 # Mirror of `_log_left_tail_amplitude` for the right tail.
 _log_right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
-    isfinite(hi) ? log(ψn) + _logcosh(κ * (hi - x)) - _logcosh(κ * (hi - xn)) :
+    isfinite(hi) ? log(ψn) + logcosh(κ * (hi - x)) - logcosh(κ * (hi - xn)) :
                    log(ψn) - κ * (x - xn)
 
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
@@ -879,9 +934,6 @@ _cosh_ratio2(v::T, u::T) where {T} = exp(v - u) * (oneunit(T) + exp(-2v)) / (one
 # sinh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u and accurate as v → 0
 # (via expm1, the same treatment _sinh_ratio gives its numerator).
 _sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + exp(-2u))
-
-# log(cosh(v)) for v ≥ 0, evaluated without overflow at large v.
-_logcosh(v::T) where {T} = v + log1p(exp(-2v)) - log(T(2))
 
 # ψ'(x): derivative of the amplitude with respect to the evaluation coordinate. Mirrors
 # `_amplitude` interval by interval, with cosh/sinh written through the overflow-safe ratios.
@@ -2509,9 +2561,11 @@ end
 # The rule itself, from ln p̂(x): κ = c·(p̂/ḡ)^α, floored.
 _scale_from_logdensity(k::AdaptiveScale, lnp) = max(k.c * exp(k.α * (lnp - k.loggbar)), k.κmin)
 
-# ln p̂ rather than p̂: the pilot density underflows to zero between far-separated tail nodes,
-# where its logarithm is still perfectly finite.
-(k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, 2 * log(_amplitude(k.pilot, x)))
+# ln p̂ rather than p̂: the pilot density underflows to zero beyond and between far-separated
+# tail nodes, where its logarithm is still perfectly finite. `_logdensity` is what makes that
+# true; `2 log(_amplitude(...))` would reintroduce the underflow this rule exists to survive,
+# and would disagree with the batch path below.
+(k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, _logdensity(k.pilot, x))
 
 # One walk of the pilot for the whole sorted batch, instead of a binary search per position.
 function _kappa_sorted(k::AdaptiveScale{T}, ts::AbstractVector, ::Type{T}) where {T}
