@@ -160,6 +160,34 @@ end
         @test (@allocated DensityEstimate(x, 3.0; rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
+    @testset "SolveStats records solver effort without changing the fit" begin
+        fresh = PenalizedDensity.SolveStats()
+        @test (fresh.iterations, fresh.backtracks) == (0, 0)
+        @test fresh.reason === :none
+        @test isnan(fresh.final_step) && isnan(fresh.final_alpha)
+
+        st = PenalizedDensity.SolveStats()
+        x = randn(MersenneTwister(11), 300)
+        d = DensityEstimate(x, 4.0; stats=st)
+        # A well-conditioned fit converges cleanly on the correction tolerance, and
+        # the collected fit is identical to the uninstrumented one — the collector
+        # must not perturb the solve.
+        @test st.iterations >= 1
+        @test st.reason === :tolerance
+        @test st.final_step <= eps(Float64)^(3//4)
+        @test 0 < st.final_alpha <= 1
+        @test d.ψ == DensityEstimate(x, 4.0).ψ
+
+        # Near-coincident nodes at rtol=0 ill-condition the solve: it backtracks and
+        # stops short of the correction tolerance, held up by roundoff rather than
+        # meeting it. A fresh collector per fit accumulates the effort.
+        st0 = PenalizedDensity.SolveStats()
+        DensityEstimate(randn(MersenneTwister(7), 4_000), 3.0; rtol=0.0, stats=st0)
+        @test st0.backtracks >= 1
+        @test st0.reason in (:floor, :steplength)
+        @test st0.final_step > eps(Float64)^(3//4)
+    end
+
     @testset "scale equivariance" begin
         # Q is scale-equivariant: rescaling x → s·x with κ → κ/s gives Q_s(s·x) = Q(x)/s.
         # M, the Newton solve, and the convergence test depend on x, κ only through κ·Δx,

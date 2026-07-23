@@ -97,6 +97,9 @@ approximated by a fast-decaying tail.
 The goodness-of-fit machinery ([`chisq_reference`](@ref) and everything built on it) supports a
 varying `κ` exactly as it does a constant one, and a finite `support` exactly as it does the
 unbounded line.
+
+Passing a [`SolveStats`](@ref) as the `stats` keyword records the Newton-step and backtracking
+counts of the fixed-scale solve, for benchmarking; it does not change the fit.
 """
 struct DensityEstimate{T<:AbstractFloat,K}
     x::Vector{T}   # sorted, distinct node locations
@@ -132,12 +135,12 @@ DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T}
     DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 
 function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
-                         rtol::Real=cbrt(eps(R))) where R<:Real
+                         rtol::Real=cbrt(eps(R)), stats=nothing) where R<:Real
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
     lo, hi = support
     lo < hi || throw(DomainError((lo, hi), "support must satisfy a < b, got support=($lo, $hi)"))
-    return _estimate(x, κ, rtol, lo, hi)
+    return _estimate(x, κ, rtol, lo, hi; stats)
 end
 
 function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) where R<:Real
@@ -163,25 +166,25 @@ end
 # Float32 fit. `Bool` is the promotion lattice's bottom numeric type, so it drops out here.
 _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
-function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real) where {R<:Real}
+function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     T = float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
     nodes, weights = _merge_presorted(xs, T(rtol) / T(κ))
-    return _fit(nodes, weights, T(κ), lo, hi)
+    return _fit(nodes, weights, T(κ), lo, hi; stats)
 end
 
 # The nodes are not known until the data has been merged, and the merge tolerance is itself
 # rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
 # to. The scale has to arrive as a function of position.
-_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real) =
+_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
     throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
                         "on the local scale, so the nodes it would index do not exist yet. Pass a " *
                         "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
 
-function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) where {R<:Real}
+function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
     # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
     # data point is the only way to see it.
     T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x))), _support_eltype(a), _support_eltype(b)))
@@ -189,7 +192,7 @@ function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) wh
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
     nodes, weights, κs, κL, κR = _merge_and_realize(xs, κfun, T(rtol))
-    return _fit(nodes, weights, κs, κL, κR, lo, hi)
+    return _fit(nodes, weights, κs, κL, κR, lo, hi; stats)
 end
 
 # The scale on the interval between nodes k and k+1. Constant and piecewise-constant fits
@@ -219,8 +222,8 @@ _show_support(d::DensityEstimate) =
 Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)$(_show_support(d))")
 
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
-function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {T}
-    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights)
+function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=nothing) where {T}
+    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κ, lo, hi)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
@@ -228,25 +231,25 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {
 end
 
 # Fit from already-merged distinct nodes and their weights, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T} =
-    _fit(nodes, weights, κ, T(-Inf), T(Inf))
+_fit(nodes::Vector{T}, weights::Vector{T}, κ::T; stats=nothing) where {T} =
+    _fit(nodes, weights, κ, T(-Inf), T(Inf); stats)
 
 # Piecewise-constant scale with an optional natural boundary at `lo`/`hi`. The assembled
 # operator carries an arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from
 # the normalized amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity
 # condition of the unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the
 # scaling law `_fit(nodes, weights, κ, lo, hi)` above uses.
-function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
+function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T; stats=nothing) where {T}
     κ̄ = _reference_scale(κs, κL, κR)
-    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights)
+    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
     ψ ./= sqrt(Z)
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
 end
 
 # Piecewise-constant scale, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
-    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf))
+_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T; stats=nothing) where {T} =
+    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf); stats)
 
 # Reject scale values a fit cannot use.
 _check_kappa(κ, x) =
@@ -448,6 +451,40 @@ function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<
 end
 
 """
+    SolveStats()
+
+Mutable collector for diagnostics of the fixed-scale Newton solve. Pass one as the
+`stats` keyword to [`DensityEstimate`](@ref) to record how the solve behaved:
+
+- `iterations`: the number of Newton steps taken (each a Hessian factorization that
+  updated the amplitudes);
+- `backtracks`: the total number of Armijo step-halvings across those steps;
+- `reason`: why the iteration stopped —
+  - `:tolerance`, the Newton correction fell to `eps(T)^(3/4)` relative to `ψ` (the
+    healthy exit);
+  - `:floor`, the correction stopped falling before reaching that tolerance, held up
+    by the roundoff floor a near-singular Hessian imposes (a conditioning-limited
+    solve);
+  - `:steplength`, backtracking found no positive step moving `ψ` by more than
+    rounding, so `ψ` is stationary to the available precision;
+  - `:none`, left unset (the solve threw before terminating);
+- `final_step`: the last Newton correction magnitude, `maxᵢ |Δᵢ|/ψᵢ` — at or below
+  the tolerance on a `:tolerance` exit, above it on a `:floor` exit;
+- `final_alpha`: the damping `α` of the last accepted step, `1` when it was undamped.
+
+Construct a fresh collector per fit. The field equation is solved identically
+whether or not one is present.
+"""
+mutable struct SolveStats
+    iterations::Int
+    backtracks::Int
+    reason::Symbol
+    final_step::Float64
+    final_alpha::Float64
+end
+SolveStats() = SolveStats(0, 0, :none, NaN, NaN)
+
+"""
     _solve_amplitude(M, w)    -> ψ
     _solve_amplitude(x, w, κ) -> ψ
 
@@ -461,8 +498,11 @@ along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stop
 Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
 roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
 tolerance. Reaching `maxiter` throws.
+
+A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
 """
-function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) where {T<:AbstractFloat}
+function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
+                          stats::Union{Nothing,SolveStats}=nothing) where {T<:AbstractFloat}
     n = length(w)
     ψ = fill(oneunit(T), n)             # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
@@ -479,6 +519,9 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
     prevstep = T(Inf)
     unguarded = false                   # has a step been taken without the Armijo test?
     converged = false
+    iters = 0; backs = 0                # Newton steps taken; Armijo halvings across them
+    reason = :none
+    finalstep = T(Inf); finalα = T(NaN) # last correction magnitude and accepted damping
     for _ in 1:maxiter
         mul!(g, M, ψ)
         @. g -= w / ψ                    # ∇F = Mψ - w./ψ
@@ -498,10 +541,14 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
         # the decrease the step predicts, which is what `unguarded` records —
         # while the Armijo test is still informative the correction may plateau
         # for a step or two without the iteration being finished.
-        if step <= stol || (unguarded && step >= prevstep)
-            converged = true
+        if step <= stol
+            converged = true; reason = :tolerance; finalstep = step
+            break
+        elseif unguarded && step >= prevstep
+            converged = true; reason = :floor; finalstep = step
             break
         end
+        iters += 1
         prevstep = step
         # Largest α ≤ 1 keeping ψ - αΔ strictly positive, then Armijo backtracking.
         α = one(T)
@@ -519,6 +566,7 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
             unguarded = true
             @. ψ -= α * Δ
             Fψ = _objective(M, w, ψ)
+            finalα = α
             continue
         end
         armijo = false
@@ -531,18 +579,27 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
                 break
             end
             α /= 2
+            backs += 1
         end
         # Backtracking ran out of room: no positive step both keeps ψ inside the
         # orthant and moves it by more than rounding, so ψ is stationary to the
         # precision available. That is a converged fit, not a failed one.
         if !armijo
-            converged = true
+            converged = true; reason = :steplength; finalstep = step
             break
         end
         copyto!(ψ, ψnew)
         Fψ = Fnew
+        finalα = α
     end
     converged || error("Newton did not converge in $maxiter iterations; the fit is unreliable")
+    if stats !== nothing
+        stats.iterations = iters
+        stats.backtracks = backs
+        stats.reason = reason
+        stats.final_step = Float64(finalstep)
+        stats.final_alpha = Float64(finalα)
+    end
     return ψ
 end
 _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:AbstractFloat} =
