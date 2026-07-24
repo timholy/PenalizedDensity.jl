@@ -2390,19 +2390,25 @@ function _inv_diag(H::SymTridiagonal{T}) where {T}
     return inv.(d .+ δ .- a)
 end
 
-# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). The
-# leave-one-out density is analytic to first order — dropping one observation at node i decrements
-# wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
-# ∇²F = M + diag(w/φ²)). Carrying δφ through the normalization ψ = φ/√Z, with Z = ∫φ² = φᵀGφ
-# and v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 - 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
+# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
+# one observation at node i decrements wᵢ; the deleted field is a Newton step of that problem from
+# the full solution, along the direction H⁻¹eᵢ (H the fit's SPD Hessian ∇²F = M + diag(w/φ²)). A
+# unit step is the first-order approximation; it under-penalizes over-fitting, because where the node
+# leverage h = (H⁻¹)ᵢᵢ/φᵢ² is high the removed point's spike collapses super-linearly and a linear
+# step cannot see it. Instead the step length t is set so node i's own nonlinear stationarity holds
+# exactly: t² h(1 - wᵢh) - t + 1 = 0, whose root t = 2/(1 + √(1 - 4h(1 - wᵢh))) (real because
+# h(1 - wᵢh) ≤ 1/4) is 1 as h → 0, recovering first order, and grows to shrink the overshoot as h
+# rises. The node amplitude becomes φᵢ(1 - t h), and the normalization is carried linearly,
+# Zₜ = Z - 2t vᵢ/φᵢ with v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ, Z = ∫φ² = φᵀGφ), so Q̂₋ᵢ(xᵢ) = (φᵢ(1 - t h))² / Zₜ.
 #
-# Nothing in that expansion uses M's entries, only that it is the fixed SPD operator whose mass
-# functional is Z — so it holds for a piecewise-constant scale unchanged. The overall factor the
-# adaptive operator carries (see `roughness_operator`) leaves ψ and the leave-one-out densities
-# invariant: under M → cM the pieces move as φ → φ/√c, Z → Z/c, H → cH, (H⁻¹)ᵢᵢ → (H⁻¹)ᵢᵢ/c,
-# Gφ → Gφ/√c and v → v/c^{3/2}, and every term above is a ratio in which c cancels. An optional
-# natural boundary at `lo`/`hi` needs only the bounded `_operator` and `_norm_sq_gram`, per the
-# same argument.
+# t and its inputs are dimensionless or scale like Z, so — as for the linear step — nothing depends
+# on M's entries beyond its being the fixed SPD operator with mass functional Z: it holds unchanged
+# for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
+#
+# The step tracks a literal leave-one-out refit (wᵢ decremented, a singleton node dropped) closely
+# across the scale range on continuous data; on heavily tied data the linearized normalization can
+# drift the score's flat tail and select too rough a scale, the regime where `select_kappa_ms` and
+# `kappa_interval` are preferred anyway.
 function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
@@ -2411,7 +2417,14 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T,
     gii = _inv_diag(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
     ψ = φ ./ sqrt(Z)
-    looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
+    looi = similar(φ)
+    for i in eachindex(φ, w)
+        h = gii[i] / φ[i]^2                             # single-observation leverage
+        disc = 1 - 4 * h * (1 - w[i] * h)               # ≥ 0 since h(1-wᵢh) ≤ 1/4
+        t = disc > 0 ? 2 / (1 + sqrt(disc)) : one(T)    # nonlinear step length, →1 as h→0
+        Zt = Z - 2 * t * v[i] / φ[i]
+        looi[i] = (φ[i] * (1 - t * h))^2 / Zt
+    end
     return ψ, looi
 end
 
@@ -2485,9 +2498,9 @@ Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded
 # Extended help
 
 Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
-segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a first-order expansion of the fit
-in the dropped point's weight, so no per-point refitting is needed. The score is minimized by a
-golden-section search over `ln κ`, bracketed by the grid `κs`.
+segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a one-step leave-one-out expansion of
+the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per-point refitting is
+needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =
@@ -2528,9 +2541,11 @@ to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-
 leading order it selects the same error-optimal scale as [`select_kappa_cv`](@ref) while being
 cheaper: the `∫Q̂²` roughness term is not needed.
 
-Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a first-order expansion of the fit in the
-dropped point's weight, so no per-point refitting is needed and the score costs `O(N)`. The score
-is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
+Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a one-step leave-one-out expansion of the fit
+in the dropped point's weight — a Newton step whose length is set so the deleted node's own
+stationarity holds exactly, which tracks a literal refit closely without a linear step's blindness
+to over-fitting — so no per-point refitting is needed and the score costs `O(N)`. The score is
+minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =

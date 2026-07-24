@@ -259,7 +259,9 @@ end
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
 
-        # LSCV score: the first-order analytic leave-one-out matches brute-force refitting.
+        # LSCV score: the analytic one-step leave-one-out matches brute-force refitting.
+        # The refit is the exact leave-one-out — wᵢ decremented, a singleton node dropped —
+        # the estimand the analytic step approximates.
         xs = sort(x); w = ones(length(xs))
         function lscv_refit(nodes, weights, κ)
             cross = 0.0
@@ -276,7 +278,17 @@ end
             return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-3
+            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-4
+        end
+
+        # The nonlinear step is exercised on the tied branch (wᵢ > 1) too: rounding to
+        # 0.05σ collapses the sample onto high-multiplicity nodes, and the analytic score
+        # still matches the decrement refit — LSCV's density-weighted cross term is
+        # accurate even where the log-scale KLCV would not be.
+        nt, wt = PenalizedDensity._merge_presorted(sort(round.(x ./ 0.05) .* 0.05), 1e-8)
+        @test maximum(wt) > 5
+        for κ0 in (1.5, 4.0)
+            @test PenalizedDensity._lscv(nt, wt, κ0) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
         end
 
         # MISE targeting: on smooth data the cross-validated scale is finer than the
@@ -302,11 +314,11 @@ end
         κ200 = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
-        # KLCV score: the mean negative leave-one-out log-likelihood built from the first-order
-        # analytic leave-one-out densities matches one built by brute-force refitting. The
-        # tolerance is looser than the LSCV analog above: taking the log gives every node equal
-        # weight, including tail nodes where the first-order expansion is least accurate, whereas
-        # LSCV's cross term downweights them by the density value.
+        # KLCV score: the mean negative leave-one-out log-likelihood built from the analytic
+        # one-step leave-one-out densities matches one built by brute-force refitting. The
+        # tolerance is looser than the LSCV analog above because taking the log gives every node
+        # equal weight, including tail nodes where the expansion is least accurate, whereas LSCV's
+        # cross term downweights them by the density value.
         xs = sort(x); w = ones(length(xs))
         function klcv_refit(nodes, weights, κ)
             s = 0.0
@@ -317,7 +329,22 @@ end
             return -s / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 2e-2
+            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 1e-3
+        end
+
+        # The nonlinear step's payoff is selection on high-leverage data: on a small, skewed
+        # sample the analytic KLCV minimizes at the scale an exact leave-one-out grid search
+        # picks, and matches the refit tightly near that optimum. A first-order expansion
+        # under-penalizes over-fitting here and selects a far too rough scale. (The analytic and
+        # exact scores can diverge far out in the over-fit tail, where a single collapsing node
+        # dominates the log-score, but that is well right of any selected scale.)
+        xh = sort(exp.(randn(MersenneTwister(3), 25))); wh = ones(length(xh))
+        span = xh[end] - xh[1]
+        gridh = exp.(range(log(0.5 / span), log(5 * length(xh) / span); length = 41))
+        κ_exact = gridh[argmin([klcv_refit(xh, wh, κ) for κ in gridh])]
+        @test select_kappa_kl(xh) ≈ κ_exact rtol = 0.2
+        for κ0 in (0.5, 1.0)
+            @test PenalizedDensity._klcv(xh, wh, κ0) ≈ klcv_refit(xh, wh, κ0) rtol = 5e-3
         end
 
         # Divergence targeting: on smooth data the KL scale is finer than the minimum-sensitivity
@@ -842,7 +869,7 @@ end
             # has underflowed, which is the only regime that can tell the scalar and batch
             # paths apart: both must read the log-density, not the density.
             ks = AdaptiveScale(3.0, 5e-3, p)
-            deep = last(chisq1) .+ [10.0, 15.0, 20.0]
+            deep = last(chisq1) .+ [20.0, 25.0, 30.0]
             @test all(t -> p(t) == 0, deep)
             @test all(t -> ks(t) > ks.κmin, deep)
             @test PenalizedDensity._kappa_sorted(ks, deep, Float64) == ks.(deep)
@@ -1655,10 +1682,10 @@ end
                 return Q2 - 2cross / sum(weights)
             end
             # Exponential (a hard left edge) and uniform (both edges hard), N a few hundred, at
-            # several κ including each family's own KLCV-selected scale. Tolerances match the
-            # unbounded suite's (`select_kappa_kl`/`select_kappa_cv` testsets above): KLCV's
-            # equal per-node weighting under the log is most sensitive to sparse tail nodes,
-            # where the first-order expansion is least accurate, so it gets the looser bound.
+            # several κ including each family's own KLCV-selected scale. KLCV's equal per-node
+            # weighting under the log is most sensitive to sparse tail nodes, so it gets the looser
+            # bound; on the uniform fit the score itself is ≈ 0 (Q ≈ 1, so ln Q̂ ≈ 0), where an
+            # absolute tolerance replaces a meaningless relative one.
             for (name, xgen, support) in (
                     ("exponential", rng -> -log.(1 .- rand(rng, 300)), (0.0, Inf)),
                     ("uniform",     rng -> rand(rng, 300),              (0.0, 1.0)))
@@ -1670,7 +1697,7 @@ end
                 for κ0 in (κsel * 0.5, κsel, κsel * 1.5)
                     a_kl = PenalizedDensity._klcv(nodes, w, κ0, κ0, κ0, lo, hi)
                     b_kl = klcv_refit_b(nodes, w, κ0, lo, hi)
-                    @test a_kl ≈ b_kl rtol = 2e-2
+                    @test a_kl ≈ b_kl rtol = 1e-3 atol = 1e-4
                     a_ls = PenalizedDensity._lscv(nodes, w, κ0, κ0, κ0, lo, hi)
                     b_ls = lscv_refit_b(nodes, w, κ0, lo, hi)
                     @test a_ls ≈ b_ls rtol = 5e-3
