@@ -2401,6 +2401,12 @@ end
 # rises. The node amplitude becomes φᵢ(1 - t h), and the normalization is carried linearly,
 # Zₜ = Z - 2t vᵢ/φᵢ with v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ, Z = ∫φ² = φᵀGφ), so Q̂₋ᵢ(xᵢ) = (φᵢ(1 - t h))² / Zₜ.
 #
+# A node isolated at unit weight sits at the double root: its own stationarity gives Mᵢᵢφᵢ² = wᵢ, so
+# h = 1/2, the discriminant vanishes and t = 2 drives the deleted amplitude to zero. Rounding can
+# carry the discriminant just below zero there, hence the clamp — without it the root jumps to the
+# linear step, which reports a finite deleted density where the field has in fact collapsed and so
+# scores such a κ as if it fit well. With the clamp `_klcv` sees Q̂₋ᵢ ≤ 0 and rejects the scale.
+#
 # t and its inputs are dimensionless or scale like Z, so — as for the linear step — nothing depends
 # on M's entries beyond its being the fixed SPD operator with mass functional Z: it holds unchanged
 # for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
@@ -2421,7 +2427,7 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T,
     for i in eachindex(φ, w)
         h = gii[i] / φ[i]^2                             # single-observation leverage
         disc = 1 - 4 * h * (1 - w[i] * h)               # ≥ 0 since h(1-wᵢh) ≤ 1/4
-        t = disc > 0 ? 2 / (1 + sqrt(disc)) : one(T)    # nonlinear step length, →1 as h→0
+        t = 2 / (1 + sqrt(max(disc, zero(disc))))       # nonlinear step length, →1 as h→0
         Zt = Z - 2 * t * v[i] / φ[i]
         looi[i] = (φ[i] * (1 - t * h))^2 / Zt
     end
@@ -2452,9 +2458,9 @@ _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ,
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
-# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same first-order leave-one-out densities as
-# _lscv. A non-positive Q̂₋ᵢ (possible where the first-order expansion overshoots) makes the log
-# undefined; return NaN so the search rejects κ.
+# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv. A
+# non-positive Q̂₋ᵢ (the deleted field has collapsed at node i) makes the log undefined; return NaN
+# so the search rejects κ.
 function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
     s = zero(T)
