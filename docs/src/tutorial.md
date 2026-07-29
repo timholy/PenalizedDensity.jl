@@ -317,7 +317,7 @@ wrong(x) = exp(-((x - 0.5) / 2.5)^2 / 2) / (2.5 * sqrt(2π))   # a single broad 
 
 The true mixture yields a far smaller ``\chi^2`` than the mismatched single Gaussian.
 [`pvalue`](@ref) turns the statistic into a significance under the reference distribution of
-``\chi^2`` — the exact finite-``N`` law (a generalized chi-squared), computed by default:
+``\chi^2`` — the finite-``N`` generalized chi-squared law, computed by default:
 
 ```@example tutorial
 (p_correct = round(pvalue(d, truepdf); digits = 3),
@@ -335,11 +335,15 @@ ref = chisq_reference(d)
  p_correct = round(pvalue(ref, chisq(d, truepdf)); digits = 3))
 ```
 
+The reference law is exact for the Gaussian fluctuation field of the Laplace approximation
+about the fit, and `method = :exact` evaluates it at finite ``N``, taking no large-``N``
+limit. See [`chisq_reference`](@ref) for context and more information.
+
 The exact law is a per-call integral (Imhof inversion): accurate, but tens of milliseconds
 apiece. Passing `method = :largeN` selects instead the closed-form inverse-Gaussian (Wald)
-shape of the original paper's large-``N`` limit, parameterized by the exact mean
+shape of the original paper's large-``N`` limit, parameterized by the mean
 [`expected_chisq`](@ref); it costs microseconds, so a large batch of trial densities against
-one fit is far cheaper. Anchored to the exact mean, it tracks the exact tail closely rather
+one fit is far cheaper. Anchored to that mean, it tracks the exact tail closely rather
 than overstating it:
 
 ```@example tutorial
@@ -381,6 +385,11 @@ The held-out negentropy is close to the in-sample value here because the fit gen
 well. Scoring on points that did not build the fit is what makes the held-out form
 informative: unlike the in-sample value, it is not inflated by concentrating the density
 onto the fit sample, the same reason [`select_kappa_cv`](@ref) cross-validates.
+
+The log density itself is [`logdensity`](@ref), and it can be used to circumvent
+density underflows to zero once ``2\kappa`` times the distance to the nearest
+node exceeds about 745. `logdensity(d, x)` holds throughout that region, where
+`log(d(x))` would give `-Inf`.
 
 The derivatives of the log density are exposed directly:
 [`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,

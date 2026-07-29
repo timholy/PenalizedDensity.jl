@@ -1,6 +1,7 @@
 module PenalizedDensity
 
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
+using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
 using Statistics: Statistics, quantile
@@ -9,7 +10,7 @@ export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, sel
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
-export logdensity_eval_gradient, logdensity_node_gradient
+export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile
 export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
 
@@ -96,6 +97,9 @@ approximated by a fast-decaying tail.
 The goodness-of-fit machinery ([`chisq_reference`](@ref) and everything built on it) supports a
 varying `κ` exactly as it does a constant one, and a finite `support` exactly as it does the
 unbounded line.
+
+Passing a [`SolveStats`](@ref) as the `stats` keyword records the Newton-step and backtracking
+counts of the fixed-scale solve, for benchmarking; it does not change the fit.
 """
 struct DensityEstimate{T<:AbstractFloat,K}
     x::Vector{T}   # sorted, distinct node locations
@@ -131,12 +135,12 @@ DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T}
     DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 
 function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
-                         rtol::Real=cbrt(eps(R))) where R<:Real
+                         rtol::Real=cbrt(eps(R)), stats=nothing) where R<:Real
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
     lo, hi = support
     lo < hi || throw(DomainError((lo, hi), "support must satisfy a < b, got support=($lo, $hi)"))
-    return _estimate(x, κ, rtol, lo, hi)
+    return _estimate(x, κ, rtol, lo, hi; stats)
 end
 
 function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) where R<:Real
@@ -162,25 +166,25 @@ end
 # Float32 fit. `Bool` is the promotion lattice's bottom numeric type, so it drops out here.
 _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
-function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real) where {R<:Real}
+function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
     κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
     T = float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
     nodes, weights = _merge_presorted(xs, T(rtol) / T(κ))
-    return _fit(nodes, weights, T(κ), lo, hi)
+    return _fit(nodes, weights, T(κ), lo, hi; stats)
 end
 
 # The nodes are not known until the data has been merged, and the merge tolerance is itself
 # rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
 # to. The scale has to arrive as a function of position.
-_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real) =
+_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
     throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
                         "on the local scale, so the nodes it would index do not exist yet. Pass a " *
                         "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
 
-function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) where {R<:Real}
+function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
     # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
     # data point is the only way to see it.
     T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x))), _support_eltype(a), _support_eltype(b)))
@@ -188,7 +192,7 @@ function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) wh
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
     nodes, weights, κs, κL, κR = _merge_and_realize(xs, κfun, T(rtol))
-    return _fit(nodes, weights, κs, κL, κR, lo, hi)
+    return _fit(nodes, weights, κs, κL, κR, lo, hi; stats)
 end
 
 # The scale on the interval between nodes k and k+1. Constant and piecewise-constant fits
@@ -218,8 +222,8 @@ _show_support(d::DensityEstimate) =
 Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)$(_show_support(d))")
 
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
-function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {T}
-    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights)
+function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=nothing) where {T}
+    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κ, lo, hi)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
@@ -227,25 +231,25 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T) where {
 end
 
 # Fit from already-merged distinct nodes and their weights, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κ::T) where {T} =
-    _fit(nodes, weights, κ, T(-Inf), T(Inf))
+_fit(nodes::Vector{T}, weights::Vector{T}, κ::T; stats=nothing) where {T} =
+    _fit(nodes, weights, κ, T(-Inf), T(Inf); stats)
 
 # Piecewise-constant scale with an optional natural boundary at `lo`/`hi`. The assembled
 # operator carries an arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from
 # the normalized amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity
 # condition of the unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the
 # scaling law `_fit(nodes, weights, κ, lo, hi)` above uses.
-function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
+function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T; stats=nothing) where {T}
     κ̄ = _reference_scale(κs, κL, κR)
-    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights)
+    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
     ψ ./= sqrt(Z)
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
 end
 
 # Piecewise-constant scale, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
-    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf))
+_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T; stats=nothing) where {T} =
+    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf); stats)
 
 # Reject scale values a fit cannot use.
 _check_kappa(κ, x) =
@@ -447,6 +451,40 @@ function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<
 end
 
 """
+    SolveStats()
+
+Mutable collector for diagnostics of the fixed-scale Newton solve. Pass one as the
+`stats` keyword to [`DensityEstimate`](@ref) to record how the solve behaved:
+
+- `iterations`: the number of Newton steps taken (each a Hessian factorization that
+  updated the amplitudes);
+- `backtracks`: the total number of Armijo step-halvings across those steps;
+- `reason`: why the iteration stopped —
+  - `:tolerance`, the Newton correction fell to `eps(T)^(3/4)` relative to `ψ` (the
+    healthy exit);
+  - `:floor`, the correction stopped falling before reaching that tolerance, held up
+    by the roundoff floor a near-singular Hessian imposes (a conditioning-limited
+    solve);
+  - `:steplength`, backtracking found no positive step moving `ψ` by more than
+    rounding, so `ψ` is stationary to the available precision;
+  - `:none`, left unset (the solve threw before terminating);
+- `final_step`: the last Newton correction magnitude, `maxᵢ |Δᵢ|/ψᵢ` — at or below
+  the tolerance on a `:tolerance` exit, above it on a `:floor` exit;
+- `final_alpha`: the damping `α` of the last accepted step, `1` when it was undamped.
+
+Construct a fresh collector per fit. The field equation is solved identically
+whether or not one is present.
+"""
+mutable struct SolveStats
+    iterations::Int
+    backtracks::Int
+    reason::Symbol
+    final_step::Float64
+    final_alpha::Float64
+end
+SolveStats() = SolveStats(0, 0, :none, NaN, NaN)
+
+"""
     _solve_amplitude(M, w)    -> ψ
     _solve_amplitude(x, w, κ) -> ψ
 
@@ -457,16 +495,33 @@ to impose normalization.
 
 Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
 along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
-Newton decrement `λ² = ∇FᵀΔ` drops below a relative tolerance, or when the line search can
-no longer decrease `F`.
+Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
+roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
+tolerance. Reaching `maxiter` throws.
+
+A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
 """
-function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) where {T<:AbstractFloat}
+function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
+                          stats::Union{Nothing,SolveStats}=nothing) where {T<:AbstractFloat}
     n = length(w)
     ψ = fill(oneunit(T), n)             # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
     Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
-    ctol = cbrt(eps(T))^2               # relative Newton-decrement tolerance
+    # The correction Δ is what the next step would subtract, so in the quadratic
+    # regime it is the remaining error in ψ. Testing F instead — or the Newton
+    # decrement, which predicts the same difference — constrains a quantity that
+    # is stationary at the minimizer, and is satisfied while ψ is still wrong by
+    # the square root of the tolerance; that error would carry into Z, λ, and the
+    # density.
+    stol = eps(T)^(3//4)                # relative tolerance on the Newton correction
+    W = sum(w)                          # total multiplicity, the scale of F's two terms
     Fψ = _objective(M, w, ψ)
+    prevstep = T(Inf)
+    unguarded = false                   # has a step been taken without the Armijo test?
+    converged = false
+    iters = 0; backs = 0                # Newton steps taken; Armijo halvings across them
+    reason = :none
+    finalstep = T(Inf); finalα = T(NaN) # last correction magnitude and accepted damping
     for _ in 1:maxiter
         mul!(g, M, ψ)
         @. g -= w / ψ                    # ∇F = Mψ - w./ψ
@@ -475,16 +530,48 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
         Δ .= g
         ldiv!(ldlt!(SymTridiagonal(Hdv, Hev)), Δ)   # Δ = (∇²F)⁻¹ ∇F
         decrement = dot(g, Δ)               # Newton decrement λ² = ∇Fᵀ(∇²F)⁻¹∇F ≥ 0
-        decrement <= ctol * max(oneunit(T), abs(Fψ)) && break
+        step = zero(T)
+        for i in eachindex(Δ, ψ)
+            step = max(step, abs(Δ[i]) / ψ[i])   # ψ > 0 throughout
+        end
+        # Roundoff floors the attainable correction at a level set by the
+        # conditioning of ∇²F, and on a widely spread sample that floor can sit
+        # well above `stol`; stopping when the correction ceases to fall covers
+        # that case. The floor is only meaningful once F has stopped resolving
+        # the decrease the step predicts, which is what `unguarded` records —
+        # while the Armijo test is still informative the correction may plateau
+        # for a step or two without the iteration being finished.
+        if step <= stol
+            converged = true; reason = :tolerance; finalstep = step
+            break
+        elseif unguarded && step >= prevstep
+            converged = true; reason = :floor; finalstep = step
+            break
+        end
+        iters += 1
+        prevstep = step
         # Largest α ≤ 1 keeping ψ - αΔ strictly positive, then Armijo backtracking.
         α = one(T)
         for i in eachindex(ψ, Δ)
             Δ[i] > 0 && (α = min(α, ψ[i] / Δ[i]))
         end
         α < one(T) && (α *= oftype(α, 0.99))
+        # Armijo compares two values of F differing by α·decrement/4. F is a
+        # difference of terms of size W accumulated over n nodes, so rounding
+        # leaves it uncertain by roughly √n·eps·(|F| + W); a predicted decrease
+        # below that carries no information, and rejecting the step on it stalls
+        # the iteration into halving α when it should be squaring the error.
+        # Such a step is deep enough into the quadratic regime to take unguarded.
+        if α * decrement / 4 <= 4 * sqrt(T(n)) * eps(T) * (abs(Fψ) + W)
+            unguarded = true
+            @. ψ -= α * Δ
+            Fψ = _objective(M, w, ψ)
+            finalα = α
+            continue
+        end
         armijo = false
         local Fnew
-        while α >= eps(T)
+        while α * step >= eps(T)        # below this ψ - αΔ rounds back to ψ
             @. ψnew = ψ - α * Δ
             Fnew = _objective(M, w, ψnew)
             if Fnew <= Fψ - α * decrement / 4
@@ -492,10 +579,26 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100) 
                 break
             end
             α /= 2
+            backs += 1
         end
-        armijo || break                     # no decrease available ⇒ converged to rounding
+        # Backtracking ran out of room: no positive step both keeps ψ inside the
+        # orthant and moves it by more than rounding, so ψ is stationary to the
+        # precision available. That is a converged fit, not a failed one.
+        if !armijo
+            converged = true; reason = :steplength; finalstep = step
+            break
+        end
         copyto!(ψ, ψnew)
         Fψ = Fnew
+        finalα = α
+    end
+    converged || error("Newton did not converge in $maxiter iterations; the fit is unreliable")
+    if stats !== nothing
+        stats.iterations = iters
+        stats.backtracks = backs
+        stats.reason = reason
+        stats.final_step = Float64(finalstep)
+        stats.final_alpha = Float64(finalα)
     end
     return ψ
 end
@@ -780,11 +883,52 @@ function _amplitude(d::DensityEstimate{T}, k::Integer, x::Real) where {T}
     return ψ[k] * _sinh_ratio(a, a + b) + ψ[k+1] * _sinh_ratio(b, a + b)
 end
 
-# ln Q(t) = 2 ln ψ(t) at every position of the sorted vector `ts`, advancing through the
-# nodes alongside `ts` in one pass. Evaluating pointwise would binary-search for each
-# position, and a plug-in scale is realized on O(N) positions for every candidate it scores.
-# The logarithm keeps the far tails informative where Q itself underflows to zero; outside a
-# finite support Q is by construction zero, i.e. ln Q = -Inf.
+"""
+    logdensity(d::DensityEstimate, x)
+
+Evaluate the log fitted density `ln Q̂(x) == 2 ln ψ(x)` at real `x`, which may
+be a scalar or an array. `-Inf` outside a finite `support` (see
+[`DensityEstimate`](@ref)), where the density is exactly zero.
+
+Prefer this to `log(d(x))` or `2 * log(amplitude(d, x))`, as `logdensity` avoids
+the underflow that would occur when evaluating the density directly. The result
+is finite and linear in `x`. See [`logdensity_eval_gradient`](@ref) for
+its derivative.
+
+# Examples
+
+```jldoctest
+julia> d = DensityEstimate([-1.0, 0.0, 1.0], 1.0);
+
+julia> logdensity(d, 0.0) ≈ 2 * log(amplitude(d, 0.0))
+true
+
+julia> amplitude(d, -800.0), isfinite(logdensity(d, -800.0))
+(0.0, true)
+```
+"""
+logdensity(d::DensityEstimate, x::Real) = _logdensity(d, x)
+logdensity(d::DensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi), x)
+
+# ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`, and the two must be kept
+# so: a caller reaching either one for the same quantity may not get a different answer.
+function _logdensity(d::DensityEstimate{T}, x::Real) where {T}
+    xs = d.x
+    n = length(xs)
+    if x <= xs[1]
+        x < d.lo && return T(-Inf)
+        return 2 * _log_left_tail_amplitude(d.ψ[1], d.κL, x, xs[1], d.lo)
+    elseif x >= xs[n]
+        x > d.hi && return T(-Inf)
+        return 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, x, xs[n], d.hi)
+    end
+    return 2 * _log_amplitude(d, searchsortedlast(xs, x), x)
+end
+
+# ln Q(t) at every position of the sorted vector `ts`, advancing through the nodes alongside
+# `ts` in one pass. Evaluating pointwise would binary-search for each position, and a plug-in
+# scale is realized on O(N) positions for every candidate it scores. Same branches as
+# `_logdensity`, differing only in how the enclosing interval is found.
 function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
     xs = d.x
     n = length(xs)
@@ -800,23 +944,38 @@ function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
         elseif t >= xs[n]
             out[i] = t > d.hi ? T(-Inf) : 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, t, xs[n], d.hi)
         else
-            out[i] = 2 * log(_amplitude(d, k, t))
+            out[i] = 2 * _log_amplitude(d, k, t)
         end
     end
     return out
 end
 
-# ln ψ(t) in the left tail, unbounded branch identical to `log(_left_tail_amplitude(...))`
-# (so `_logdensity_sorted` reduces to its pre-existing arithmetic when `lo = -Inf`); the finite
-# branch uses `_logcosh` so it stays finite well past where `cosh` itself would overflow.
+# ln ψ(x) inside interval k, the log-domain mirror of `_amplitude(d, k, x)`. Both sinh arcs
+# are formed in the log domain and combined with `logaddexp`, so the result holds wherever
+# ψ itself underflows: at κ(xs[k+1] - xs[k]) ≳ 1490 the arcs vanish in the middle of the
+# interval, which is where a log density is most worth having. ψ is strictly positive by
+# construction (`_solve_amplitude` keeps it so), hence `log(ψ[k])` is always real.
+function _log_amplitude(d::DensityEstimate, k::Integer, x::Real)
+    xs, ψ = d.x, d.ψ
+    κ = _kappa(d, k)
+    a = κ * (xs[k+1] - x)           # a, b ≥ 0 and a + b = θ
+    b = κ * (x - xs[k])
+    return logaddexp(log(ψ[k]) + logabssinh(a), log(ψ[k+1]) + logabssinh(b)) - logabssinh(a + b)
+end
+
+# ln ψ(t) in the left tail. Every branch stays in the log domain: the unbounded arm as a
+# sum rather than the logarithm of a product, the bounded arm through `logcosh`. The tails
+# are where a log-density is worth having precisely because ψ itself has underflowed to
+# zero, so forming the amplitude first would return -Inf over the whole region the
+# logarithm exists to describe.
 _log_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
-    isfinite(lo) ? log(ψ1) + _logcosh(κ * (x - lo)) - _logcosh(κ * (x1 - lo)) :
-                   log(ψ1 * exp(κ * (x - x1)))
+    isfinite(lo) ? log(ψ1) + logcosh(κ * (x - lo)) - logcosh(κ * (x1 - lo)) :
+                   log(ψ1) + κ * (x - x1)
 
 # Mirror of `_log_left_tail_amplitude` for the right tail.
 _log_right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
-    isfinite(hi) ? log(ψn) + _logcosh(κ * (hi - x)) - _logcosh(κ * (hi - xn)) :
-                   log(ψn * exp(-κ * (x - xn)))
+    isfinite(hi) ? log(ψn) + logcosh(κ * (hi - x)) - logcosh(κ * (hi - xn)) :
+                   log(ψn) - κ * (x - xn)
 
 # sinh(u)/sinh(θ) for 0 ≤ u ≤ θ, evaluated without overflow at large θ.
 _sinh_ratio(u::T, θ::T) where {T} = exp(u - θ) * expm1(-2u) / expm1(-2θ)
@@ -832,9 +991,6 @@ _cosh_ratio2(v::T, u::T) where {T} = exp(v - u) * (oneunit(T) + exp(-2v)) / (one
 # sinh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u and accurate as v → 0
 # (via expm1, the same treatment _sinh_ratio gives its numerator).
 _sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + exp(-2u))
-
-# log(cosh(v)) for v ≥ 0, evaluated without overflow at large v.
-_logcosh(v::T) where {T} = v + log1p(exp(-2v)) - log(T(2))
 
 # ψ'(x): derivative of the amplitude with respect to the evaluation coordinate. Mirrors
 # `_amplitude` interval by interval, with cosh/sinh written through the overflow-safe ratios.
@@ -1695,8 +1851,10 @@ end
     expected_chisq(d::DensityEstimate) -> ⟨χ²⟩
     expected_chisq(ref::ChisqReference) -> ⟨χ²⟩
 
-Mean of the reference distribution of [`chisq`](@ref), in the exact finite-`N` theory
-(Holy 1997, Eqs. 16–18). Defined at any scale, constant or spatially varying.
+Mean of the reference distribution of [`chisq`](@ref) — the finite-`N` generalized-χ² law
+of the quadratic fluctuation approximation (Holy 1997, Eqs. 16–18), whose standing as a
+null distribution [`chisq_reference`](@ref) sets out. Defined at any scale, constant or
+spatially varying.
 
 Given a `DensityEstimate`, [`chisq_reference`](@ref) is assembled internally; to draw
 several quantities from one fit, build the reference once and pass it here and to
@@ -1707,7 +1865,7 @@ expected_chisq(d::DensityEstimate) = chisq_reference(d).mean
 # Standard normal CDF, Φ(t) = ½ erfc(-t/√2).
 _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 
-# ── Exact reference distribution of χ² (Holy 1997, Eqs. 16–18) ───────────────
+# ── Finite-N reference distribution of χ² (Holy 1997, Eqs. 16–18) ────────────
 #
 # χ²(δψ) = 4 Σᵢ wᵢ (δψ(xᵢ)/ψ_cl(xᵢ))² is a quadratic form in the Gaussian
 # fluctuation field of Eq. 16 (precision L = -ℓ²∂² + 2λ + 2Σ wₖδ(x-xₖ)/ψₖ²,
@@ -1735,9 +1893,10 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
     ChisqReference
 
 Precomputed reference distribution of the goodness-of-fit statistic [`chisq`](@ref)
-for one fit, in the exact finite-`N` theory (Holy 1997, Eqs. 16–18). The statistic is
-a quadratic form in the Gaussian fluctuation field, so its law is a generalized
-chi-squared; this object stores the `O(N)` data — a symmetric tridiagonal matrix and a
+for one fit (Holy 1997, Eqs. 16–18). The statistic is a quadratic form in the Gaussian
+fluctuation field, so its law is a generalized chi-squared, evaluated here at finite `N`
+with no large-`N` limit; see [`chisq_reference`](@ref) for the approximation it rests on.
+This object stores the `O(N)` data — a symmetric tridiagonal matrix and a
 rank-one constraint vector — that its density and tail probabilities are computed from.
 
 Build one with [`chisq_reference`](@ref) and reuse it across many evaluations of
@@ -1896,11 +2055,20 @@ end
 """
     chisq_reference(d::DensityEstimate) -> ChisqReference
 
-Assemble the exact reference distribution of [`chisq`](@ref) for the fit `d`, following
+Assemble the reference distribution of [`chisq`](@ref) for the fit `d`, following
 Holy 1997 (Eqs. 16–18). Costs `O(N)`; reuse the result across many calls to
 [`chisq_ccdf`](@ref)/[`chisq_pdf`](@ref)/[`pvalue`](@ref) rather than rebuilding it. A
 spatially varying `κ` and a finite `support` (see [`DensityEstimate`](@ref)) are both
-supported, and the law stays exact and `O(N)` in either case.
+supported, and the law stays `O(N)` in either case.
+
+The law is exact for the Gaussian fluctuation field of the Laplace approximation about
+the fit, and it is evaluated at finite `N` (corresponding to `method = :exact`; the
+large-N limit is `method = :largeN`).
+
+It is not, by itself, a finite-sample frequentist null distribution for data drawn from
+the fitted density; it is a Bayesian measure of likelihood among distributions sharing
+the same roughness penalty. Its calibration as a frequentist null distribution need not
+be distribution-free.
 
 # Extended help
 
@@ -1994,11 +2162,12 @@ end
     chisq_ccdf(ref::ChisqReference, z; method=:exact)  -> P(χ² ≥ z)
 
 Upper-tail (survival) probability of the reference χ² distribution at `z`. Evaluated at an
-observed statistic it is a p-value; see [`pvalue`](@ref).
+observed statistic it is a diagnostic significance; see [`pvalue`](@ref), and
+[`chisq_reference`](@ref) for the sense in which it is and is not a p-value.
 
 `method=:exact` (default) uses the finite-`N` generalized-χ² law via Imhof inversion of
 [`chisq_reference`](@ref)`(d)`. `method=:largeN` uses the inverse-Gaussian (Wald) shape of
-the large-`N` limit (Eq. 26), parameterized by the exact mean [`expected_chisq`](@ref); it
+the large-`N` limit (Eq. 26), parameterized by the mean [`expected_chisq`](@ref); it
 is a closed form, far cheaper per call, and — like the exact law — defined at every scale.
 Pass a prebuilt [`ChisqReference`](@ref) to avoid reassembling it across calls.
 """
@@ -2052,6 +2221,9 @@ chisq_pdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
 
 Significance of the fit of a trial density `Q`: the probability that the reference χ²
 distribution exceeds the observed [`chisq`](@ref)`(d, Q)`, i.e. `chisq_ccdf(d, chisq(d, Q))`.
+The reference law is that of the quadratic fluctuation approximation, so this is a
+diagnostic significance whose calibration is density-dependent; see
+[`chisq_reference`](@ref).
 
 `method` is as in [`chisq_ccdf`](@ref). To test several trial densities against one fit,
 build the reference once with [`chisq_reference`](@ref) and call `pvalue(ref, chisq(d, Q))`.
@@ -2087,7 +2259,7 @@ function _default_κs(x::AbstractVector{<:Real})
 end
 
 """
-    select_kappa_ms(x; κs=<data-scaled grid>, rtol=1e-6) -> κ
+    select_kappa_ms(x; κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
 the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
@@ -2111,7 +2283,7 @@ search, bracketed by the grid `κs`. This is a principled convention rather than
 optimum: `S` has no exact stationary point in `κ`, so the flattest point depends on measuring
 sensitivity in `ln κ`.
 """
-function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
@@ -2127,7 +2299,7 @@ function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=
 end
 
 """
-    kappa_interval(x; level=0.2, rtol=1e-6) -> (; κ, lo, hi)
+    kappa_interval(x; level=0.2, rtol=cbrt(eps(T))) -> (; κ, lo, hi)
 
 Principled smoothing-scale selection returning a point value and an interval of plausible
 scales. `κ` is the half-entropy scale — the `h = 1/2` point of the entropy fraction `h(κ)`
@@ -2155,7 +2327,7 @@ of the multiplicities (`ln N` for distinct points). The normalized quantity
 is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
 `h = 1/2` is returned as `κ`.
 """
-function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=1e-6)
+function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=cbrt(eps(float(eltype(x)))))
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
@@ -2218,19 +2390,31 @@ function _inv_diag(H::SymTridiagonal{T}) where {T}
     return inv.(d .+ δ .- a)
 end
 
-# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). The
-# leave-one-out density is analytic to first order — dropping one observation at node i decrements
-# wᵢ, perturbing the unnormalised field φ by δφ = -H⁻¹eᵢ/φᵢ (H the fit's SPD Hessian
-# ∇²F = M + diag(w/φ²)). Carrying δφ through the normalization ψ = φ/√Z, with Z = ∫φ² = φᵀGφ
-# and v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ), gives Q̂₋ᵢ(xᵢ) ≈ ψᵢ² (1 - 2(H⁻¹)ᵢᵢ/φᵢ² + 2vᵢ/(φᵢ Z)).
+# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
+# one observation at node i decrements wᵢ; the deleted field is a Newton step of that problem from
+# the full solution, along the direction H⁻¹eᵢ (H the fit's SPD Hessian ∇²F = M + diag(w/φ²)). A
+# unit step is the first-order approximation; it under-penalizes over-fitting, because where the node
+# leverage h = (H⁻¹)ᵢᵢ/φᵢ² is high the removed point's spike collapses super-linearly and a linear
+# step cannot see it. Instead the step length t is set so node i's own nonlinear stationarity holds
+# exactly: t² h(1 - wᵢh) - t + 1 = 0, whose root t = 2/(1 + √(1 - 4h(1 - wᵢh))) (real because
+# h(1 - wᵢh) ≤ 1/4) is 1 as h → 0, recovering first order, and grows to shrink the overshoot as h
+# rises. The node amplitude becomes φᵢ(1 - t h), and the normalization is carried linearly,
+# Zₜ = Z - 2t vᵢ/φᵢ with v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ, Z = ∫φ² = φᵀGφ), so Q̂₋ᵢ(xᵢ) = (φᵢ(1 - t h))² / Zₜ.
 #
-# Nothing in that expansion uses M's entries, only that it is the fixed SPD operator whose mass
-# functional is Z — so it holds for a piecewise-constant scale unchanged. The overall factor the
-# adaptive operator carries (see `roughness_operator`) leaves ψ and the leave-one-out densities
-# invariant: under M → cM the pieces move as φ → φ/√c, Z → Z/c, H → cH, (H⁻¹)ᵢᵢ → (H⁻¹)ᵢᵢ/c,
-# Gφ → Gφ/√c and v → v/c^{3/2}, and every term above is a ratio in which c cancels. An optional
-# natural boundary at `lo`/`hi` needs only the bounded `_operator` and `_norm_sq_gram`, per the
-# same argument.
+# A node isolated at unit weight sits at the double root: its own stationarity gives Mᵢᵢφᵢ² = wᵢ, so
+# h = 1/2, the discriminant vanishes and t = 2 drives the deleted amplitude to zero. Rounding can
+# carry the discriminant just below zero there, hence the clamp — without it the root jumps to the
+# linear step, which reports a finite deleted density where the field has in fact collapsed and so
+# scores such a κ as if it fit well. With the clamp `_klcv` sees Q̂₋ᵢ ≤ 0 and rejects the scale.
+#
+# t and its inputs are dimensionless or scale like Z, so — as for the linear step — nothing depends
+# on M's entries beyond its being the fixed SPD operator with mass functional Z: it holds unchanged
+# for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
+#
+# The step tracks a literal leave-one-out refit (wᵢ decremented, a singleton node dropped) closely
+# across the scale range on continuous data; on heavily tied data the linearized normalization can
+# drift the score's flat tail and select too rough a scale, the regime where `select_kappa_ms` and
+# `kappa_interval` are preferred anyway.
 function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
@@ -2239,7 +2423,14 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T,
     gii = _inv_diag(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
     ψ = φ ./ sqrt(Z)
-    looi = @. ψ^2 * (1 - 2 * gii / φ^2 + 2 * v / (φ * Z))
+    looi = similar(φ)
+    for i in eachindex(φ, w)
+        h = gii[i] / φ[i]^2                             # single-observation leverage
+        disc = 1 - 4 * h * (1 - w[i] * h)               # ≥ 0 since h(1-wᵢh) ≤ 1/4
+        t = 2 / (1 + sqrt(max(disc, zero(disc))))       # nonlinear step length, →1 as h→0
+        Zt = Z - 2 * t * v[i] / φ[i]
+        looi[i] = (φ[i] * (1 - t * h))^2 / Zt
+    end
     return ψ, looi
 end
 
@@ -2267,9 +2458,9 @@ _lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ,
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
-# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same first-order leave-one-out densities as
-# _lscv. A non-positive Q̂₋ᵢ (possible where the first-order expansion overshoots) makes the log
-# undefined; return NaN so the search rejects κ.
+# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv. A
+# non-positive Q̂₋ᵢ (the deleted field has collapsed at node i) makes the log undefined; return NaN
+# so the search rejects κ.
 function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
     s = zero(T)
@@ -2286,7 +2477,7 @@ _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
 _klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -2313,16 +2504,16 @@ Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded
 # Extended help
 
 Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
-segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a first-order expansion of the fit
-in the dropped point's weight, so no per-point refitting is needed. The score is minimized by a
-golden-section search over `ln κ`, bracketed by the grid `κs`.
+segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a one-step leave-one-out expansion of
+the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per-point refitting is
+needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
-select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =
     _select_by_score(_lscv, x, κs, rtol, support)
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=1e-6, support=(-Inf, Inf)) -> κ
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
 minimizing the mean negative leave-one-out log-likelihood
@@ -2356,11 +2547,13 @@ to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-
 leading order it selects the same error-optimal scale as [`select_kappa_cv`](@ref) while being
 cheaper: the `∫Q̂²` roughness term is not needed.
 
-Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a first-order expansion of the fit in the
-dropped point's weight, so no per-point refitting is needed and the score costs `O(N)`. The score
-is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
+Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a one-step leave-one-out expansion of the fit
+in the dropped point's weight — a Newton step whose length is set so the deleted node's own
+stationarity holds exactly, which tracks a literal refit closely without a linear step's blindness
+to over-fitting — so no per-point refitting is needed and the score costs `O(N)`. The score is
+minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
-select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6,
+select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
                support::Tuple{Real,Real}=(-Inf, Inf)) =
     _select_by_score(_klcv, x, κs, rtol, support)
 
@@ -2446,9 +2639,11 @@ end
 # The rule itself, from ln p̂(x): κ = c·(p̂/ḡ)^α, floored.
 _scale_from_logdensity(k::AdaptiveScale, lnp) = max(k.c * exp(k.α * (lnp - k.loggbar)), k.κmin)
 
-# ln p̂ rather than p̂: the pilot density underflows to zero between far-separated tail nodes,
-# where its logarithm is still perfectly finite.
-(k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, 2 * log(_amplitude(k.pilot, x)))
+# ln p̂ rather than p̂: the pilot density underflows to zero beyond and between far-separated
+# tail nodes, where its logarithm is still perfectly finite. `_logdensity` is what makes that
+# true; `2 log(_amplitude(...))` would reintroduce the underflow this rule exists to survive,
+# and would disagree with the batch path below.
+(k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, _logdensity(k.pilot, x))
 
 # One walk of the pilot for the whole sorted batch, instead of a binary search per position.
 function _kappa_sorted(k::AdaptiveScale{T}, ts::AbstractVector, ::Type{T}) where {T}
@@ -2788,7 +2983,7 @@ _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
 
 """
-    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=1e-6) -> (; κ, support)
+    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> (; κ, support)
 
 Choose a domain `support = (a, b)` — either side possibly infinite — together with the
 smoothing scale `κ`, jointly, by the same Kullback–Leibler cross-validation score
@@ -2860,7 +3055,7 @@ searches themselves score every candidate directly by the KLCV score `select_kap
 not by calling `kappa` per candidate.
 """
 function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
-                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=1e-6)
+                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))

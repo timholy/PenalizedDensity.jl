@@ -1,5 +1,6 @@
 using PenalizedDensity
 using LinearAlgebra: SymTridiagonal, ZeroPivotException
+using LogExpFunctions: logaddexp
 using OffsetArrays
 using QuadGK: quadgk
 using Random, Statistics
@@ -159,6 +160,33 @@ end
         @test (@allocated DensityEstimate(x, 3.0; rtol=0.0)) < 40 * length(x) * sizeof(Float64)
     end
 
+    @testset "SolveStats records solver effort without changing the fit" begin
+        fresh = PenalizedDensity.SolveStats()
+        @test (fresh.iterations, fresh.backtracks) == (0, 0)
+        @test fresh.reason === :none
+        @test isnan(fresh.final_step) && isnan(fresh.final_alpha)
+
+        st = PenalizedDensity.SolveStats()
+        x = randn(MersenneTwister(11), 300)
+        d = DensityEstimate(x, 4.0; stats=st)
+        # A well-conditioned fit converges cleanly on the correction tolerance, and
+        # the collected fit is identical to the uninstrumented one — the collector
+        # must not perturb the solve.
+        @test st.iterations >= 1
+        @test st.reason === :tolerance
+        @test st.final_step <= eps(Float64)^(3//4)
+        @test 0 < st.final_alpha <= 1
+        @test d.ψ == DensityEstimate(x, 4.0).ψ
+
+        # Near-coincident nodes at rtol=0 ill-condition the solve: it stops short of the
+        # correction tolerance, held up by roundoff rather than meeting it.
+        st0 = PenalizedDensity.SolveStats()
+        DensityEstimate(randn(MersenneTwister(7), 4_000), 3.0; rtol=0.0, stats=st0)
+        @test st0.iterations >= 1
+        @test st0.reason in (:floor, :steplength)
+        @test st0.final_step > eps(Float64)^(3//4)
+    end
+
     @testset "scale equivariance" begin
         # Q is scale-equivariant: rescaling x → s·x with κ → κ/s gives Q_s(s·x) = Q(x)/s.
         # M, the Newton solve, and the convergence test depend on x, κ only through κ·Δx,
@@ -230,7 +258,9 @@ end
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
 
-        # LSCV score: the first-order analytic leave-one-out matches brute-force refitting.
+        # LSCV score: the analytic one-step leave-one-out matches brute-force refitting.
+        # The refit is the exact leave-one-out — wᵢ decremented, a singleton node dropped —
+        # the estimand the analytic step approximates.
         xs = sort(x); w = ones(length(xs))
         function lscv_refit(nodes, weights, κ)
             cross = 0.0
@@ -247,7 +277,17 @@ end
             return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-3
+            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-4
+        end
+
+        # The nonlinear step is exercised on the tied branch (wᵢ > 1) too: rounding to
+        # 0.05σ collapses the sample onto high-multiplicity nodes, and the analytic score
+        # still matches the decrement refit — LSCV's density-weighted cross term is
+        # accurate even where the log-scale KLCV would not be.
+        nt, wt = PenalizedDensity._merge_presorted(sort(round.(x ./ 0.05) .* 0.05), 1e-8)
+        @test maximum(wt) > 5
+        for κ0 in (1.5, 4.0)
+            @test PenalizedDensity._lscv(nt, wt, κ0) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
         end
 
         # MISE targeting: on smooth data the cross-validated scale is finer than the
@@ -273,11 +313,11 @@ end
         κ200 = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
-        # KLCV score: the mean negative leave-one-out log-likelihood built from the first-order
-        # analytic leave-one-out densities matches one built by brute-force refitting. The
-        # tolerance is looser than the LSCV analog above: taking the log gives every node equal
-        # weight, including tail nodes where the first-order expansion is least accurate, whereas
-        # LSCV's cross term downweights them by the density value.
+        # KLCV score: the mean negative leave-one-out log-likelihood built from the analytic
+        # one-step leave-one-out densities matches one built by brute-force refitting. The
+        # tolerance is looser than the LSCV analog above because taking the log gives every node
+        # equal weight, including tail nodes where the expansion is least accurate, whereas LSCV's
+        # cross term downweights them by the density value.
         xs = sort(x); w = ones(length(xs))
         function klcv_refit(nodes, weights, κ)
             s = 0.0
@@ -288,7 +328,22 @@ end
             return -s / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 2e-2
+            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 1e-3
+        end
+
+        # The nonlinear step's payoff is selection on high-leverage data: on a small, skewed
+        # sample the analytic KLCV minimizes at the scale an exact leave-one-out grid search
+        # picks, and matches the refit tightly near that optimum. A first-order expansion
+        # under-penalizes over-fitting here and selects a far too rough scale. (The analytic and
+        # exact scores can diverge far out in the over-fit tail, where a single collapsing node
+        # dominates the log-score, but that is well right of any selected scale.)
+        xh = sort(exp.(randn(MersenneTwister(3), 25))); wh = ones(length(xh))
+        span = xh[end] - xh[1]
+        gridh = exp.(range(log(0.5 / span), log(5 * length(xh) / span); length = 41))
+        κ_exact = gridh[argmin([klcv_refit(xh, wh, κ) for κ in gridh])]
+        @test select_kappa_kl(xh) ≈ κ_exact rtol = 0.2
+        for κ0 in (0.5, 1.0)
+            @test PenalizedDensity._klcv(xh, wh, κ0) ≈ klcv_refit(xh, wh, κ0) rtol = 5e-3
         end
 
         # Divergence targeting: on smooth data the KL scale is finer than the minimum-sensitivity
@@ -605,7 +660,10 @@ end
                 for t in range(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo); length = 41)
                     (; y, logjac) = gaussianize_logjacobian(d, t)
                     @test y == gaussianize(d, t)
-                    @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-8
+                    # The cdf behind y is a quadrature at rtol = √eps, so the identity
+                    # cannot hold tighter than that; most points land near 1e-10, a few
+                    # near the quadrature tolerance itself.
+                    @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-7
                 end
                 # Monotone across the support.
                 @test issorted(gaussianize(d, collect(range(lo, hi; length = 1001))))
@@ -805,6 +863,15 @@ end
             far = last(chisq1) + 1e4
             @test p(far) == 0
             @test k(far) == k.κmin == 1e-6 * k.c
+
+            # A shallow exponent keeps the rule off its floor even where the pilot density
+            # has underflowed, which is the only regime that can tell the scalar and batch
+            # paths apart: both must read the log-density, not the density.
+            ks = AdaptiveScale(3.0, 5e-3, p)
+            deep = last(chisq1) .+ [20.0, 25.0, 30.0]
+            @test all(t -> p(t) == 0, deep)
+            @test all(t -> ks(t) > ks.κmin, deep)
+            @test PenalizedDensity._kappa_sorted(ks, deep, Float64) == ks.(deep)
 
             @test sprint(show, k) ==
                   "AdaptiveScale(c=3.0, α=0.5) over a pilot with $(length(p.x)) nodes"
@@ -1307,6 +1374,84 @@ end
         @test all(isfinite, amplitude(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
     end
 
+    @testset "log-density stays finite where the density underflows" begin
+        Random.seed!(11)
+        x = randn(200)
+        κ = 1.5
+        d = DensityEstimate(x, κ)
+        # Far enough out that ψ itself is zero in double precision, which is the
+        # regime a log-density exists to serve.
+        far = [d.x[1] - 1500.0, d.x[1] - 700.0, d.x[end] + 700.0, d.x[end] + 1500.0]
+        ℓ = PenalizedDensity._logdensity_sorted(d, sort(far))
+        @test all(isfinite, ℓ)
+        @test any(t -> amplitude(d, t) == 0, far)
+
+        # Beyond the outermost nodes the log-density is exactly linear with slope
+        # ±2κ, so the closed form is available independently of the recurrence.
+        for t in (d.x[1] - 1500.0, d.x[1] - 700.0)
+            @test PenalizedDensity._logdensity_sorted(d, [t])[1] ≈
+                  2 * (log(d.ψ[1]) + d.κL * (t - d.x[1]))
+        end
+        for t in (d.x[end] + 700.0, d.x[end] + 1500.0)
+            @test PenalizedDensity._logdensity_sorted(d, [t])[1] ≈
+                  2 * (log(d.ψ[end]) - d.κR * (t - d.x[end]))
+        end
+
+        # Where the density has not underflowed the two routes must agree.
+        near = sort(d.x[1] .- [0.5, 2.0, 5.0])
+        @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude(d, near))
+    end
+
+    @testset "log-density stays finite inside a wide gap" begin
+        # κ·gap ≈ 3000: both sinh arcs underflow in the middle of the interval, so the
+        # amplitude is zero over a region where the log-density is finite.
+        xs = [-1000.0, -999.0, 0.0, 999.0, 1000.0]
+        κ = 3.0
+        d = DensityEstimate(xs, κ)
+        mid = [-750.0, -500.0, -250.0, 250.0, 500.0, 750.0]
+        @test all(t -> amplitude(d, t) == 0, mid)
+        @test all(isfinite, logdensity(d, mid))
+
+        # Deep inside the gap each arc is a pure exponential decay from its own node,
+        # ψ ≈ ψ_k e^{-κ(x - x_k)} + ψ_{k+1} e^{-κ(x_{k+1} - x)}, which pins the value
+        # without reference to the sinh recurrence.
+        for t in mid
+            k = searchsortedlast(xs, t)
+            @test logdensity(d, t) ≈ 2 * logaddexp(log(d.ψ[k]) - κ * (t - xs[k]),
+                                                   log(d.ψ[k+1]) - κ * (xs[k+1] - t))
+        end
+    end
+
+    @testset "logdensity" begin
+        Random.seed!(5)
+        d = DensityEstimate(randn(150), 1.2)
+
+        # Agrees with the amplitude wherever the amplitude has not underflowed.
+        ts = collect(range(d.x[1] - 3, d.x[end] + 3; length = 500))
+        @test logdensity(d, ts) ≈ 2 .* log.(amplitude(d, ts))
+        @test logdensity(d, ts[17]) == logdensity(d, ts)[17]      # scalar matches array
+
+        # The scalar path and the sorted-batch sweep are two routes to one quantity.
+        far = sort(vcat(ts, d.x[1] .- [1e4, 1500.0], d.x[end] .+ [1500.0, 1e4]))
+        @test logdensity(d, far) == PenalizedDensity._logdensity_sorted(d, far)
+
+        # Array shape and axes are preserved; matches `map` over the same points.
+        m = reshape(ts[1:12], 3, 4)
+        @test size(logdensity(d, m)) == (3, 4)
+        @test logdensity(d, m) == map(t -> logdensity(d, t), m)
+        to = OffsetArray(ts[1:20], -7)
+        @test axes(logdensity(d, to)) == axes(to)
+        @test logdensity(d, to) == OffsetArray(logdensity(d, ts[1:20]), -7)
+
+        # Outside a finite support the density is exactly zero, so ln Q = -Inf.
+        db = DensityEstimate(clamp.(randn(150), -1.9, 1.9), 1.2; support = (-2.0, 2.0))
+        @test logdensity(db, -2.5) == -Inf
+        @test logdensity(db, 2.5) == -Inf
+        @test isfinite(logdensity(db, 0.0))
+        # The bounded tails run through `logcosh` and stay finite to the boundary.
+        @test all(isfinite, logdensity(db, range(-2, 2; length = 200)))
+    end
+
     @testset "input validation" begin
         @test_throws ArgumentError DensityEstimate(Float64[], 1.0)
         @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[], 1.0)
@@ -1536,10 +1681,10 @@ end
                 return Q2 - 2cross / sum(weights)
             end
             # Exponential (a hard left edge) and uniform (both edges hard), N a few hundred, at
-            # several κ including each family's own KLCV-selected scale. Tolerances match the
-            # unbounded suite's (`select_kappa_kl`/`select_kappa_cv` testsets above): KLCV's
-            # equal per-node weighting under the log is most sensitive to sparse tail nodes,
-            # where the first-order expansion is least accurate, so it gets the looser bound.
+            # several κ including each family's own KLCV-selected scale. KLCV's equal per-node
+            # weighting under the log is most sensitive to sparse tail nodes, so it gets the looser
+            # bound; on the uniform fit the score itself is ≈ 0 (Q ≈ 1, so ln Q̂ ≈ 0), where an
+            # absolute tolerance replaces a meaningless relative one.
             for (name, xgen, support) in (
                     ("exponential", rng -> -log.(1 .- rand(rng, 300)), (0.0, Inf)),
                     ("uniform",     rng -> rand(rng, 300),              (0.0, 1.0)))
@@ -1551,7 +1696,7 @@ end
                 for κ0 in (κsel * 0.5, κsel, κsel * 1.5)
                     a_kl = PenalizedDensity._klcv(nodes, w, κ0, κ0, κ0, lo, hi)
                     b_kl = klcv_refit_b(nodes, w, κ0, lo, hi)
-                    @test a_kl ≈ b_kl rtol = 2e-2
+                    @test a_kl ≈ b_kl rtol = 1e-3 atol = 1e-4
                     a_ls = PenalizedDensity._lscv(nodes, w, κ0, κ0, κ0, lo, hi)
                     b_ls = lscv_refit_b(nodes, w, κ0, lo, hi)
                     @test a_ls ≈ b_ls rtol = 5e-3
