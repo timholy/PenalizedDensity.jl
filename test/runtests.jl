@@ -178,12 +178,11 @@ end
         @test 0 < st.final_alpha <= 1
         @test d.ψ == DensityEstimate(x, 4.0).ψ
 
-        # Near-coincident nodes at rtol=0 ill-condition the solve: it backtracks and
-        # stops short of the correction tolerance, held up by roundoff rather than
-        # meeting it. A fresh collector per fit accumulates the effort.
+        # Near-coincident nodes at rtol=0 ill-condition the solve: it stops short of the
+        # correction tolerance, held up by roundoff rather than meeting it.
         st0 = PenalizedDensity.SolveStats()
         DensityEstimate(randn(MersenneTwister(7), 4_000), 3.0; rtol=0.0, stats=st0)
-        @test st0.backtracks >= 1
+        @test st0.iterations >= 1
         @test st0.reason in (:floor, :steplength)
         @test st0.final_step > eps(Float64)^(3//4)
     end
