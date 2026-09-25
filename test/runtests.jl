@@ -913,6 +913,64 @@ end
             @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
         end
 
+        @testset "per-observation leave-one-out log densities" begin
+            loo(x, k) = PenalizedDensity._loo_logdensities(x, k, rtol, -Inf, Inf)
+            κ0 = select_kappa_kl(chisq1)
+            p = DensityEstimate(chisq1, κ0)
+            ka = AdaptiveScale(8.0, 0.75, p)
+            tied = round.(chisq1; digits=2)          # sorted, and heavily tied
+            @test length(unique(tied)) < length(tied) ÷ 2
+            for x in (chisq1, tied)
+                ℓ0 = loo(x, κ0)
+                @test length(ℓ0) == length(x)
+                @test -mean(ℓ0) ≈ klcv_const(x, κ0) rtol=1e-12
+                ℓa = loo(x, ka)
+                @test length(ℓa) == length(x)
+                @test -mean(ℓa) ≈ klcv_scale(x, ka) rtol=1e-12
+                # Tied observations share their node's value.
+                for j in 2:length(x)
+                    x[j] == x[j-1] && @test ℓa[j] == ℓa[j-1]
+                end
+            end
+            # On a finite support, through the 7-argument scoring.
+            lo, hi = 0.0, Inf
+            ℓs = PenalizedDensity._loo_logdensities(chisq1, ka, rtol, lo, hi)
+            @test -mean(ℓs) ≈ PenalizedDensity._score_kappa(PenalizedDensity._klcv, chisq1, ka, rtol, lo, hi) rtol=1e-12
+            # An unresolvable candidate: all NaN.
+            @test all(isnan, PenalizedDensity._loo_logdensities([1.0, 1.0], 5.0, rtol, -Inf, Inf))
+        end
+
+        @testset "one-standard-error rule" begin
+            # nse = 0 is the minimum-score choice, and the gain is the score difference.
+            κa = select_kappa_adaptive(chisq1; nse=0)
+            @test κa isa AdaptiveScale
+            κ0 = select_kappa_kl(chisq1)
+            gain, se = PenalizedDensity._adaptive_gain(chisq1, κ0, κa, rtol, -Inf, Inf)
+            @test gain ≈ klcv_const(chisq1, κ0) - klcv_scale(chisq1, κa) atol=1e-12
+            @test gain > 0 && se > 0
+
+            # A smooth density where the best exponent edges out the constant scale by far less
+            # than one standard error: nse = 0 takes the adaptive scale, nse = 1 the constant.
+            xn = sort!(randn(Xoshiro(3), 500))
+            κn0 = select_kappa_adaptive(xn; nse=0)
+            @test κn0 isa AdaptiveScale
+            κn = select_kappa_adaptive(xn)
+            @test κn isa Real && κn == select_kappa_kl(xn)
+            gain, se = PenalizedDensity._adaptive_gain(xn, κn, κn0, rtol, -Inf, Inf)
+            @test 0 < gain < se
+            @test gain ≈ klcv_const(xn, κn) - klcv_scale(xn, κn0) atol=1e-12
+
+            # A divergent edge: adaptivity wins by several standard errors.
+            xc = sort!(randn(Xoshiro(2), 250) .^ 2)
+            κc = select_kappa_adaptive(xc)
+            @test κc isa AdaptiveScale
+            gain, se = PenalizedDensity._adaptive_gain(xc, select_kappa_kl(xc), κc, rtol, -Inf, Inf)
+            @test gain > 3se
+            @test select_kappa_adaptive(xc; nse=Inf) isa Real
+
+            @test_throws "nse must be nonnegative" select_kappa_adaptive(xc; nse=-1)
+        end
+
         @testset "the c search brackets its minimum" begin
             # Driven by synthetic scores: the searches take the objective as an argument, so
             # their geometry is testable without a density pathological enough to force it.
