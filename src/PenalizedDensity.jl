@@ -450,6 +450,20 @@ function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<
     return dot(ψ, M, ψ) / 2 - s
 end
 
+# The magnitude of the terms summed to form F(ψ), before their cancellation: ∑ Mᵢᵢψᵢ² bounds
+# the quadratic form's terms (M is diagonally dominant, so each |Mᵢ,ᵢ₊₁|ψᵢψᵢ₊₁ is covered by the
+# adjacent diagonal terms), and ∑ wᵢ|ln ψᵢ| the likelihood's. Rounding leaves F uncertain by a
+# multiple of eps times this, not of |F|: on nearly coincident nodes the coth entries reach
+# 1e5 or more while the quadratic form they enter nearly cancels, so |F| understates the
+# roundoff by that factor.
+function _objective_scale(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
+    s = zero(T)
+    for i in eachindex(w, ψ)
+        s += M.dv[i] * ψ[i]^2 + w[i] * abs(log(ψ[i]))
+    end
+    return s
+end
+
 """
     SolveStats()
 
@@ -557,12 +571,15 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
         end
         α < one(T) && (α *= oftype(α, 0.99))
         # Armijo compares two values of F differing by α·decrement/4. F is a
-        # difference of terms of size W accumulated over n nodes, so rounding
-        # leaves it uncertain by roughly √n·eps·(|F| + W); a predicted decrease
-        # below that carries no information, and rejecting the step on it stalls
-        # the iteration into halving α when it should be squaring the error.
-        # Such a step is deep enough into the quadratic regime to take unguarded.
-        if α * decrement / 4 <= 4 * sqrt(T(n)) * eps(T) * (abs(Fψ) + W)
+        # difference of terms accumulated over n nodes, so rounding leaves it
+        # uncertain by roughly √n·eps times the size of those terms
+        # (`_objective_scale`, which can exceed |F| by orders of magnitude when
+        # nearly coincident nodes make the operator's entries large); a predicted
+        # decrease below that carries no information, and rejecting the step on
+        # it stalls the iteration into halving α when it should be squaring the
+        # error. Such a step is deep enough into the quadratic regime to take
+        # unguarded.
+        if α * decrement / 4 <= 4 * sqrt(T(n)) * eps(T) * (_objective_scale(M, w, ψ) + W)
             unguarded = true
             @. ψ -= α * Δ
             Fψ = _objective(M, w, ψ)

@@ -1,5 +1,5 @@
 using PenalizedDensity
-using LinearAlgebra: SymTridiagonal, ZeroPivotException
+using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
 using LogExpFunctions: logaddexp
 using OffsetArrays
 using QuadGK: quadgk
@@ -185,6 +185,26 @@ end
         @test st0.iterations >= 1
         @test st0.reason in (:floor, :steplength)
         @test st0.final_step > eps(Float64)^(3//4)
+
+        # Nearly coincident nodes make the operator's entries (up to ~2e5 here) far larger
+        # than the objective they nearly cancel to, so F's rounding noise is orders of
+        # magnitude above eps·|F|. The Armijo test must measure the noise by the size of
+        # F's terms; measured by |F|, it rejects every step once the predicted decrease is
+        # below the true noise and the solve stops with the amplitudes still wrong by ~1e-6.
+        x = -log.(1 .- rand(Xoshiro(0x9a6a4425a4e3843c), 1000))
+        xs = sort(x)
+        κ, lo = 2.0855457048506127, xs[1] - 0.004565539700564811
+        nodes, w = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)) / κ)
+        M = PenalizedDensity.roughness_operator(nodes, κ, lo, Inf)
+        @test maximum(M.dv) > 1e5
+        st2 = PenalizedDensity.SolveStats()
+        ψ = PenalizedDensity._solve_amplitude(M, w; stats=st2)
+        @test st2.reason in (:floor, :tolerance)
+        @test st2.final_step < 1e-9
+        # The returned amplitudes are stationary: a further Newton correction is at roundoff.
+        g = M * ψ .- w ./ ψ
+        Δ = ldlt!(SymTridiagonal(M.dv .+ w ./ ψ .^ 2, copy(M.ev))) \ g
+        @test maximum(abs.(Δ) ./ ψ) < 1e-9
     end
 
     @testset "scale equivariance" begin
