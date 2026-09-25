@@ -1,5 +1,5 @@
 using PenalizedDensity
-using LinearAlgebra: SymTridiagonal, ZeroPivotException
+using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
 using LogExpFunctions: logaddexp
 using OffsetArrays
 using QuadGK: quadgk
@@ -185,6 +185,26 @@ end
         @test st0.iterations >= 1
         @test st0.reason in (:floor, :steplength)
         @test st0.final_step > eps(Float64)^(3//4)
+
+        # Nearly coincident nodes make the operator's entries (up to ~2e5 here) far larger
+        # than the objective they nearly cancel to, so F's rounding noise is orders of
+        # magnitude above eps·|F|. The Armijo test must measure the noise by the size of
+        # F's terms; measured by |F|, it rejects every step once the predicted decrease is
+        # below the true noise and the solve stops with the amplitudes still wrong by ~1e-6.
+        x = -log.(1 .- rand(Xoshiro(0x9a6a4425a4e3843c), 1000))
+        xs = sort(x)
+        κ, lo = 2.0855457048506127, xs[1] - 0.004565539700564811
+        nodes, w = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)) / κ)
+        M = PenalizedDensity.roughness_operator(nodes, κ, lo, Inf)
+        @test maximum(M.dv) > 1e5
+        st2 = PenalizedDensity.SolveStats()
+        ψ = PenalizedDensity._solve_amplitude(M, w; stats=st2)
+        @test st2.reason in (:floor, :tolerance)
+        @test st2.final_step < 1e-9
+        # The returned amplitudes are stationary: a further Newton correction is at roundoff.
+        g = M * ψ .- w ./ ψ
+        Δ = ldlt!(SymTridiagonal(M.dv .+ w ./ ψ .^ 2, copy(M.ev))) \ g
+        @test maximum(abs.(Δ) ./ ψ) < 1e-9
     end
 
     @testset "scale equivariance" begin
@@ -911,6 +931,64 @@ end
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
             @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
+        end
+
+        @testset "per-observation leave-one-out log densities" begin
+            loo(x, k) = PenalizedDensity._loo_logdensities(x, k, rtol, -Inf, Inf)
+            κ0 = select_kappa_kl(chisq1)
+            p = DensityEstimate(chisq1, κ0)
+            ka = AdaptiveScale(8.0, 0.75, p)
+            tied = round.(chisq1; digits=2)          # sorted, and heavily tied
+            @test length(unique(tied)) < length(tied) ÷ 2
+            for x in (chisq1, tied)
+                ℓ0 = loo(x, κ0)
+                @test length(ℓ0) == length(x)
+                @test -mean(ℓ0) ≈ klcv_const(x, κ0) rtol=1e-12
+                ℓa = loo(x, ka)
+                @test length(ℓa) == length(x)
+                @test -mean(ℓa) ≈ klcv_scale(x, ka) rtol=1e-12
+                # Tied observations share their node's value.
+                for j in 2:length(x)
+                    x[j] == x[j-1] && @test ℓa[j] == ℓa[j-1]
+                end
+            end
+            # On a finite support, through the 7-argument scoring.
+            lo, hi = 0.0, Inf
+            ℓs = PenalizedDensity._loo_logdensities(chisq1, ka, rtol, lo, hi)
+            @test -mean(ℓs) ≈ PenalizedDensity._score_kappa(PenalizedDensity._klcv, chisq1, ka, rtol, lo, hi) rtol=1e-12
+            # An unresolvable candidate: all NaN.
+            @test all(isnan, PenalizedDensity._loo_logdensities([1.0, 1.0], 5.0, rtol, -Inf, Inf))
+        end
+
+        @testset "one-standard-error rule" begin
+            # nse = 0 is the minimum-score choice, and the gain is the score difference.
+            κa = select_kappa_adaptive(chisq1; nse=0)
+            @test κa isa AdaptiveScale
+            κ0 = select_kappa_kl(chisq1)
+            gain, se = PenalizedDensity._adaptive_gain(chisq1, κ0, κa, rtol, -Inf, Inf)
+            @test gain ≈ klcv_const(chisq1, κ0) - klcv_scale(chisq1, κa) atol=1e-12
+            @test gain > 0 && se > 0
+
+            # A smooth density where the best exponent edges out the constant scale by far less
+            # than one standard error: nse = 0 takes the adaptive scale, nse = 1 the constant.
+            xn = sort!(randn(Xoshiro(3), 500))
+            κn0 = select_kappa_adaptive(xn; nse=0)
+            @test κn0 isa AdaptiveScale
+            κn = select_kappa_adaptive(xn)
+            @test κn isa Real && κn == select_kappa_kl(xn)
+            gain, se = PenalizedDensity._adaptive_gain(xn, κn, κn0, rtol, -Inf, Inf)
+            @test 0 < gain < se
+            @test gain ≈ klcv_const(xn, κn) - klcv_scale(xn, κn0) atol=1e-12
+
+            # A divergent edge: adaptivity wins by several standard errors.
+            xc = sort!(randn(Xoshiro(2), 250) .^ 2)
+            κc = select_kappa_adaptive(xc)
+            @test κc isa AdaptiveScale
+            gain, se = PenalizedDensity._adaptive_gain(xc, select_kappa_kl(xc), κc, rtol, -Inf, Inf)
+            @test gain > 3se
+            @test select_kappa_adaptive(xc; nse=Inf) isa Real
+
+            @test_throws "nse must be nonnegative" select_kappa_adaptive(xc; nse=-1)
         end
 
         @testset "the c search brackets its minimum" begin

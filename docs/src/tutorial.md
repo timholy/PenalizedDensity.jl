@@ -195,7 +195,9 @@ scale and still evaluated in closed form and in ``O(N)``:
 ```
 
 Crucially, the constant scale competes in that same comparison: it's the ``\alpha = 0`` member
-of the family, ``\kappa(x) = c``, so **adaptivity is used only when it wins**. When it does not, the selector
+of the family, ``\kappa(x) = c``, so **adaptivity is used only when it wins**, and by default
+only when its gain in score exceeds one standard error of that gain (the keyword `nse`
+sets the multiple; `nse = 0` keeps whichever score is smaller). When it does not, the selector
 says so by returning a plain number rather than an `AdaptiveScale` — as on uniform data,
 where ``\kappa \propto \hat p^\alpha`` has no contrast to exploit:
 
