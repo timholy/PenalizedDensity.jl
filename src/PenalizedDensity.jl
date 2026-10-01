@@ -2429,10 +2429,20 @@ end
 # for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
 #
 # The step tracks a literal leave-one-out refit (wᵢ decremented, a singleton node dropped) closely
-# across the scale range on continuous data; on heavily tied data the linearized normalization can
-# drift the score's flat tail and select too rough a scale, the regime where `select_kappa_ms` and
-# `kappa_interval` are preferred anyway.
-function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+# across the scale range on continuous data.
+#
+# `holdout = :location` instead deletes all wᵢ observations at node i, the held-out value then
+# lying away from every atom of the remaining sample. Deleting c observations (c = 1 or wᵢ) takes
+# the step τ = c·t along the same direction, with node i's stationarity at weight wᵢ - c fixing
+# τ²h(1 - wᵢh) - τ + c = 0; the root continuous with the first-order step is
+# τ = 2c/(1 + √(1 - 4ch(1 - wᵢh))), the node amplitude becomes φᵢ(1 - τh), and Zₜ = Z - 2τvᵢ/φᵢ.
+# For c = wᵢ the discriminant is (1 - 2wᵢh)² and the node collapses at wᵢh = 1/2, as a single
+# isolated point does at h = 1/2. At wᵢ = 1 the two modes coincide. On tied data, leaving out a
+# single copy of a repeated value rewards spikes at the atoms, so `:location` is the default.
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+                      holdout::Symbol=:location) where {T}
+    holdout in (:location, :observation) ||
+        throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
     M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
     Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
@@ -2443,23 +2453,30 @@ function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T,
     looi = similar(φ)
     for i in eachindex(φ, w)
         h = gii[i] / φ[i]^2                             # single-observation leverage
-        disc = 1 - 4 * h * (1 - w[i] * h)               # ≥ 0 since h(1-wᵢh) ≤ 1/4
-        t = 2 / (1 + sqrt(max(disc, zero(disc))))       # nonlinear step length, →1 as h→0
-        Zt = Z - 2 * t * v[i] / φ[i]
-        looi[i] = (φ[i] * (1 - t * h))^2 / Zt
+        c = holdout === :location ? w[i] : one(T)       # observations deleted
+        τ = _deletion_step(h, w[i], c)
+        Zt = Z - 2 * τ * v[i] / φ[i]
+        looi[i] = (φ[i] * (1 - τ * h))^2 / Zt
     end
     return ψ, looi
 end
 
+# The step τ for deleting c of the w observations at a node of leverage h (see `_loo_density`).
+# The discriminant is ≥ 0 for c ∈ {1, w}, up to the rounding the clamp absorbs.
+function _deletion_step(h::T, w::T, c::T) where {T}
+    disc = 1 - 4 * c * h * (1 - w * h)
+    return 2c / (1 + sqrt(max(disc, zero(disc))))
+end
+
 # `_loo_density` on the unbounded line.
-_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
+_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
 
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ), with an optional
 # natural boundary at `lo`/`hi`: an unbiased estimate, up to the κ-independent ∫Q², of the
 # integrated squared error ∫(Q̂-Q)².
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
+    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi; kwargs...)
     N = sum(w)
     cross = zero(T)
     for i in eachindex(w, looi)
@@ -2469,17 +2486,17 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
 end
 
 # `_lscv` on the unbounded line.
-_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
-_lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
+_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
+_lscv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _lscv(nodes, w, κ, κ, κ; kwargs...)
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
 # κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv. A
 # non-positive Q̂₋ᵢ (the deleted field has collapsed at node i) makes the log undefined; return NaN
 # so the search rejects κ.
-function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
+    _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi; kwargs...)
     s = zero(T)
     for i in eachindex(w, looi)
         looi[i] > 0 || return T(NaN)
@@ -2489,12 +2506,13 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
 end
 
 # `_klcv` on the unbounded line.
-_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
-_klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
+_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
+_klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes, w, κ, κ, κ; kwargs...)
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                    holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -2513,10 +2531,12 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
-Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
-rounded data instead resemble a discrete distribution, for which `LSCV` decreases without bound
-as `κ → ∞` (finer scales keep resolving the atoms); `select_kappa_cv` then returns a large `κ`.
-Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
+`holdout` chooses what each held-out term leaves out: `:location` (the default) all
+observations at the held-out value, `:observation` just one of them. The two agree when every
+value is distinct. Cross-validation assumes the data are draws from a continuous density. On
+heavily tied or coarsely rounded data, leaving out a single copy of a repeated value rewards
+density spikes at the repeated values, and `:observation` then selects a large `κ`. `:location`
+removes that incentive, but the fit still treats the repeated values as exact points.
 
 # Extended help
 
@@ -2526,11 +2546,12 @@ the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per
 needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf)) =
-    _select_by_score(_lscv, x, κs, rtol, support)
+               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
+    _select_by_score(_lscv, x, κs, rtol, support; holdout)
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                    holdout=:location) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
 minimizing the mean negative leave-one-out log-likelihood
@@ -2550,11 +2571,13 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
-Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
-rounded data instead resemble a discrete distribution, for which the leave-one-out log-likelihood
-increases without bound as `κ → ∞` (leaving out one of many coincident copies barely perturbs the
-fit); `select_kappa_kl` then returns a large `κ`. Prefer [`select_kappa_ms`](@ref) or
-[`kappa_interval`](@ref), which stay bounded, in that regime.
+`holdout` chooses what each held-out term leaves out: `:location` (the default) all
+observations at the held-out value, `:observation` just one of them. The two agree when every
+value is distinct. Cross-validation assumes the data are draws from a continuous density. On
+heavily tied or coarsely rounded data, leaving out a single copy of a repeated value barely
+perturbs the fit, so the leave-one-out log-likelihood rewards density spikes at the repeated
+values and `:observation` then selects a large `κ`. `:location` removes that incentive, but the
+fit still treats the repeated values as exact points.
 
 # Extended help
 
@@ -2571,15 +2594,15 @@ to over-fitting — so no per-point refitting is needed and the score costs `O(N
 minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf)) =
-    _select_by_score(_klcv, x, κs, rtol, support)
+               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
+    _select_by_score(_klcv, x, κs, rtol, support; holdout)
 
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
-# search. `scorefun(nodes, w, κ, κ, κ, lo, hi)` returns the score for the merged nodes/weights at
-# scale κ. A near-coincident pair left unmerged at very large κ can drive the fit to a non-finite
-# score; those are treated as +∞ so the search never selects a degenerate scale.
+# search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
+# nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
+# to a non-finite score; those are treated as +∞ so the search never selects a degenerate scale.
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
-                          support::Tuple{Real,Real})
+                          support::Tuple{Real,Real}; holdout::Symbol=:location)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
@@ -2590,7 +2613,7 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
     r = T(rtol)
-    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi); isfinite(v) ? v : typemax(T))
+    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout); isfinite(v) ? v : typemax(T))
     lnκ = log.(T.(κs))
     i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
     loκ = lnκ[max(i - 1, firstindex(lnκ))]

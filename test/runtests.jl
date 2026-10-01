@@ -307,8 +307,23 @@ end
         nt, wt = PenalizedDensity._merge_presorted(sort(round.(x ./ 0.05) .* 0.05), 1e-8)
         @test maximum(wt) > 5
         for κ0 in (1.5, 4.0)
-            @test PenalizedDensity._lscv(nt, wt, κ0) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
+            @test PenalizedDensity._lscv(nt, wt, κ0; holdout=:observation) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
         end
+        # The default leaves out every copy at a location; it matches the refit that drops the node.
+        function lscv_refit_location(nodes, weights, κ)
+            cross = 0.0
+            for i in eachindex(nodes)
+                keep = [j for j in eachindex(nodes) if j != i]
+                cross += weights[i] * PenalizedDensity._fit(nodes[keep], weights[keep], κ)(nodes[i])
+            end
+            di = PenalizedDensity._fit(copy(nodes), copy(weights), κ)
+            return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
+        end
+        for κ0 in (1.5, 4.0)
+            @test PenalizedDensity._lscv(nt, wt, κ0) ≈ lscv_refit_location(nt, wt, κ0) rtol = 5e-3
+        end
+        # On distinct points the two holdouts are the same score.
+        @test PenalizedDensity._lscv(xs, w, 4.0) == PenalizedDensity._lscv(xs, w, 4.0; holdout=:observation)
 
         # MISE targeting: on smooth data the cross-validated scale is finer than the
         # minimum-sensitivity scale and gives a smaller integrated squared error.
