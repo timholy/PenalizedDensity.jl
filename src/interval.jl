@@ -681,8 +681,9 @@ end
 
 # The reduced term φ of group `g` carrying multiplicity `r`, as a function of the amplitudes `vl`
 # at its nodes (`_group_nodes(g, m)`, the full-length `v` holding them): its value, the group
-# mass P, the root τ, and the gradient, Hessian, and mass gradient ∇ᵥP = 2n/D in those
-# amplitudes. With r = 0 the group's cells are empty (τ = 1) and φ is their flux term alone.
+# mass P, the root τ, the gradient, the Hessian `SymTridiagonal(hd, he) + γ·n nᵀ`, and the mass
+# gradient ∇ᵥP = 2n/D in those amplitudes. With r = 0 the group's cells are empty (τ = 1, γ = 0)
+# and φ is their flux term alone.
 function _group_local(L::_IntervalLayout{T}, g::_IntervalGroup{T}, r::T, v::Vector{T}, τ0::T) where {T}
     m = length(L.y)
     nodes = _group_nodes(g, m)
@@ -690,7 +691,7 @@ function _group_local(L::_IntervalLayout{T}, g::_IntervalGroup{T}, r::T, v::Vect
     f = first(nodes)
     τ = r > 0 ? _solve_tau(L, _IntervalGroup{T}(g.first, g.last, r), v, τ0) : one(T)
     φ = P = dQ = scale = zero(T)
-    gv = zeros(T, k); Hv = zeros(T, k, k); nvec = zeros(T, k)
+    gv = zeros(T, k); hd = zeros(T, k); he = zeros(T, max(k - 1, 0)); nvec = zeros(T, k)
     for c in g.first:g.last
         κ = _cell_kappa(L, c)
         m11, m12, n11, n12, d11, d12 = _cell_forms(L, c, κ^2 * τ)
@@ -703,7 +704,7 @@ function _group_local(L::_IntervalLayout{T}, g::_IntervalGroup{T}, r::T, v::Vect
             φ += a * v[i]^2 / 2
             scale += abs(a) * v[i]^2 / 2
             gv[ii] += a * v[i]
-            Hv[ii, ii] += a
+            hd[ii] += a
             nvec[ii] += n11 * v[i]
         else
             i = c - f + 1
@@ -711,23 +712,113 @@ function _group_local(L::_IntervalLayout{T}, g::_IntervalGroup{T}, r::T, v::Vect
             scale += (abs(a) * (v[c]^2 + v[c+1]^2) + 2abs(b * v[c] * v[c+1])) / 2
             gv[i] += a * v[c] + b * v[c+1]
             gv[i+1] += b * v[c] + a * v[c+1]
-            Hv[i, i] += a; Hv[i+1, i+1] += a
-            Hv[i, i+1] += b; Hv[i+1, i] += b
+            hd[i] += a; hd[i+1] += a
+            he[i] += b
             nvec[i] += n11 * v[c] + n12 * v[c+1]
             nvec[i+1] += n12 * v[c] + n11 * v[c+1]
         end
     end
     D = one(T)
+    γ = zero(T)
     if r > 0
         φ += r - r * log(P)
         scale += r * (1 + abs(log(P)))
         D = 1 - 2r * dQ / P^2
         γ = 4r / (P^2 * D)
-        for j in 1:k, i in 1:k
-            Hv[i, j] += γ * nvec[i] * nvec[j]
+    end
+    return (; φ, scale, P, τ, gv, hd, he, γ, nvec, gP = 2 .* nvec ./ D)
+end
+
+# The symmetric matrix  SymTridiagonal(d, e) + Σ_q γ[q]·n[q] n[q]ᵀ,  each n[q] supported on the
+# index range rq[q]: the Hessian, in the nodal amplitudes, of the exact terms of a local deletion
+# problem. Cell flux forms and point terms are tridiagonal; each occupied group adds one rank-one
+# term through its mass.
+struct _LocalHessian{T}
+    d::Vector{T}
+    e::Vector{T}
+    γ::Vector{T}
+    rq::Vector{UnitRange{Int}}
+    n::Vector{Vector{T}}
+end
+
+_plus_tri(H::_LocalHessian, S::SymTridiagonal) = _LocalHessian(H.d .+ S.dv, H.e .+ S.ev, H.γ, H.rq, H.n)
+
+function _dense(H::_LocalHessian{T}) where {T}
+    A = Matrix{T}(SymTridiagonal(H.d, H.e))
+    for q in eachindex(H.γ, H.rq, H.n)
+        r = H.rq[q]
+        A[r, r] .+= H.γ[q] .* H.n[q] .* H.n[q]'
+    end
+    return A
+end
+
+# The diagonal and first superdiagonal of H, rank-one terms included.
+function _tri_entries(H::_LocalHessian)
+    d, e = copy(H.d), copy(H.e)
+    for q in eachindex(H.γ, H.rq, H.n)
+        r, n, γ = H.rq[q], H.n[q], H.γ[q]
+        for (p, i) in pairs(r)
+            d[i] += γ * n[p]^2
+            p < length(r) && (e[i] += γ * n[p] * n[p+1])
         end
     end
-    return (; φ, scale, P, τ, gv, Hv, gP = 2 .* nvec ./ D)
+    return d, e
+end
+
+function _mul(H::_LocalHessian, x::AbstractVector)
+    y = SymTridiagonal(H.d, H.e) * x
+    for q in eachindex(H.γ, H.rq, H.n)
+        r = H.rq[q]
+        y[r] .+= (H.γ[q] * dot(H.n[q], view(x, r))) .* H.n[q]
+    end
+    return y
+end
+
+# H \ b by the Woodbury identity on the tridiagonal part, in O(k) per rank-one term. Returns
+# `nothing` unless the tridiagonal part is positive definite (its LDLᵀ pivots all positive);
+# the rank-one terms are positive semidefinite, so H is then positive definite too.
+function _solve_pd(H::_LocalHessian{T}, b::AbstractVector) where {T}
+    k = length(H.d)
+    piv = similar(H.d); l = similar(H.e)        # LDLᵀ of the tridiagonal part
+    piv[1] = H.d[1]
+    piv[1] > 0 || return nothing
+    for i in 2:k
+        l[i-1] = H.e[i-1] / piv[i-1]
+        piv[i] = H.d[i] - l[i-1] * H.e[i-1]
+        piv[i] > 0 || return nothing
+    end
+    function tsolve(rhs)
+        z = collect(T, rhs)
+        for i in 2:k
+            z[i] -= l[i-1] * z[i-1]
+        end
+        z ./= piv
+        for i in k-1:-1:1
+            z[i] -= l[i] * z[i+1]
+        end
+        return z
+    end
+    x = tsolve(b)
+    qs = [q for q in eachindex(H.γ) if H.γ[q] != 0]
+    isempty(qs) && return x
+    p = length(qs)
+    W = Matrix{T}(undef, k, p)                  # T⁻¹U
+    C = zeros(T, p, p)                          # Γ⁻¹ + UᵀT⁻¹U
+    for (c, q) in pairs(qs)
+        u = zeros(T, k)
+        u[H.rq[q]] .= H.n[q]
+        W[:, c] = tsolve(u)
+        C[c, c] += 1 / H.γ[q]
+    end
+    Utx = zeros(T, p)
+    for (c, q) in pairs(qs)
+        r = H.rq[q]
+        Utx[c] = dot(H.n[q], view(x, r))
+        for (c2, q2) in pairs(qs)
+            C[c2, c] += dot(H.n[q2], view(W, H.rq[q2], c))
+        end
+    end
+    return x .- W * (cholesky(Symmetric(C)) \ Utx)
 end
 
 # ∇ᵥZ, the gradient of the unnormalized mass in the nodal amplitudes, given each group's ∇ᵥP.
@@ -788,12 +879,16 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
     Z = E.Z
     v = sqrt.(s)
     chol = _banded_cholesky!(copy(E.band))
+    dl = chol[1, :]
+    dr = _reverse_cholesky_diag(E.band)
     Ks = _banded_inverse_band(chol)             # band of the inverse Hessian in s
     Kv(i, j) = (i >= j ? Ks[1+i-j, j] : Ks[1+j-i, i]) / (4 * v[i] * v[j])   # ∇²ᵥΦ = 4V(∇²ₛΦ)V
     Kvblock(r) = _inverse_block(chol, Ks, r) ./ (4 .* v[r] .* v[r]')
     locals = [_group_local(L, g, g.r, v, E.τ[j]) for (j, g) in pairs(L.groups)]
     gZ = _grad_Z(L, v, (loc.gP for loc in locals))
     KgZ = _banded_solve!(chol, gZ ./ (2 .* v)) ./ (2 .* v)                  # K_v ∇ᵥZ
+    # With (K_ll)⁻¹ = S + H, the first-order change in Z is (K∇Z)ₗᵀ(K_ll)⁻¹δ - ∇Pᵀδ.
+    dZ(nodes, loc, Kinv, δ) = dot(KgZ[nodes], _mul(Kinv, δ)) - dot(loc.gP, δ)
     lp = fill(T(NaN), length(L.groups))
     for (j, g) in pairs(L.groups)
         js = _with_neighbors(L, [j])            # js[1] == j
@@ -802,8 +897,8 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
         pw = L.w[nodes]
         rs = [gq.r for gq in gs]
         loc = _local_terms(L, gs, rs, E.τ[js], nodes, pw, v)
-        Kll = Kvblock(nodes)
-        S = inv(Kll) - loc.Hv                   # the rest's Hessian, reduced onto the local nodes
+        S = _rest_hessian(E.band, dl, dr, v, nodes, loc.H)
+        Kinv = _plus_tri(loc.H, S)              # (K_ll)⁻¹
         rs[1] -= 1
         vl, new, resolved = _delete_local(L, gs, rs, pw, v, nodes, loc, S, E.τ[js])
         δ = vl .- v[nodes]
@@ -812,10 +907,10 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
         lP = any(resolved[own]) ? log(new.Ps[1]) : T(NaN)
         Pm = new.P
         if _empties_isolated(L, g)
-            lP, δ = _emptied_group(L, g, v, nodes, Kll \ δ, Kvblock)
+            lP, δ = _emptied_group(L, g, v, nodes, _mul(Kinv, δ), Kvblock)
             Pm = exp(lP)
         end
-        Zm = Z - loc.P + Pm + dot(KgZ[nodes] .- Kll * loc.gP, Kll \ δ)
+        Zm = Z - loc.P + Pm + dZ(nodes, loc, Kinv, δ)
         isfinite(lP) && Zm > 0 && (lp[j] = lP - log(Zm))
     end
     ld = fill(T(NaN), m)
@@ -838,10 +933,9 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
             rs = [g.r for g in gs]
             loc = _local_terms(L, gs, rs, E.τ[js], nodes, pw, v)
             pw[i-first(nodes)+1] -= c
-            Kll = Kvblock(nodes)
-            S = inv(Kll) - loc.Hv
+            S = _rest_hessian(E.band, dl, dr, v, nodes, loc.H)
             vl, new, resolved = _delete_local(L, gs, rs, pw, v, nodes, loc, S, E.τ[js])
-            Zm = Z - loc.P + new.P + dot(KgZ[nodes] .- Kll * loc.gP, Kll \ (vl .- v[nodes]))
+            Zm = Z - loc.P + new.P + dZ(nodes, loc, _plus_tri(loc.H, S), vl .- v[nodes])
             p = i - first(nodes) + 1
             lv2 = resolved[p] ? 2 * log(vl[p]) : T(NaN)
         elseif c == w
@@ -901,7 +995,9 @@ function _emptied_group(L::_IntervalLayout{T}, g::_IntervalGroup{T}, v::Vector{T
                         y::Vector{T}, Kvblock) where {T}
     m = length(L.y)
     k = length(nodes)
-    C = _group_local(L, g, zero(T), v, one(T)).Hv
+    C = let loc = _group_local(L, g, zero(T), v, one(T))
+        Matrix{T}(SymTridiagonal(loc.hd, loc.he))
+    end
     ext = max(first(nodes) - 1, 1):min(last(nodes) + 1, m)
     Kext = Kvblock(ext)
     Kvfar(i, j) = Kext[i-first(ext)+1, j-first(ext)+1]
@@ -927,28 +1023,59 @@ end
 # The exact terms of a local deletion problem on the contiguous `nodes`, summed: each group
 # `gs[q]` at multiplicity `rs[q]` (seeded by `τs[q]`), and point terms -2pw[p] ln v at
 # nodes[p]. Returns their value, scale, total mass P, the groups' roots τ, and the gradient,
-# Hessian, and mass gradient in the amplitudes at `nodes`.
+# Hessian (a `_LocalHessian`), and mass gradient in the amplitudes at `nodes`.
 function _local_terms(L::_IntervalLayout{T}, gs, rs, τs, nodes, pw::Vector{T}, v::Vector{T}) where {T}
     m = length(L.y)
     k = length(nodes)
     φ = scale = P = zero(T)
-    gv = zeros(T, k); Hv = zeros(T, k, k); gP = zeros(T, k)
+    gv = zeros(T, k); hd = zeros(T, k); he = zeros(T, k - 1); gP = zeros(T, k)
+    γ = zeros(T, length(gs)); rq = Vector{UnitRange{Int}}(undef, length(gs)); ns = Vector{Vector{T}}(undef, length(gs))
     τ = collect(T, τs)
     Ps = similar(τ)
     for q in eachindex(gs, rs, τ)
         loc = _group_local(L, gs[q], rs[q], v, τ[q])
         idx = _group_nodes(gs[q], m) .- (first(nodes) - 1)
         φ += loc.φ; scale += loc.scale; P += loc.P; Ps[q] = loc.P; τ[q] = loc.τ
-        gv[idx] .+= loc.gv; Hv[idx, idx] .+= loc.Hv; gP[idx] .+= loc.gP
+        gv[idx] .+= loc.gv; gP[idx] .+= loc.gP
+        hd[idx] .+= loc.hd; he[first(idx):last(idx)-1] .+= loc.he
+        γ[q] = loc.γ; rq[q] = idx; ns[q] = loc.nvec
     end
     for (p, i) in pairs(nodes)
         pw[p] == 0 && continue
         φ -= 2pw[p] * log(v[i])
         scale += 2pw[p] * abs(log(v[i]))
         gv[p] -= 2pw[p] / v[i]
-        Hv[p, p] += 2pw[p] / v[i]^2
+        hd[p] += 2pw[p] / v[i]^2
     end
-    return (; φ, scale, P, Ps, τ, gv, Hv, gP)
+    return (; φ, scale, P, Ps, τ, gv, H=_LocalHessian(hd, he, γ, rq, ns), gP)
+end
+
+# The Hessian of the rest of the problem (all but the exact local terms with Hessian `H`) reduced
+# onto the contiguous `nodes`, (K_ll)⁻¹ - H, in the amplitudes. `band` is ∇²ₛΦ at the fit `v`;
+# `dl[i]²` and `dr[i]²` are the Schur complements at node i of the nodes left and right of it (the
+# squared Cholesky pivots of ∇²ₛΦ in forward and reverse order). The nodes outside `nodes` couple
+# only to its two end nodes, because no group straddles them, so (K_ll)⁻¹ is ∇²ᵥΦ on the block
+# with the end diagonals replaced by those Schur complements; the exact terms' rank-one parts
+# cancel, and the result is tridiagonal.
+function _rest_hessian(band::Matrix{T}, dl::Vector{T}, dr::Vector{T}, v::Vector{T}, nodes,
+                       H::_LocalHessian{T}) where {T}
+    d, e = _tri_entries(H)
+    a, b = first(nodes), last(nodes)
+    sd = [4 * v[i]^2 * (i == a ? dl[a]^2 : i == b ? dr[b]^2 : band[1, i]) for i in nodes] .- d
+    se = [4 * v[i] * v[i+1] * band[2, i] for i in a:b-1] .- e
+    return SymTridiagonal(sd, se)
+end
+
+# Diagonal of the Cholesky factor of the banded matrix `band` (lower-band layout) taken in
+# reverse node order, indexed by the original nodes.
+function _reverse_cholesky_diag(band::Matrix{T}) where {T}
+    nb, m = size(band)
+    R = zeros(T, nb, m)
+    for j in 1:m, d in 0:nb-1
+        j + d <= m && (R[1+d, j] = band[1+d, m+1-j-d])
+    end
+    _banded_cholesky!(R)
+    return reverse(R[1, :])
 end
 
 # Indices of the groups in `js` together with the groups occupying the cells just outside each.
@@ -983,10 +1110,9 @@ _span_nodes(gs, m::Int) = minimum(g -> first(_group_nodes(g, m)), gs):maximum(g 
 # held positive by dividing them by 100 whenever the step would overshoot; they are reported as
 # unresolved, and a caller that needs one of their values must not use it.
 function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T}, nodes,
-                       loc, S::Matrix{T}, τ0) where {T}
+                       loc, S::SymTridiagonal{T}, τ0) where {T}
     v0 = v[nodes]
     w = copy(v)
-    τ = τ0
     resolved = trues(length(v0))
     function advance(vl, α, step)
         vn = vl .- α .* step
@@ -995,14 +1121,14 @@ function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T
         end
         return vn
     end
-    function model!(vl)
+    function model!(vl, τ)                      # τ seeds the groups' root solves
         w[nodes] .= vl
         new = _local_terms(L, gs, rs, τ, nodes, pw, w)
         Δ = vl .- v0
         return new.φ - dot(loc.gv, Δ) + dot(Δ, S * Δ) / 2, new
     end
     vl = copy(v0)
-    f, cur = model!(vl)
+    f, cur = model!(vl, τ0)
     tol = eps(T)^(3 // 4)
     converged = unguarded = false
     prevstep = T(Inf)
@@ -1010,15 +1136,22 @@ function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T
         τ = cur.τ
         Δ = vl .- v0
         grad = cur.gv .- loc.gv .+ S * Δ
-        Hm = Symmetric(cur.Hv .+ S)
-        F = cholesky(Hm; check=false)
-        μ = zero(T)
-        while !issuccess(F)                     # far from the minimizer: regularize to descend
-            μ = max(2μ, sqrt(eps(T)) * maximum(abs, Hm))
-            F = cholesky(Hm + μ * I; check=false)
+        Hm = _plus_tri(cur.H, S)
+        step = _solve_pd(Hm, grad)
+        if step === nothing
+            Hd = Symmetric(_dense(Hm))
+            F = cholesky(Hd; check=false)
+            μ = zero(T)
+            while !issuccess(F)                 # far from the minimizer: regularize to descend
+                μ = max(2μ, sqrt(eps(T)) * maximum(abs, Hd))
+                F = cholesky(Hd + μ * I; check=false)
+            end
+            step = F \ grad
         end
-        step = F \ grad
-        relstep = maximum(i -> resolved[i] ? abs(step[i]) / vl[i] : zero(T), eachindex(vl, step))
+        relstep = zero(T)
+        for i in eachindex(vl, step)
+            resolved[i] && (relstep = max(relstep, abs(step[i]) / vl[i]))
+        end
         # Converged, or at the floor roundoff imposes (unguarded steps no longer shrinking).
         if relstep <= tol || (unguarded && relstep >= prevstep)
             converged = true
@@ -1037,11 +1170,11 @@ function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T
         unguarded |= !guarded
         if !guarded
             vl = advance(vl, α, step)
-            f, cur = model!(vl)
+            f, cur = model!(vl, τ)
         end
         while guarded
             vn = advance(vl, α, step)
-            fn, new = model!(vn)
+            fn, new = model!(vn, τ)
             if fn <= f || α * relstep <= eps(T)
                 vl = vn
                 f, cur = fn, new

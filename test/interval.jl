@@ -1,6 +1,6 @@
 # Tests of IntervalDensityEstimate. Included from runtests.jl.
 
-using LinearAlgebra: dot
+using LinearAlgebra: diag, dot
 using SparseArrays: sparse
 
 # Finite-difference reference for the interval likelihood, independent of the package: minimize
@@ -436,6 +436,55 @@ end
             Hinv = inv(H)
             for r in (1:m, 2:6, 4:4, m-bw-1:m)
                 @test PenalizedDensity._inverse_block(chol, K, r) ≈ Hinv[r, r]
+            end
+        end
+    end
+
+    @testset "tridiagonal-plus-rank-one local Hessians" begin
+        rng = Xoshiro(8)
+        k = 12
+        d = 3 .+ rand(rng, k); e = randn(rng, k - 1) / 2
+        # Groups share their end nodes, as adjacent groups in a local set do.
+        H = PenalizedDensity._LocalHessian(d, e, [0.7, 0.0, 2.5], [1:5, 5:9, 9:12],
+                                           [randn(rng, 5), randn(rng, 5), randn(rng, 4)])
+        A = PenalizedDensity._dense(H)
+        @test A ≈ A'
+        @test A[1:4, 1:4] ≈ Matrix(SymTridiagonal(d, e))[1:4, 1:4] + 0.7 * H.n[1][1:4] * H.n[1][1:4]'
+        x = randn(rng, k)
+        @test PenalizedDensity._mul(H, x) ≈ A * x
+        @test PenalizedDensity._solve_pd(H, x) ≈ A \ x
+        dd, ee = PenalizedDensity._tri_entries(H)
+        @test dd ≈ diag(A) && ee ≈ diag(A, 1)
+        # An indefinite tridiagonal part is declined, even where the rank-one terms would repair it.
+        Hneg = PenalizedDensity._LocalHessian([d[1:end-1]; -0.1], e, H.γ, H.rq, H.n)
+        @test PenalizedDensity._solve_pd(Hneg, x) === nothing
+    end
+
+    @testset "the rest's Hessian on a local set is tridiagonal" begin
+        # Exact points inside wide intervals give local sets of many nodes. The reduced Hessian
+        # (K_ll)⁻¹ - H, formed from Schur complements at the two end nodes, must equal the inverse
+        # of the dense block of the inverse Hessian.
+        rng = Xoshiro(9)
+        x = randn(rng, 200)
+        exact = rand(rng, 200) .< 0.5
+        lower = ifelse.(exact, x, 0.5 .* floor.(x ./ 0.5)); upper = ifelse.(exact, x, lower .+ 0.5)
+        for κ in (1.0, 20.0)
+            L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), -Inf, Inf)
+            m = length(L.y)
+            s, E = PenalizedDensity._solve_interval(L)
+            v = sqrt.(s)
+            chol = PenalizedDensity._banded_cholesky!(copy(E.band))
+            K = PenalizedDensity._banded_inverse_band(chol)
+            dr = PenalizedDensity._reverse_cholesky_diag(E.band)
+            for j in eachindex(L.groups)
+                js = PenalizedDensity._with_neighbors(L, [j])
+                gs = L.groups[js]
+                nodes = PenalizedDensity._span_nodes(gs, m)
+                loc = PenalizedDensity._local_terms(L, gs, [g.r for g in gs], E.τ[js], nodes, L.w[nodes], v)
+                Kll = PenalizedDensity._inverse_block(chol, K, nodes) ./ (4 .* v[nodes] .* v[nodes]')
+                S = PenalizedDensity._rest_hessian(E.band, chol[1, :], dr, v, nodes, loc.H)
+                ref = inv(Kll) - PenalizedDensity._dense(loc.H)
+                @test Matrix(S) ≈ ref atol = 1e-6 * maximum(abs, ref)
             end
         end
     end
