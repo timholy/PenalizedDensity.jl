@@ -2390,9 +2390,10 @@ function _invert_monotone(h, target::T) where {T}
     return exp((lnlo + lnhi) / 2)
 end
 
-# Diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from the top-down and
-# bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ - aᵢ), with aᵢ the original diagonal.
-function _inv_diag(H::SymTridiagonal{T}) where {T}
+# Diagonal and first off-diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from
+# the top-down and bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ - aᵢ), with aᵢ the original
+# diagonal, and (H⁻¹)ᵢ,ᵢ₊₁ = -bᵢ (H⁻¹)ᵢ₊₁,ᵢ₊₁ / dᵢ.
+function _inv_band(H::SymTridiagonal{T}) where {T}
     a, b = H.dv, H.ev
     n = length(a)
     d = similar(a); δ = similar(a)
@@ -2404,8 +2405,15 @@ function _inv_diag(H::SymTridiagonal{T}) where {T}
     for i in n-1:-1:1
         δ[i] = a[i] - b[i]^2 / δ[i+1]
     end
-    return inv.(d .+ δ .- a)
+    g = inv.(d .+ δ .- a)
+    return g, [-b[i] * g[i+1] / d[i] for i in 1:n-1]
 end
+
+# ln(-Mₖ,ₖ₊₁) for the operator `_operator` assembles with reference scale κ̄, formed directly so
+# that it stays finite where csch(κh) underflows.
+_log_coupling(x::Vector{T}, κ::T, κ̄::T, k::Int) where {T} = -logabssinh(κ * (x[k+1] - x[k]))
+_log_coupling(x::Vector{T}, κs::Vector{T}, κ̄::T, k::Int) where {T} =
+    log(κ̄ / κs[k]) - logabssinh(κs[k] * (x[k+1] - x[k]))
 
 # Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
 # one observation at node i decrements wᵢ; the deleted field is a Newton step of that problem from
@@ -2419,47 +2427,102 @@ end
 # Zₜ = Z - 2t vᵢ/φᵢ with v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ, Z = ∫φ² = φᵀGφ), so Q̂₋ᵢ(xᵢ) = (φᵢ(1 - t h))² / Zₜ.
 #
 # A node isolated at unit weight sits at the double root: its own stationarity gives Mᵢᵢφᵢ² = wᵢ, so
-# h = 1/2, the discriminant vanishes and t = 2 drives the deleted amplitude to zero. Rounding can
-# carry the discriminant just below zero there, hence the clamp — without it the root jumps to the
-# linear step, which reports a finite deleted density where the field has in fact collapsed and so
-# scores such a κ as if it fit well. With the clamp `_klcv` sees Q̂₋ᵢ ≤ 0 and rejects the scale.
+# h = 1/2, the discriminant vanishes and t = 2. Rounding can carry the discriminant just below zero
+# there, hence the clamp in `_deletion_step`.
 #
 # t and its inputs are dimensionless or scale like Z, so — as for the linear step — nothing depends
 # on M's entries beyond its being the fixed SPD operator with mass functional Z: it holds unchanged
 # for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
 #
 # The step tracks a literal leave-one-out refit (wᵢ decremented, a singleton node dropped) closely
-# across the scale range on continuous data; on heavily tied data the linearized normalization can
-# drift the score's flat tail and select too rough a scale, the regime where `select_kappa_ms` and
-# `kappa_interval` are preferred anyway.
-function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
+# across the scale range on continuous data.
+#
+# `holdout = :location` instead deletes all wᵢ observations at node i, the held-out value then
+# lying away from every atom of the remaining sample. Deleting c observations (c = 1 or wᵢ) takes
+# the step τ = c·t along the same direction, with node i's stationarity at weight wᵢ - c fixing
+# τ²h(1 - wᵢh) - τ + c = 0; the root continuous with the first-order step is
+# τ = 2c/(1 + √(1 - 4ch(1 - wᵢh))), the node amplitude becomes φᵢ(1 - τh), and Zₜ = Z - 2τvᵢ/φᵢ.
+# For c = wᵢ the discriminant is (1 - 2wᵢh)² and the node collapses at wᵢh = 1/2, as a single
+# isolated point does at h = 1/2. At wᵢ = 1 the two modes coincide. On tied data, leaving out a
+# single copy of a repeated value rewards spikes at the atoms, so `:location` is the default.
+#
+# When all of node i's observations are deleted (c = wᵢ), node i's stationarity at weight zero is
+# source-free, (Mφ')ᵢ = 0, so the deleted amplitude is also φ'ᵢ = Σⱼ (-Mᵢⱼ) φ'ⱼ / Mᵢᵢ over the
+# neighbors j = i ± 1, which move by the same step, φ'ⱼ = φⱼ - τ (H⁻¹)ⱼᵢ/φᵢ. The two forms agree
+# exactly, but φᵢ(1 - τh) cancels to roundoff at an isolated node (h → 1/(2wᵢ)), where the held-out
+# density is of order e^{-2κ·gap}; the neighbor sum has positive terms and is formed in the log
+# domain, so it holds its relative accuracy there. That form is used whenever c = wᵢ.
+#
+# Returns ψ, the log of each squared deleted amplitude (NaN where a neighbor's linear update is
+# not positive), and each deleted normalization Zₜ; see `_loo_density` and `_loo_logdensity`.
+function _loo_terms(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+                    holdout::Symbol=:location) where {T}
+    holdout in (:location, :observation) ||
+        throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
     M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
     Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
     H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
-    gii = _inv_diag(H)
-    v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, gii already extracted
-    ψ = φ ./ sqrt(Z)
-    looi = similar(φ)
+    gii, gnext = _inv_band(H)
+    v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, its inverse band already extracted
+    κ̄ = _reference_scale(κ, κL, κR)
+    n = length(φ)
+    la2 = similar(φ)
+    Zt = similar(φ)
     for i in eachindex(φ, w)
         h = gii[i] / φ[i]^2                             # single-observation leverage
-        disc = 1 - 4 * h * (1 - w[i] * h)               # ≥ 0 since h(1-wᵢh) ≤ 1/4
-        t = 2 / (1 + sqrt(max(disc, zero(disc))))       # nonlinear step length, →1 as h→0
-        Zt = Z - 2 * t * v[i] / φ[i]
-        looi[i] = (φ[i] * (1 - t * h))^2 / Zt
+        c = holdout === :location ? w[i] : one(T)       # observations deleted
+        τ = _deletion_step(h, w[i], c)
+        Zt[i] = Z - 2 * τ * v[i] / φ[i]
+        if c == w[i]
+            l = T(-Inf)
+            if i > 1
+                φj = φ[i-1] - τ * gnext[i-1] / φ[i]
+                l = φj > 0 ? logaddexp(l, _log_coupling(nodes, κ, κ̄, i - 1) + log(φj)) : T(NaN)
+            end
+            if i < n
+                φj = φ[i+1] - τ * gnext[i] / φ[i]
+                l = φj > 0 ? logaddexp(l, _log_coupling(nodes, κ, κ̄, i) + log(φj)) : T(NaN)
+            end
+            la2[i] = 2 * (l - log(M.dv[i]))
+        else
+            la2[i] = log((φ[i] * (1 - τ * h))^2)
+        end
     end
-    return ψ, looi
+    return φ ./ sqrt(Z), la2, Zt
+end
+
+# Normalized amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node (see `_loo_terms`).
+function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+                      kwargs...) where {T}
+    ψ, la2, Zt = _loo_terms(nodes, w, κ, κL, κR, lo, hi; kwargs...)
+    return ψ, exp.(la2) ./ Zt
+end
+
+# ψ and the leave-one-out log densities ln Q̂₋ᵢ(xᵢ), NaN where the deleted fit is undefined (a
+# non-positive normalization or neighbor update).
+function _loo_logdensity(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+                         kwargs...) where {T}
+    ψ, la2, Zt = _loo_terms(nodes, w, κ, κL, κR, lo, hi; kwargs...)
+    return ψ, [Zt[i] > 0 ? la2[i] - log(Zt[i]) : T(NaN) for i in eachindex(la2, Zt)]
+end
+
+# The step τ for deleting c of the w observations at a node of leverage h (see `_loo_density`).
+# The discriminant is ≥ 0 for c ∈ {1, w}, up to the rounding the clamp absorbs.
+function _deletion_step(h::T, w::T, c::T) where {T}
+    disc = 1 - 4 * c * h * (1 - w * h)
+    return 2c / (1 + sqrt(max(disc, zero(disc))))
 end
 
 # `_loo_density` on the unbounded line.
-_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
+_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
 
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ), with an optional
 # natural boundary at `lo`/`hi`: an unbiased estimate, up to the κ-independent ∫Q², of the
 # integrated squared error ∫(Q̂-Q)².
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
+    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi; kwargs...)
     N = sum(w)
     cross = zero(T)
     for i in eachindex(w, looi)
@@ -2469,32 +2532,32 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
 end
 
 # `_lscv` on the unbounded line.
-_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
-_lscv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _lscv(nodes, w, κ, κ, κ)
+_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
+_lscv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _lscv(nodes, w, κ, κ, κ; kwargs...)
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
-# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv. A
-# non-positive Q̂₋ᵢ (the deleted field has collapsed at node i) makes the log undefined; return NaN
-# so the search rejects κ.
-function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
-    _, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi)
+# κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv, in
+# the log domain. An undefined held-out log density returns NaN so the search rejects κ.
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
+    _, ℓ = _loo_logdensity(nodes, w, κ, κL, κR, lo, hi; kwargs...)
     s = zero(T)
-    for i in eachindex(w, looi)
-        looi[i] > 0 || return T(NaN)
-        s += w[i] * log(looi[i])
+    for i in eachindex(w, ℓ)
+        isfinite(ℓ[i]) || return T(NaN)
+        s += w[i] * ℓ[i]
     end
     return -s / sum(w)
 end
 
 # `_klcv` on the unbounded line.
-_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf))
-_klcv(nodes::Vector{T}, w::Vector{T}, κ::T) where {T} = _klcv(nodes, w, κ, κ, κ)
+_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
+    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
+_klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes, w, κ, κ, κ; kwargs...)
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
+    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                    holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -2513,10 +2576,12 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
-Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
-rounded data instead resemble a discrete distribution, for which `LSCV` decreases without bound
-as `κ → ∞` (finer scales keep resolving the atoms); `select_kappa_cv` then returns a large `κ`.
-Prefer [`select_kappa_ms`](@ref) or [`kappa_interval`](@ref), which stay bounded, in that regime.
+`holdout` chooses what each held-out term leaves out: `:location` (the default) all
+observations at the held-out value, `:observation` just one of them. The two agree when every
+value is distinct. Cross-validation assumes the data are draws from a continuous density. On
+heavily tied or coarsely rounded data, leaving out a single copy of a repeated value rewards
+density spikes at the repeated values, and `:observation` then selects a large `κ`. `:location`
+removes that incentive, but the fit still treats the repeated values as exact points.
 
 # Extended help
 
@@ -2526,11 +2591,12 @@ the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per
 needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf)) =
-    _select_by_score(_lscv, x, κs, rtol, support)
+               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
+    _select_by_score(_lscv, x, κs, rtol, support; holdout)
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
+    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                    holdout=:location) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
 minimizing the mean negative leave-one-out log-likelihood
@@ -2550,11 +2616,13 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
-Cross-validation assumes the data are draws from a continuous density. Heavily tied or coarsely
-rounded data instead resemble a discrete distribution, for which the leave-one-out log-likelihood
-increases without bound as `κ → ∞` (leaving out one of many coincident copies barely perturbs the
-fit); `select_kappa_kl` then returns a large `κ`. Prefer [`select_kappa_ms`](@ref) or
-[`kappa_interval`](@ref), which stay bounded, in that regime.
+`holdout` chooses what each held-out term leaves out: `:location` (the default) all
+observations at the held-out value, `:observation` just one of them. The two agree when every
+value is distinct. Cross-validation assumes the data are draws from a continuous density. On
+heavily tied or coarsely rounded data, leaving out a single copy of a repeated value barely
+perturbs the fit, so the leave-one-out log-likelihood rewards density spikes at the repeated
+values and `:observation` then selects a large `κ`. `:location` removes that incentive, but the
+fit still treats the repeated values as exact points.
 
 # Extended help
 
@@ -2571,15 +2639,15 @@ to over-fitting — so no per-point refitting is needed and the score costs `O(N
 minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
 select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf)) =
-    _select_by_score(_klcv, x, κs, rtol, support)
+               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
+    _select_by_score(_klcv, x, κs, rtol, support; holdout)
 
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
-# search. `scorefun(nodes, w, κ, κ, κ, lo, hi)` returns the score for the merged nodes/weights at
-# scale κ. A near-coincident pair left unmerged at very large κ can drive the fit to a non-finite
-# score; those are treated as +∞ so the search never selects a degenerate scale.
+# search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
+# nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
+# to a non-finite score; those are treated as +∞ so the search never selects a degenerate scale.
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
-                          support::Tuple{Real,Real})
+                          support::Tuple{Real,Real}; holdout::Symbol=:location)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
@@ -2590,7 +2658,7 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
     r = T(rtol)
-    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi); isfinite(v) ? v : typemax(T))
+    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout); isfinite(v) ? v : typemax(T))
     lnκ = log.(T.(κs))
     i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
     loκ = lnκ[max(i - 1, firstindex(lnκ))]
@@ -2711,7 +2779,7 @@ end
 # `_score_kappa` does). Each observation takes the value at the node it merged into; merging
 # collapses contiguous runs of `xs`, so node i covers the next `w[i]` observations in order.
 # Hence `-mean` of the result is `_klcv` on the same nodes, up to rounding. Entries whose node has
-# a non-positive leave-one-out density are NaN, and an unresolvable candidate (fewer than two
+# an undefined leave-one-out log density are NaN, and an unresolvable candidate (fewer than two
 # nodes, or an exact zero pivot) returns all NaN, matching the NaN score `_klcv`/`_score_kappa`
 # report in those cases.
 function _loo_logdensities(xs::Vector{T}, κ::Real, rtol::T, lo::T, hi::T) where {T}
@@ -2728,8 +2796,8 @@ function _loo_logdensities(xs::Vector{T}, nodes::Vector{T}, w::Vector{T}, κ, κ
                            lo::T, hi::T) where {T}
     ℓ = fill(T(NaN), length(xs))
     length(nodes) >= 2 || return ℓ
-    looi = try
-        _loo_density(nodes, w, κ, κL, κR, lo, hi)[2]
+    ℓnode = try
+        _loo_logdensity(nodes, w, κ, κL, κR, lo, hi)[2]
     catch e
         e isa ZeroPivotException && return ℓ
         rethrow()
@@ -2737,8 +2805,8 @@ function _loo_logdensities(xs::Vector{T}, nodes::Vector{T}, w::Vector{T}, κ, κ
     sum(w) == length(xs) ||
         error("merged weights sum to $(sum(w)), but the sample has $(length(xs)) observations")
     j = firstindex(ℓ)
-    for i in eachindex(w, looi)
-        v = looi[i] > 0 ? log(looi[i]) : T(NaN)
+    for i in eachindex(w, ℓnode)
+        v = isfinite(ℓnode[i]) ? ℓnode[i] : T(NaN)
         m = Int(w[i])               # an integer count: merging only ever adds oneunit(T)
         ℓ[j:j+m-1] .= v
         j += m
@@ -2785,9 +2853,17 @@ const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum befor
 # a regime where the first-order LOO expansion is no longer trustworthy and spuriously reports
 # ever-improving scores (observed directly: KLCV score turning unboundedly negative for
 # κ ≳ 1e6 on data where every sane candidate sits below 1e4).
-function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::Int=_CITERS,
-                   maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
-                   bounds::Union{Nothing,Tuple{Real,Real}}=nothing) where {T}
+#
+# The returned c never scores non-finite: if the golden-section refinement ends on an
+# unresolvable c, the best grid point is returned instead.
+_select_c(score, c0; kwargs...) = first(_select_c_scored(score, c0; kwargs...))
+
+# `_select_c`, returning `(c, score(c))`, with `score(c)` finite. With `skip_unresolved=true`, a
+# bracket with no resolvable candidate returns `nothing` instead of throwing.
+function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::Int=_CITERS,
+                          maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
+                          bounds::Union{Nothing,Tuple{Real,Real}}=nothing,
+                          skip_unresolved::Bool=false) where {T}
     f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
     lnspan = log(T(span))
     lnbounds = bounds === nothing ? nothing : (log(T(bounds[1])), log(T(bounds[2])))
@@ -2795,22 +2871,32 @@ function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::In
         loln, hiln = log(c0) - lnspan, log(c0) + lnspan
         if lnbounds !== nothing
             loln, hiln = max(loln, lnbounds[1]), min(hiln, lnbounds[2])
-            loln < hiln || return exp(clamp(log(c0), lnbounds[1], lnbounds[2]))
+            if !(loln < hiln)
+                l = clamp(log(c0), lnbounds[1], lnbounds[2])
+                fl = f(l)
+                fl < typemax(T) && return exp(l), fl
+                skip_unresolved && return nothing
+                error("no resolvable $label at the clamped bound c = $(exp(l))")
+            end
         end
         lncs = range(loln, hiln; length=ngrid)
         scores = Vector{T}(undef, ngrid)
         for j in (reverse ? (ngrid:-1:1) : (1:ngrid))
             scores[j] = f(lncs[j])
         end
-        all(==(typemax(T)), scores) &&
+        if all(==(typemax(T)), scores)
+            skip_unresolved && return nothing
             error("no resolvable $label anywhere in the search bracket around c = $c0")
+        end
         i = argmin(scores)
         if i != firstindex(lncs) && i != lastindex(lncs)
-            return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters))
+            l = _golden_min(f, lncs[i-1], lncs[i+1]; iters)
+            fl = f(l)
+            return fl < typemax(T) ? (exp(l), fl) : (exp(lncs[i]), scores[i])
         end
         if lnbounds !== nothing
-            i == firstindex(lncs) && lncs[i] <= lnbounds[1] && return exp(lnbounds[1])
-            i == lastindex(lncs) && lncs[i] >= lnbounds[2] && return exp(lnbounds[2])
+            i == firstindex(lncs) && lncs[i] <= lnbounds[1] && return exp(lnbounds[1]), scores[i]
+            i == lastindex(lncs) && lncs[i] >= lnbounds[2] && return exp(lnbounds[2]), scores[i]
         end
         c0 = exp(lncs[i])                       # recenter on the winning edge and search on
     end
@@ -2895,7 +2981,8 @@ merge the sample into different nodes). The mean of `dⱼ` is the difference of 
 `gain = KLCV(constant) - KLCV(adaptive)`, and `se = std(d)/√N` is its standard error. The
 adaptive scale is returned only if `gain > nse · se`. If `se == 0` (including `N = 1`), it is
 returned iff `gain > 0`. A candidate whose score is not finite (an unresolvable fit) never
-wins; if the constant scale is the unresolvable one, the best finite adaptive candidate is
+wins, and an exponent with no resolvable `c` near the previous exponent's is skipped; if the
+constant scale is the unresolvable one, the best finite adaptive candidate is
 returned regardless of `nse`. The rule applies only to this final choice, not among the
 exponents.
 
@@ -2940,17 +3027,20 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
 
     # The exponents are searched in increasing order, each bracket centered on the previous
-    # exponent's optimum. The optimal c climbs steeply with α — a scale falling off as p̂^α
-    # needs a larger c to keep the same resolution where the data actually are — and by α = 1
-    # it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
-    # every optimum comfortably inside its bracket.
+    # resolved exponent's optimum. The optimal c climbs steeply with α — a scale falling off as
+    # p̂^α needs a larger c to keep the same resolution where the data actually are — and by
+    # α = 1 it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
+    # every optimum comfortably inside its bracket. An exponent with no resolvable c in its
+    # bracket is skipped and leaves the center where it was.
     best_c, best_α, best_score = κ0, zero(T), typemax(T)
     c0 = κ0
     for α in sort!(collect(T, alphas))
         scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
-        c0 = _select_c(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0)
-        s = _score_kappa(_klcv, xs, scale(c0), r, slo, shi)
-        if isfinite(s) && s < best_score
+        res = _select_c_scored(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0;
+                               skip_unresolved=true)
+        res === nothing && continue
+        c0, s = res
+        if s < best_score
             best_score, best_c, best_α = s, c0, α
         end
     end
