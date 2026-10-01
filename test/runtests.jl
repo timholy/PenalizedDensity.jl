@@ -2195,10 +2195,13 @@ end
         @test_throws "need at least two distinct points to seed a boundary search" PenalizedDensity._edge_spacing([5.0], :left)
 
         # Ten points coincide at the left edge: zero spacing to seed a search from. Reachable
-        # through the public API when many duplicates sit at one edge.
+        # through the public API when many duplicates sit at one edge. The default `kappa`
+        # refuses such heavily tied data first; accepting them as exact points reaches the edge.
         x = vcat(fill(0.0, 10), [100.0])
-        @test_throws ArgumentError select_support(x)
-        @test_throws "the 10 points nearest the left edge coincide" select_support(x)
+        @test_throws "repeat another value" select_support(x)
+        points_kl(x; kwargs...) = select_kappa_kl(x; resolution=0, kwargs...)
+        @test_throws ArgumentError select_support(x; kappa=points_kl)
+        @test_throws "the 10 points nearest the left edge coincide" select_support(x; kappa=points_kl)
 
         # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
         @test_throws ErrorException PenalizedDensity._select_gap(gap -> NaN, 1.0)
@@ -2229,6 +2232,8 @@ end
         @test isfinite(t2)   # the search completes; the timing itself is reported, not gated
     end
 end
+
+include("interval.jl")
 
 @testset "code quality (Aqua)" begin
     Aqua.test_all(PenalizedDensity)
