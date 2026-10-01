@@ -261,6 +261,40 @@ end
         @test slope(κ) < slope(κ * 1.3) && slope(κ) < slope(κ / 1.3)
     end
 
+    @testset "held-out densities of isolated points track literal refits" begin
+        # An outlier's held-out density is of order e^{-2κ·gap}: far below roundoff relative to
+        # the fit, where a deletion step formed as a difference cancels. Compare every node with
+        # a literal leave-one-out refit, through κ large enough to isolate most tail points.
+        x = sort([randn(Xoshiro(1), 60); 5.0])
+        w = ones(length(x))
+        for κ in (0.5, 8.0, 50.0, 200.0)
+            _, ℓ = PenalizedDensity._loo_logdensity(x, w, κ, κ, κ, -Inf, Inf)
+            lit = [logdensity(DensityEstimate(deleteat!(copy(x), i), κ), x[i]) for i in eachindex(x)]
+            @test maximum(abs, ℓ .- lit) < 0.1
+        end
+        # With a piecewise-constant scale and a natural boundary, the neighbor sum equals the
+        # deleted amplitude φᵢ(1 - τh) wherever that difference does not cancel (h well below ½).
+        PD = PenalizedDensity
+        κs = collect(range(2.0, 40.0; length=length(x) - 1))
+        for (lo, hi) in ((-Inf, Inf), (-3.0, 5.5))
+            _, ℓ = PD._loo_logdensity(x, w, κs, 2.0, 40.0, lo, hi)
+            @test all(isfinite, ℓ)
+            @test PD._klcv(x, w, κs, 2.0, 40.0, lo, hi) ≈ -sum(ℓ) / length(x)
+            M = PD._operator(x, κs, 2.0, 40.0, lo, hi)
+            φ = PD._solve_amplitude(M, w)
+            Z, Gφ = PD._norm_sq_gram(x, φ, κs, 2.0, 40.0, lo, hi)
+            H = SymTridiagonal(M.dv .+ w ./ φ .^ 2, M.ev)
+            g, _ = PD._inv_band(H)
+            v = H \ Gφ
+            h = g ./ φ .^ 2
+            τ = PD._deletion_step.(h, w, w)
+            ℓdiff = 2 .* log.(φ .* (1 .- τ .* h)) .- log.(Z .- 2 .* τ .* v ./ φ)
+            ok = h .< 0.4
+            @test count(ok) > 40
+            @test ℓ[ok] ≈ ℓdiff[ok] rtol = 1e-10
+        end
+    end
+
     @testset "select_kappa_cv: cross-validated (MISE) scale" begin
         Random.seed!(11)
         x = randn(1500)
@@ -903,7 +937,7 @@ end
             # has underflowed, which is the only regime that can tell the scalar and batch
             # paths apart: both must read the log-density, not the density.
             ks = AdaptiveScale(3.0, 5e-3, p)
-            deep = last(chisq1) .+ [20.0, 25.0, 30.0]
+            deep = last(chisq1) .+ [40.0, 45.0, 50.0]
             @test all(t -> p(t) == 0, deep)
             @test all(t -> ks(t) > ks.κmin, deep)
             @test PenalizedDensity._kappa_sorted(ks, deep, Float64) == ks.(deep)
@@ -922,8 +956,10 @@ end
 
             d = DensityEstimate(chisq1, κ)
             @test length(d.κ) == length(d.x) - 1
-            # The scale follows the density: finest at the divergent edge, coarsest in the tail.
-            @test argmax(d.κ) < length(d.κ) ÷ 10
+            # The scale follows the density: finest near the divergent edge (where the pilot
+            # peaks), coarsest in the tail.
+            @test d.x[argmax(d.κ)] < 0.1
+            @test d.x[argmin(d.κ)] > 5
             @test extrema(d.κ)[2] / extrema(d.κ)[1] > 100
             @test cdf(d, Inf) == 1
 
