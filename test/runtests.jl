@@ -1060,8 +1060,17 @@ end
             masked(c) = c < 0.5 ? NaN : (log(c) - log(5.0))^2
             @test sel(masked, 1.0) ≈ 5.0 rtol=1e-3
 
+            # The returned c always resolves: a refinement that ends on an unresolvable c falls
+            # back to the best grid point. Here only the opening grid resolves.
+            lngrid = range(log(2.0) - log(PenalizedDensity._CSPAN), log(2.0) + log(PenalizedDensity._CSPAN);
+                           length=PenalizedDensity._CGRID)
+            gridonly(c) = any(g -> abs(log(c) - g) < 1e-9, lngrid) ? (log(c) - log(2.1))^2 : NaN
+            c, s = PenalizedDensity._select_c_scored(gridonly, 2.0)
+            @test c ≈ 2.0 && s == gridonly(c)
+
             # Nothing resolvable anywhere in the opening bracket.
             @test_throws "no resolvable smoothing scale" sel(_ -> NaN, 1.0)
+            @test PenalizedDensity._select_c_scored(_ -> NaN, 1.0; skip_unresolved=true) === nothing
             # A score with no interior minimum runs off the bracket until it gives up.
             @test_throws "kept running off its search bracket" sel(c -> -log(c), 1.0)
         end

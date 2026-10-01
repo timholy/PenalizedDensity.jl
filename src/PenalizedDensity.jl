@@ -2853,9 +2853,17 @@ const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum befor
 # a regime where the first-order LOO expansion is no longer trustworthy and spuriously reports
 # ever-improving scores (observed directly: KLCV score turning unboundedly negative for
 # κ ≳ 1e6 on data where every sane candidate sits below 1e4).
-function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::Int=_CITERS,
-                   maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
-                   bounds::Union{Nothing,Tuple{Real,Real}}=nothing) where {T}
+#
+# The returned c never scores non-finite: if the golden-section refinement ends on an
+# unresolvable c, the best grid point is returned instead.
+_select_c(score, c0; kwargs...) = first(_select_c_scored(score, c0; kwargs...))
+
+# `_select_c`, returning `(c, score(c))`, with `score(c)` finite. With `skip_unresolved=true`, a
+# bracket with no resolvable candidate returns `nothing` instead of throwing.
+function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::Int=_CITERS,
+                          maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
+                          bounds::Union{Nothing,Tuple{Real,Real}}=nothing,
+                          skip_unresolved::Bool=false) where {T}
     f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
     lnspan = log(T(span))
     lnbounds = bounds === nothing ? nothing : (log(T(bounds[1])), log(T(bounds[2])))
@@ -2863,22 +2871,32 @@ function _select_c(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, iters::In
         loln, hiln = log(c0) - lnspan, log(c0) + lnspan
         if lnbounds !== nothing
             loln, hiln = max(loln, lnbounds[1]), min(hiln, lnbounds[2])
-            loln < hiln || return exp(clamp(log(c0), lnbounds[1], lnbounds[2]))
+            if !(loln < hiln)
+                l = clamp(log(c0), lnbounds[1], lnbounds[2])
+                fl = f(l)
+                fl < typemax(T) && return exp(l), fl
+                skip_unresolved && return nothing
+                error("no resolvable $label at the clamped bound c = $(exp(l))")
+            end
         end
         lncs = range(loln, hiln; length=ngrid)
         scores = Vector{T}(undef, ngrid)
         for j in (reverse ? (ngrid:-1:1) : (1:ngrid))
             scores[j] = f(lncs[j])
         end
-        all(==(typemax(T)), scores) &&
+        if all(==(typemax(T)), scores)
+            skip_unresolved && return nothing
             error("no resolvable $label anywhere in the search bracket around c = $c0")
+        end
         i = argmin(scores)
         if i != firstindex(lncs) && i != lastindex(lncs)
-            return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters))
+            l = _golden_min(f, lncs[i-1], lncs[i+1]; iters)
+            fl = f(l)
+            return fl < typemax(T) ? (exp(l), fl) : (exp(lncs[i]), scores[i])
         end
         if lnbounds !== nothing
-            i == firstindex(lncs) && lncs[i] <= lnbounds[1] && return exp(lnbounds[1])
-            i == lastindex(lncs) && lncs[i] >= lnbounds[2] && return exp(lnbounds[2])
+            i == firstindex(lncs) && lncs[i] <= lnbounds[1] && return exp(lnbounds[1]), scores[i]
+            i == lastindex(lncs) && lncs[i] >= lnbounds[2] && return exp(lnbounds[2]), scores[i]
         end
         c0 = exp(lncs[i])                       # recenter on the winning edge and search on
     end
@@ -2963,7 +2981,8 @@ merge the sample into different nodes). The mean of `dⱼ` is the difference of 
 `gain = KLCV(constant) - KLCV(adaptive)`, and `se = std(d)/√N` is its standard error. The
 adaptive scale is returned only if `gain > nse · se`. If `se == 0` (including `N = 1`), it is
 returned iff `gain > 0`. A candidate whose score is not finite (an unresolvable fit) never
-wins; if the constant scale is the unresolvable one, the best finite adaptive candidate is
+wins, and an exponent with no resolvable `c` near the previous exponent's is skipped; if the
+constant scale is the unresolvable one, the best finite adaptive candidate is
 returned regardless of `nse`. The rule applies only to this final choice, not among the
 exponents.
 
@@ -3008,17 +3027,20 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
 
     # The exponents are searched in increasing order, each bracket centered on the previous
-    # exponent's optimum. The optimal c climbs steeply with α — a scale falling off as p̂^α
-    # needs a larger c to keep the same resolution where the data actually are — and by α = 1
-    # it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
-    # every optimum comfortably inside its bracket.
+    # resolved exponent's optimum. The optimal c climbs steeply with α — a scale falling off as
+    # p̂^α needs a larger c to keep the same resolution where the data actually are — and by
+    # α = 1 it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
+    # every optimum comfortably inside its bracket. An exponent with no resolvable c in its
+    # bracket is skipped and leaves the center where it was.
     best_c, best_α, best_score = κ0, zero(T), typemax(T)
     c0 = κ0
     for α in sort!(collect(T, alphas))
         scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
-        c0 = _select_c(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0)
-        s = _score_kappa(_klcv, xs, scale(c0), r, slo, shi)
-        if isfinite(s) && s < best_score
+        res = _select_c_scored(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0;
+                               skip_unresolved=true)
+        res === nothing && continue
+        c0, s = res
+        if s < best_score
             best_score, best_c, best_α = s, c0, α
         end
     end
