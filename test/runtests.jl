@@ -2230,6 +2230,8 @@ end
     end
 end
 
+include("interval.jl")
+
 @testset "code quality (Aqua)" begin
     Aqua.test_all(PenalizedDensity)
 end

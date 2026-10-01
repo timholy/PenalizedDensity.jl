@@ -2,17 +2,27 @@ module PenalizedDensity
 
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
 using LogExpFunctions: logabssinh, logaddexp, logcosh
-using QuadGK: quadgk
+using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
 using Statistics: Statistics, mean, quantile, std
 
-export DensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
+export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
 export AdaptiveScale, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile
 export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
+
+"""
+    AbstractDensityEstimate
+
+Supertype of the fitted densities: [`DensityEstimate`](@ref) (point observations) and
+[`IntervalDensityEstimate`](@ref) (interval observations, optionally mixed with points). Every
+subtype is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
+[`logdensity`](@ref), [`cdf`](@ref), and [`quantile`](@ref Statistics.quantile).
+"""
+abstract type AbstractDensityEstimate end
 
 """
     DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
@@ -101,7 +111,7 @@ unbounded line.
 Passing a [`SolveStats`](@ref) as the `stats` keyword records the Newton-step and backtracking
 counts of the fixed-scale solve, for benchmarking; it does not change the fit.
 """
-struct DensityEstimate{T<:AbstractFloat,K}
+struct DensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     x::Vector{T}   # sorted, distinct node locations
     w::Vector{T}   # weight (multiplicity) at each node
     ψ::Vector{T}   # normalized amplitude at the nodes
@@ -3272,5 +3282,7 @@ function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
     κ = isinf(lo) && isinf(hi) ? κ_inf : T(kappa(xs; κs, rtol, support=(lo, hi)))
     return (; κ, support=(lo, hi))
 end
+
+include("interval.jl")
 
 end # module
