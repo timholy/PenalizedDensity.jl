@@ -155,10 +155,11 @@ _candidate_kappa(κfun, cand::Vector{T}) where {T} = _kappa_sorted(κfun, cand, 
 _layout_kappa(κ::Real, y::Vector{T}) where {T} = (fill(T(κ), length(y) - 1), T(κ), T(κ))
 _layout_kappa(κfun, y::Vector{T}) where {T} = _kappa_profile(y, κfun, T)
 
-# `counts[i]`, when given, is the number of observations sharing the bounds `lower[i]`,
-# `upper[i]` (see `_tally_intervals`).
+# With `strict=false`, a scale too fine for some occupied cell (see `_check_resolvable`) returns
+# `nothing` instead of throwing. `counts[i]`, when given, is the number of observations sharing
+# the bounds `lower[i]`, `upper[i]` (see `_tally_intervals`).
 function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol::T, lo::T, hi::T;
-                          counts::Union{AbstractVector,Nothing}=nothing) where {T}
+                          strict::Bool=true, counts::Union{AbstractVector,Nothing}=nothing) where {T}
     axes(lower) == axes(upper) ||
         throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
     counts === nothing || axes(counts) == axes(lower) ||
@@ -213,6 +214,7 @@ function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol
         cellgroup[g.first+1:g.last+1] .= j
     end
     κs, κL, κR = _layout_kappa(κ, y)
+    strict || _unresolvable_cell(y, κs, cellgroup) == 0 || return nothing
     _check_resolvable(y, κs, cellgroup, reps)
     return _IntervalLayout{T}(y, w, groups, cellgroup, κs, κL, κR, lo, hi)
 end
@@ -222,17 +224,23 @@ end
 # log-probability terms and the nodal solve loses accuracy; by then the estimate has long since
 # reached its limit as κ → ∞, the histogram on the recorded intervals.
 function _check_resolvable(y::Vector{T}, κs::Vector{T}, cellgroup::Vector{Int}, reps) where {T}
+    c = _unresolvable_cell(y, κs, cellgroup)
+    c == 0 && return nothing
+    θ = κs[c] * (y[c+1] - y[c])
+    throw(ArgumentError(
+        "κ·width = $θ on the interval $(reps[cellgroup[c+1]]) exceeds $(eps(T)^(-1 // 4)): the " *
+        "smoothing length is too far below the interval width to fit accurately, and the " *
+        "estimate is already at its histogram limit; use a smaller κ"))
+end
+
+# The first occupied interior cell whose κ·width exceeds the accuracy limit, or 0.
+function _unresolvable_cell(y::Vector{T}, κs::Vector{T}, cellgroup::Vector{Int}) where {T}
     limit = eps(T)^(-1 // 4)
     for c in eachindex(κs)
-        j = cellgroup[c+1]
-        j == 0 && continue
-        θ = κs[c] * (y[c+1] - y[c])
-        θ <= limit || throw(ArgumentError(
-            "κ·width = $θ on the interval $(reps[j]) exceeds $limit: the smoothing length is too " *
-            "far below the interval width to fit accurately, and the estimate is already at its " *
-            "histogram limit; use a smaller κ"))
+        cellgroup[c+1] == 0 && continue
+        κs[c] * (y[c+1] - y[c]) <= limit || return c
     end
-    return nothing
+    return 0
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -1644,4 +1652,104 @@ function _quantile(d::IntervalDensityEstimate{T}, F::Vector{T}, total::T, q::Rea
     c = searchsortedlast(F, target)
     y = xs[c] + (target - F[c]) / (F[c+1] - F[c]) * (xs[c+1] - xs[c])
     return _invert_mass(d, t -> _cdf_mass(d, F, t), xs[c], xs[c+1], y, target)
+end
+
+# ---------------------------------------------------------------------------------------------
+# Spatially varying scale
+
+function AdaptiveScale(c::Real, α::Real, pilot::IntervalDensityEstimate{T}) where {T}
+    α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
+    c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
+    return AdaptiveScale{T}(T(c), T(α), pilot, _log_geomean(pilot), T(_KAPPA_FLOOR) * T(c))
+end
+
+# ln ḡ over the pilot's observations: a point contributes ln p̂ at the point, a finite interval
+# the log of its mean density P/width (the quantity interval data determine), and a censored
+# observation ln p̂ at its finite bound.
+function _log_geomean(d::IntervalDensityEstimate{T}) where {T}
+    s = zero(T)
+    n = zero(T)
+    for i in eachindex(d.x, d.w)
+        d.w[i] == 0 && continue
+        s += d.w[i] * 2 * log(d.ψ[i])
+        n += d.w[i]
+    end
+    m = length(d.x)
+    for g in d.groups
+        lp = if g.first == 0
+            _logdensity(d, d.x[g.last+1])
+        elseif g.last == m
+            _logdensity(d, d.x[g.first])
+        else
+            log(sum(c -> _cell_mass(d, c), g.first:g.last) / (d.x[g.last+1] - d.x[g.first]))
+        end
+        isfinite(lp) || error("the pilot's log density on an observation is $lp")
+        s += g.r * lp
+        n += g.r
+    end
+    return s / n
+end
+
+_logdensity_sorted(d::IntervalDensityEstimate{T}, ts::AbstractVector) where {T} =
+    T[_logdensity(d, t) for t in ts]
+
+# KLCV score of the scale `κ` (a number or a callable) on interval data; NaN when `κ` is too fine
+# for some occupied interval to be fitted accurately, or makes a nodal density underflow beyond
+# what the solve can represent.
+function _interval_score(lower, upper, counts, κ, rtol::T, lo::T, hi::T) where {T}
+    L = _interval_layout(lower, upper, κ, rtol, lo, hi; strict=false, counts)
+    L === nothing && return T(NaN)
+    return _unless_unresolvable(() -> _interval_klcv(L), T(NaN))
+end
+
+# Held-out log-likelihood of each observation (each distinct pair, with `counts`), in the order
+# of `eachindex(lower, upper)`: the log-probability of its interval or the log-density at its
+# point, as `_interval_loo` gives them for the group or node it belongs to. The `counts`-weighted
+# mean of the result is `-_interval_klcv` up to rounding. All NaN when `κ` is unresolvable;
+# entries whose held-out value is undefined are NaN.
+function _interval_loo_obs(lower, upper, counts, κ, rtol::T, lo::T, hi::T) where {T}
+    ℓ = fill(T(NaN), length(lower))
+    L = _interval_layout(lower, upper, κ, rtol, lo, hi; strict=false, counts)
+    L === nothing && return ℓ
+    res = _unless_unresolvable(() -> _interval_loo(L), nothing)
+    res === nothing && return ℓ
+    lp, ld = res
+    m = length(L.y)
+    for (j, i) in enumerate(eachindex(lower, upper))    # j: position in ℓ
+        a, b = T(lower[i]), T(upper[i])
+        ia = isfinite(a) ? searchsortedlast(L.y, a) : 0
+        ib = isfinite(b) ? searchsortedlast(L.y, b) : m + 1
+        v = ia == ib ? ld[ia] : lp[L.cellgroup[ia+1]]
+        ℓ[j] = isfinite(v) ? v : T(NaN)
+    end
+    return ℓ
+end
+
+function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
+                               alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
+                               pilot_selector=nothing,
+                               nse::Real=1,
+                               rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
+                               support::Tuple{Real,Real}=(-Inf, Inf))
+    _check_adaptive_args(alphas, nse, rtol)
+    a, b = support
+    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    axes(lower) == axes(upper) ||
+        throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
+    T = float(promote_type(eltype(lower), eltype(upper), eltype(alphas), typeof(rtol),
+                           _support_eltype(a), _support_eltype(b)))
+    r, slo, shi = T(rtol), T(a), T(b)
+
+    κ0 = T(pilot_selector === nothing ? select_kappa_kl(lower, upper) :
+                                         pilot_selector(lower, upper))
+    κ0 > 0 || throw(ArgumentError("pilot_selector must return a positive scale, got $κ0"))
+    lu, uu, counts = _tally_intervals(lower, upper, T)
+    L = _interval_layout(lu, uu, κ0, r, slo, shi; counts)
+    p = _interval_fit(L, κ0)
+
+    const_score = _interval_klcv(L)
+    score(κfun) = _interval_score(lu, uu, counts, κfun, r, slo, shi)
+    gain_se(κa) = _mean_se(_interval_loo_obs(lu, uu, counts, κa, r, slo, shi) .-
+                           _interval_loo_obs(lu, uu, counts, κ0, r, slo, shi), counts)
+    return _select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse)
 end

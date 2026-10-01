@@ -2745,7 +2745,7 @@ function _check_ties(xs::Vector{T}, caller::String) where {T}
           "point likelihood treats them as exact. "
     d = T[xs[i] - xs[i-1] for i in 2:n if xs[i] != xs[i-1]]    # gaps between distinct values
     δ = isempty(d) ? zero(T) : minimum(d)
-    fix = caller == "select_kappa_kl" ?
+    fix = caller in ("select_kappa_kl", "select_kappa_adaptive") ?
           "pass `resolution=δ` to fit them as rounded (interval) data" :
           "use `select_kappa_kl(x; resolution=δ)` to fit them as rounded (interval) data"
     if length(d) >= 2 && all(di -> abs(di / δ - round(di / δ)) <= 1e-3, d)
@@ -2753,7 +2753,7 @@ function _check_ties(xs::Vector{T}, caller::String) where {T}
                "or pass `resolution=0` to treat them as exact points."
     else
         msg *= "Pass `resolution=0` to treat them as exact points, or give each observation's bounds " *
-               "with `select_kappa_kl(lower, upper)`."
+               "with `$(caller == "select_kappa_adaptive" ? caller : "select_kappa_kl")(lower, upper)`."
     end
     throw(ArgumentError(msg))
 end
@@ -2911,10 +2911,21 @@ end
 # mean, std(d)/√n. The mean equals the difference of the two candidates' KLCV scores up to
 # rounding. With a single observation the standard error is undefined and is returned as 0.
 function _adaptive_gain(xs::Vector{T}, κ0::Real, κa, rtol::T, lo::T, hi::T) where {T}
-    d = _loo_logdensities(xs, κa, rtol, lo, hi) .- _loo_logdensities(xs, κ0, rtol, lo, hi)
+    return _mean_se(_loo_logdensities(xs, κa, rtol, lo, hi) .- _loo_logdensities(xs, κ0, rtol, lo, hi))
+end
+
+function _mean_se(d::Vector{T}) where {T}
     n = length(d)
     gain = mean(d)
     se = n >= 2 ? std(d; corrected=true) / sqrt(T(n)) : zero(T)
+    return gain, se
+end
+
+# As above, for a sample in which `d[i]` occurs `counts[i]` times.
+function _mean_se(d::Vector{T}, counts::Vector{T}) where {T}
+    n = sum(counts)
+    gain = sum(counts .* d) / n
+    se = n >= 2 ? sqrt(sum(counts .* (d .- gain) .^ 2) / (n - 1) / n) : zero(T)
     return gain, se
 end
 
@@ -2996,11 +3007,13 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
 end
 
 """
-    select_kappa_adaptive(x; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), pilot_selector=select_kappa_kl,
-        nse=1, rtol=cbrt(eps(T)), support=(-Inf, Inf)) -> κ
+    select_kappa_adaptive(x; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), pilot_selector=nothing,
+        nse=1, rtol=cbrt(eps(T)), support=(-Inf, Inf), resolution=nothing) -> κ
+    select_kappa_adaptive(lower, upper; alphas, pilot_selector, nse, rtol, support) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
-return it ready to pass to [`DensityEstimate`](@ref).
+return it ready to pass to [`DensityEstimate`](@ref) (or, for interval data,
+[`IntervalDensityEstimate`](@ref)).
 
 Returns an [`AdaptiveScale`](@ref) when the best exponent `α` in `alphas` beats the constant
 scale by more than `nse` standard errors of the score, and the constant scale itself (a
@@ -3015,8 +3028,17 @@ comparison. They are searched in increasing order, whatever order they are given
 `nse ≥ 0` (default `1`) sets how many standard errors the adaptive scale's gain must exceed
 (see the extended help); `nse = 0` returns whichever candidate has the smaller score.
 `pilot_selector` sets the constant scale of the pilot density the family is built from, and
-may be any callable returning a positive scale from the sample. `rtol` is the node-merging
-tolerance, as a fraction of the local smoothing length, matching [`DensityEstimate`](@ref)'s.
+may be any callable returning a positive scale from the sample (from `(lower, upper)` for
+interval data); the default `nothing` uses [`select_kappa_kl`](@ref). `rtol` is the
+node-merging tolerance, as a fraction of the local smoothing length, matching
+[`DensityEstimate`](@ref)'s.
+
+`resolution` and the `(lower, upper)` form work as for [`select_kappa_kl`](@ref): more than 1%
+repeated values throw an `ArgumentError` unless `resolution` is given; `resolution = δ > 0`
+treats each `x[i]` as rounded to a lattice of spacing `δ` and selects the scale for
+[`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, with the pilot an interval fit and
+every candidate scored by the held-out log-probabilities of the observations' intervals;
+`resolution = 0` treats the values as exact points.
 
 `support = (a, b)` (default `(-Inf, Inf)`) fits the pilot density and cross-validates every
 candidate scale on a finite domain, as [`DensityEstimate`](@ref)'s `support` does; it is a
@@ -3088,35 +3110,59 @@ unbounded selection that saw a different edge.
 """
 function select_kappa_adaptive(x::AbstractVector{<:Real};
                                alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
-                               pilot_selector=select_kappa_kl,
+                               pilot_selector=nothing,
                                nse::Real=1,
                                rtol::Real=cbrt(eps(float(eltype(x)))),
-                               support::Tuple{Real,Real}=(-Inf, Inf))
-    isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
-    all(>(0), alphas) ||
-        throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
-                            "(α = 0) is always compared against them"))
-    nse >= 0 || throw(ArgumentError("nse must be nonnegative, got $nse"))
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+                               support::Tuple{Real,Real}=(-Inf, Inf),
+                               resolution::Union{Real,Nothing}=nothing)
+    if resolution !== nothing && resolution != 0
+        isfinite(resolution) && resolution > 0 ||
+            throw(ArgumentError("resolution must be finite and nonnegative, got $resolution"))
+        isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
+        TR = float(promote_type(eltype(x), typeof(resolution)))
+        lower, upper = _lattice_bounds(x, TR(resolution), support)
+        return select_kappa_adaptive(lower, upper; alphas, pilot_selector, nse, rtol, support)
+    end
+    _check_adaptive_args(alphas, nse, rtol)
     a, b = support
     a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
     T = float(promote_type(eltype(x), eltype(alphas), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
+    resolution === nothing && _check_ties(xs, "select_kappa_adaptive")
     r = T(rtol)
 
     # pilot_selector chooses only a scalar starting scale, so it is called support-oblivious
     # (any callable returning a positive scale from the sample, including ones with no notion
     # of a boundary at all); the pilot density p̂ below is what actually carries the support.
-    κ0 = T(pilot_selector(xs))
+    κ0 = T(pilot_selector === nothing ? select_kappa_kl(xs; resolution=0) : pilot_selector(xs))
     κ0 > 0 || throw(ArgumentError("pilot_selector must return a positive scale, got $κ0"))
     p = DensityEstimate(xs, κ0; rtol=r, support=(slo, shi))
-    loggbar = _log_geomean(p)
 
     # The constant scale, scored on the same footing as the adaptive candidates. The 7-arg
     # `_klcv` reduces to the unbounded arithmetic exactly when `slo, shi = -Inf, Inf`.
     const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
+    score(κfun) = _score_kappa(_klcv, xs, κfun, r, slo, shi)
+    gain_se(κa) = _adaptive_gain(xs, κ0, κa, r, slo, shi)
+    return _select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse)
+end
+
+function _check_adaptive_args(alphas, nse, rtol)
+    isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
+    all(>(0), alphas) ||
+        throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
+                            "(α = 0) is always compared against them"))
+    nse >= 0 || throw(ArgumentError("nse must be nonnegative, got $nse"))
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    return nothing
+end
+
+# The search shared by point and interval data. `score(κfun)` is the KLCV score of the scale
+# function `κfun` (NaN when unresolvable), `const_score` that of the pilot's constant scale `κ0`,
+# and `gain_se(κa)` the per-observation gain of `κa` over `κ0` as `(mean, standard error)`.
+function _select_adaptive(score, gain_se, p, κ0::T, const_score::T, alphas, nse) where {T}
+    loggbar = _log_geomean(p)
 
     # The exponents are searched in increasing order, each bracket centered on the previous
     # resolved exponent's optimum. The optimal c climbs steeply with α — a scale falling off as
@@ -3128,8 +3174,7 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     c0 = κ0
     for α in sort!(collect(T, alphas))
         scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
-        res = _select_c_scored(c -> _score_kappa(_klcv, xs, scale(c), r, slo, shi), c0;
-                               skip_unresolved=true)
+        res = _select_c_scored(c -> score(scale(c)), c0; skip_unresolved=true)
         res === nothing && continue
         c0, s = res
         if s < best_score
@@ -3146,7 +3191,7 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     gain = const_score - best_score
     gain > 0 || return κ0
     nse == 0 && return κa
-    _, se = _adaptive_gain(xs, κ0, κa, r, slo, shi)
+    _, se = gain_se(κa)
     isfinite(se) || error("nonfinite standard error of the adaptive gain, although both " *
                           "candidates have finite scores")
     return se == 0 || gain > nse * se ? κa : κ0      # se == 0: the gain alone decides

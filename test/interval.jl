@@ -569,3 +569,125 @@ end
         @test κ ≈ select_kappa_kl(lower, upper; κs=filter(<(50), κs)) rtol = 1e-6
     end
 end
+
+@testset "interval adaptive selection" begin
+    rtol = cbrt(eps())
+    @testset "rounded data: the tie check and the resolution path" begin
+        # Heavily tied data are refused as point data, naming the fix.
+        x = round.(randn(Xoshiro(1), 1000); digits=1)
+        @test_throws "repeat another value" select_kappa_adaptive(x)
+        @test_throws "pass `resolution=δ`" select_kappa_adaptive(x)
+        zt = [randn(Xoshiro(1), 100); fill(0.123, 5)]
+        @test_throws "select_kappa_adaptive(lower, upper)" select_kappa_adaptive(zt)
+        @test_throws "resolution must be finite and nonnegative" select_kappa_adaptive(x; resolution=-0.1)
+        # With the resolution, the fit follows the rounding intervals, not the repeated values.
+        for seed in 1:4
+            xs = round.(randn(Xoshiro(seed), 1000); digits=1)
+            κ = select_kappa_adaptive(xs; resolution=0.1)
+            d = IntervalDensityEstimate(xs, κ; resolution=0.1)
+            @test maximum(d.(-4:0.01:4)) < 0.5
+        end
+        lower, upper = PenalizedDensity._lattice_bounds(x, 0.1, (-Inf, Inf))
+        κ = select_kappa_adaptive(x; resolution=0.1, nse=0)
+        κb = select_kappa_adaptive(lower, upper; nse=0)
+        @test κ isa AdaptiveScale && κb isa AdaptiveScale
+        @test (κ.c, κ.α) == (κb.c, κb.α)
+        κo = select_kappa_adaptive(OffsetArray(x, -3); resolution=0.1, nse=0)
+        @test (κo.c, κo.α) == (κ.c, κ.α)
+        # resolution = 0: exact points, through the point path.
+        @test select_kappa_adaptive(round.(randn(Xoshiro(2), 300); digits=2); resolution=0) isa Union{Real,AdaptiveScale}
+        # pilot_selector receives the bounds.
+        seen = Ref{Any}(nothing)
+        spy(l, u) = (seen[] = (l, u); 3.0)
+        κp = select_kappa_adaptive(lower, upper; alphas=(0.5,), pilot_selector=spy)
+        @test seen[] == (lower, upper)
+        @test κp isa AdaptiveScale ? κp.pilot.κ == 3.0 : κp == 3.0
+    end
+
+    @testset "a rounded edge density selects an adaptive scale" begin
+        xe = round.(-log.(rand(Xoshiro(2), 2000)); digits=1)
+        κ = select_kappa_adaptive(xe; resolution=0.1)
+        @test κ isa AdaptiveScale
+        @test κ.pilot isa IntervalDensityEstimate
+        d = IntervalDensityEstimate(xe, κ; resolution=0.1)
+        @test d.x[argmax(d.κ)] < 0.5            # finest at the edge
+        @test κ(0.1) > 5κ(4.0)
+        @test cdf(d, Inf) ≈ 1
+    end
+
+    @testset "point observations as degenerate intervals" begin
+        # Exact points reproduce the point-data selection.
+        x = randn(Xoshiro(5), 300) .^ 2
+        κp = select_kappa_adaptive(x; nse=0)
+        κi = select_kappa_adaptive(x, x; nse=0)
+        @test κi.α == κp.α
+        @test κi.c ≈ κp.c rtol = 1e-3
+        # The pilots' scales come from different default grids and agree only to ~1e-5.
+        @test κi.pilot.κ ≈ κp.pilot.κ rtol = 1e-4
+        @test κi.loggbar ≈ κp.loggbar rtol = 1e-5
+    end
+
+    @testset "per-observation held-out values and tallies" begin
+        lower, upper = rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), cens=(1.375, 6), seed=4)
+        lu, uu, counts = PenalizedDensity._tally_intervals(lower, upper, Float64)
+        @test sum(counts) == length(lower)
+        @test length(lu) < length(lower)
+        for κ in (2.0, x -> 1.0 + x^2)
+            L = PenalizedDensity._interval_layout(lower, upper, κ, rtol, -Inf, Inf)
+            Lt = PenalizedDensity._interval_layout(lu, uu, κ, rtol, -Inf, Inf; counts)
+            @test L.y == Lt.y && L.w == Lt.w && L.groups == Lt.groups && L.κs == Lt.κs
+            s = PenalizedDensity._interval_score(lu, uu, counts, κ, rtol, -Inf, Inf)
+            @test s ≈ PenalizedDensity._interval_klcv(L)
+            ℓ = PenalizedDensity._interval_loo_obs(lu, uu, counts, κ, rtol, -Inf, Inf)
+            @test -sum(counts .* ℓ) / sum(counts) ≈ s
+            ℓall = PenalizedDensity._interval_loo_obs(lower, upper, nothing, κ, rtol, -Inf, Inf)
+            @test -mean(ℓall) ≈ s
+        end
+        # The weighted standard error equals that of the expanded sample.
+        d = randn(Xoshiro(3), 5); c = [1.0, 3, 2, 1, 4]
+        expanded = reduce(vcat, fill.(d, Int.(c)))
+        @test all(PenalizedDensity._mean_se(d, c) .≈ PenalizedDensity._mean_se(expanded))
+    end
+
+    @testset "a scale too fine for an interval is unresolvable, not an error" begin
+        lower, upper = rounded_intervals(; n=100, seed=3)
+        κbig = 1e5     # κ·width = 25000 > eps()^(-1/4)
+        @test_throws "histogram limit" PenalizedDensity._interval_layout(lower, upper, κbig, rtol, -Inf, Inf)
+        @test PenalizedDensity._interval_layout(lower, upper, κbig, rtol, -Inf, Inf; strict=false) === nothing
+        @test isnan(PenalizedDensity._interval_score(lower, upper, nothing, κbig, rtol, -Inf, Inf))
+        @test all(isnan, PenalizedDensity._interval_loo_obs(lower, upper, nothing, κbig, rtol, -Inf, Inf))
+    end
+
+    @testset "an underflowing interval edge is unresolvable, not an error" begin
+        # The fixture of the select_kappa_kl test above: the adaptive search's scores reject the
+        # scales at which the far edge underflows.
+        lower = [0.0, 1.0, 2.0, 0.9, 1.5, 2.5]
+        upper = [1.0, 2.0, 3.0, 0.9, 1.5, 2.5]
+        @test isfinite(PenalizedDensity._interval_score(lower, upper, nothing, 50.0, rtol, -Inf, Inf))
+        for κ in (200.0, 400.0)
+            @test isnan(PenalizedDensity._interval_score(lower, upper, nothing, κ, rtol, -Inf, Inf))
+            @test all(isnan, PenalizedDensity._interval_loo_obs(lower, upper, nothing, κ, rtol, -Inf, Inf))
+        end
+    end
+
+    @testset "ḡ of an interval pilot" begin
+        # Points: the geometric mean of the density at the sample, as for DensityEstimate.
+        x = randn(Xoshiro(7), 200)
+        @test PenalizedDensity._log_geomean(IntervalDensityEstimate(x, x, 2.0)) ≈
+              PenalizedDensity._log_geomean(DensityEstimate(x, 2.0)) rtol = 1e-10
+        # Intervals: each contributes the log of its mean density, P/width.
+        lower, upper = [-1.0, -1.0, 0.0, 0.5], [0.0, 0.0, 0.5, 1.5]
+        d = IntervalDensityEstimate(lower, upper, 1.5)
+        P(a, b) = cdf(d, b) - cdf(d, a)
+        expect = (2log(P(-1, 0)) + log(P(0, 0.5) / 0.5) + log(P(0.5, 1.5)))/4
+        @test PenalizedDensity._log_geomean(d) ≈ expect rtol = 1e-10
+        # Censored observations: the log density at the finite bound.
+        dc = IntervalDensityEstimate([-Inf, -1.0, 0.0, 0.5], [-1.0, 0.0, 0.5, Inf], 1.5)
+        Pc(a, b) = cdf(dc, b) - cdf(dc, a)
+        expectc = (logdensity(dc, -1.0) + log(Pc(-1, 0)) + log(Pc(0, 0.5) / 0.5) + logdensity(dc, 0.5)) / 4
+        @test PenalizedDensity._log_geomean(dc) ≈ expectc rtol = 1e-10
+        κ = AdaptiveScale(2.0, 0.5, d)
+        @test κ(0.25) ≈ 2.0 * exp(0.5 * (logdensity(d, 0.25) - expect))
+        @test_throws "must be positive" AdaptiveScale(2.0, 0.0, d)
+    end
+end
