@@ -155,9 +155,14 @@ _candidate_kappa(κfun, cand::Vector{T}) where {T} = _kappa_sorted(κfun, cand, 
 _layout_kappa(κ::Real, y::Vector{T}) where {T} = (fill(T(κ), length(y) - 1), T(κ), T(κ))
 _layout_kappa(κfun, y::Vector{T}) where {T} = _kappa_profile(y, κfun, T)
 
-function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol::T, lo::T, hi::T) where {T}
+# `counts[i]`, when given, is the number of observations sharing the bounds `lower[i]`,
+# `upper[i]` (see `_tally_intervals`).
+function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol::T, lo::T, hi::T;
+                          counts::Union{AbstractVector,Nothing}=nothing) where {T}
     axes(lower) == axes(upper) ||
         throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
+    counts === nothing || axes(counts) == axes(lower) ||
+        throw(DimensionMismatch("counts must have the axes of the bounds, got $(axes(counts)) and $(axes(lower))"))
     isempty(lower) && throw(ArgumentError("cannot fit a density to zero observations"))
     for i in eachindex(lower, upper)
         _check_observation(T(lower[i]), T(upper[i]), lo, hi)
@@ -175,30 +180,31 @@ function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol
     y, _ = _merge_presorted(cand, rtol, _candidate_kappa(κ, cand))
     m = length(y)
     w = zeros(T, m)
-    keys = Tuple{Int,Int,T,T}[]    # (lower node or 0, upper node or m+1, lower, upper)
+    keys = Tuple{Int,Int,T,T,T}[]    # (lower node or 0, upper node or m+1, lower, upper, count)
     for i in eachindex(lower, upper)
         a, b = T(lower[i]), T(upper[i])
+        cnt = counts === nothing ? one(T) : T(counts[i])
         ia = isfinite(a) ? searchsortedlast(y, a) : 0
         ib = isfinite(b) ? searchsortedlast(y, b) : m + 1
         if ia == ib             # a point, or an interval narrower than the merge tolerance
-            w[ia] += 1
+            w[ia] += cnt
         else
-            push!(keys, (ia, ib, a, b))
+            push!(keys, (ia, ib, a, b, cnt))
         end
     end
     sort!(keys; by=k -> (k[1], k[2]))
     groups = _IntervalGroup{T}[]
     reps = Tuple{T,T}[]
-    for (ia, ib, a, b) in keys
+    for (ia, ib, a, b, cnt) in keys
         if !isempty(groups) && groups[end].first == ia && groups[end].last == ib - 1
             g = groups[end]
-            groups[end] = _IntervalGroup{T}(g.first, g.last, g.r + 1)
+            groups[end] = _IntervalGroup{T}(g.first, g.last, g.r + cnt)
         else
             if !isempty(groups) && groups[end].last >= ia
                 a0, b0 = reps[end]
                 throw(ArgumentError("intervals [$a0, $b0] and [$a, $b] overlap; overlapping intervals are not supported"))
             end
-            push!(groups, _IntervalGroup{T}(ia, ib - 1, one(T)))
+            push!(groups, _IntervalGroup{T}(ia, ib - 1, cnt))
             push!(reps, (a, b))
         end
     end
@@ -427,7 +433,11 @@ end
 
 # Solve H x = b in place for the SPD banded H stored as its lower band (band[1+i-j, j]),
 # overwriting the band with its Cholesky factor.
-function _banded_cholesky_solve!(band::Matrix{T}, b::Vector{T}) where {T}
+_banded_cholesky_solve!(band::Matrix{T}, b::Vector{T}) where {T} =
+    _banded_solve!(_banded_cholesky!(band), b)
+
+# Overwrite the lower band of an SPD banded matrix with its Cholesky factor L (H = LLᵀ).
+function _banded_cholesky!(band::Matrix{T}) where {T}
     bw = size(band, 1) - 1
     m = size(band, 2)
     for j in 1:m
@@ -446,6 +456,13 @@ function _banded_cholesky_solve!(band::Matrix{T}, b::Vector{T}) where {T}
             band[1+i-j, j] = t / d
         end
     end
+    return band
+end
+
+# Solve LLᵀx = b in place, given the banded Cholesky factor from `_banded_cholesky!`.
+function _banded_solve!(band::Matrix{T}, b::Vector{T}) where {T}
+    bw = size(band, 1) - 1
+    m = size(band, 2)
     for j in 1:m                    # forward: L z = b
         t = b[j]
         for k in max(1, j - bw):j-1
@@ -461,6 +478,57 @@ function _banded_cholesky_solve!(band::Matrix{T}, b::Vector{T}) where {T}
         b[j] = t / band[1, j]
     end
     return b
+end
+
+# The entries of H⁻¹ within the band of H, in the same lower-band layout, from the banded Cholesky
+# factor L. Since LᵀH⁻¹ = L⁻¹ is lower triangular with diagonal 1/Lⱼⱼ, the band of H⁻¹ fills in
+# from the last column backwards (Takahashi's recurrence), in O(m·bw²).
+function _banded_inverse_band(chol::Matrix{T}) where {T}
+    bw = size(chol, 1) - 1
+    m = size(chol, 2)
+    K = zeros(T, bw + 1, m)
+    Kij(i, j) = i >= j ? K[1+i-j, j] : K[1+j-i, i]
+    for j in m:-1:1
+        kmax = min(m, j + bw)
+        for i in kmax:-1:j+1
+            t = zero(T)
+            for k in j+1:kmax
+                t += chol[1+k-j, j] * Kij(k, i)
+            end
+            K[1+i-j, j] = -t / chol[1, j]
+        end
+        t = zero(T)
+        for k in j+1:kmax
+            t += chol[1+k-j, j] * K[1+k-j, j]
+        end
+        K[1, j] = (1 / chol[1, j] - t) / chol[1, j]
+    end
+    return K
+end
+
+# The dense block of H⁻¹ on the contiguous index range `r`, from the band `K` of H⁻¹ and the
+# Cholesky factor L. Entries beyond the band follow from (LᵀH⁻¹)ᵢⱼ = 0 for i < j, which gives
+# (H⁻¹)ᵢⱼ through (H⁻¹)ₖⱼ for k = i+1, …, i+bw: filling each column upward, those lie either
+# lower in the same column of the block or within the band.
+function _inverse_block(chol::Matrix{T}, K::Matrix{T}, r::UnitRange{Int}) where {T}
+    bw = size(K, 1) - 1
+    m = size(K, 2)
+    B = zeros(T, length(r), length(r))
+    f = first(r) - 1
+    for j in r
+        for i in j:-1:first(r)
+            if j - i <= bw
+                B[i-f, j-f] = K[1+j-i, i]
+                continue
+            end
+            t = zero(T)
+            for k in i+1:min(m, i + bw)
+                t += chol[1+k-i, i] * (k <= j ? B[k-f, j-f] : K[1+k-j, j])
+            end
+            B[i-f, j-f] = -t / chol[1, i]
+        end
+    end
+    return Matrix(Symmetric(B, :U))
 end
 
 # Starting nodal densities: a point fit to one representative location per observation, at a
@@ -495,11 +563,21 @@ function _interval_start(L::_IntervalLayout{T}) where {T}
 end
 
 # A scale at which the nodal densities cannot be represented: some density has underflowed so far
-# that the gradient or Hessian of Φ in s overflows. A direct fit reports it as an ArgumentError.
+# that the gradient or Hessian of Φ in s overflows. Selectors treat such a scale as unresolvable.
 struct _UnresolvableScale <: Exception
     msg::String
 end
 Base.showerror(io::IO, e::_UnresolvableScale) = print(io, e.msg)
+
+# Run `f()`, returning `fallback` if the scale it fits is unresolvable.
+function _unless_unresolvable(f, fallback)
+    try
+        return f()
+    catch err
+        err isa _UnresolvableScale || rethrow()
+        return fallback
+    end
+end
 
 # Throw `_UnresolvableScale` unless the evaluation `E` at `s` is finite. A density far below a
 # neighboring one (an interval edge far from the points inside it, at large κ) makes the terms of
@@ -596,6 +674,469 @@ function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing)
     _eval_phi!(E, L, s)
     _check_finite_eval(E, L, s)
     return s, E
+end
+
+# ---------------------------------------------------------------------------------------------
+# Deletion scores
+
+# The reduced term φ of group `g` carrying multiplicity `r`, as a function of the amplitudes `vl`
+# at its nodes (`_group_nodes(g, m)`, the full-length `v` holding them): its value, the group
+# mass P, the root τ, and the gradient, Hessian, and mass gradient ∇ᵥP = 2n/D in those
+# amplitudes. With r = 0 the group's cells are empty (τ = 1) and φ is their flux term alone.
+function _group_local(L::_IntervalLayout{T}, g::_IntervalGroup{T}, r::T, v::Vector{T}, τ0::T) where {T}
+    m = length(L.y)
+    nodes = _group_nodes(g, m)
+    k = length(nodes)
+    f = first(nodes)
+    τ = r > 0 ? _solve_tau(L, _IntervalGroup{T}(g.first, g.last, r), v, τ0) : one(T)
+    φ = P = dQ = scale = zero(T)
+    gv = zeros(T, k); Hv = zeros(T, k, k); nvec = zeros(T, k)
+    for c in g.first:g.last
+        κ = _cell_kappa(L, c)
+        m11, m12, n11, n12, d11, d12 = _cell_forms(L, c, κ^2 * τ)
+        a, b = m11 / κ^2, m12 / κ^2
+        P += _cell_quad(L, v, c, n11, n12)
+        dQ += κ^2 * _cell_quad(L, v, c, d11, d12)
+        if c == 0 || c == m
+            i = c == 0 ? 1 : m
+            ii = i - f + 1
+            φ += a * v[i]^2 / 2
+            scale += abs(a) * v[i]^2 / 2
+            gv[ii] += a * v[i]
+            Hv[ii, ii] += a
+            nvec[ii] += n11 * v[i]
+        else
+            i = c - f + 1
+            φ += (a * (v[c]^2 + v[c+1]^2) + 2b * v[c] * v[c+1]) / 2
+            scale += (abs(a) * (v[c]^2 + v[c+1]^2) + 2abs(b * v[c] * v[c+1])) / 2
+            gv[i] += a * v[c] + b * v[c+1]
+            gv[i+1] += b * v[c] + a * v[c+1]
+            Hv[i, i] += a; Hv[i+1, i+1] += a
+            Hv[i, i+1] += b; Hv[i+1, i] += b
+            nvec[i] += n11 * v[c] + n12 * v[c+1]
+            nvec[i+1] += n12 * v[c] + n11 * v[c+1]
+        end
+    end
+    D = one(T)
+    if r > 0
+        φ += r - r * log(P)
+        scale += r * (1 + abs(log(P)))
+        D = 1 - 2r * dQ / P^2
+        γ = 4r / (P^2 * D)
+        for j in 1:k, i in 1:k
+            Hv[i, j] += γ * nvec[i] * nvec[j]
+        end
+    end
+    return (; φ, scale, P, τ, gv, Hv, gP = 2 .* nvec ./ D)
+end
+
+# ∇ᵥZ, the gradient of the unnormalized mass in the nodal amplitudes, given each group's ∇ᵥP.
+function _grad_Z(L::_IntervalLayout{T}, v::Vector{T}, gPs) where {T}
+    y = L.y
+    m = length(y)
+    gZ = zeros(T, m)
+    for c in 0:m
+        L.cellgroup[c+1] == 0 || continue
+        if c == 0 || c == m
+            i, κ = c == 0 ? (1, L.κL) : (m, L.κR)
+            Δ = c == 0 ? y[1] - L.lo : L.hi - y[m]
+            gZ[i] += 2 * _tail_mass(v[i], κ, Δ) / v[i]
+        else
+            _, _, n11, n12, _, _ = _cell_coeffs(L.κs[c]^2, y[c+1] - y[c])
+            gZ[c] += 2 * (n11 * v[c] + n12 * v[c+1])
+            gZ[c+1] += 2 * (n12 * v[c] + n11 * v[c+1])
+        end
+    end
+    for (g, gP) in zip(L.groups, gPs)
+        gZ[_group_nodes(g, m)] .+= gP
+    end
+    return gZ
+end
+
+"""
+    _interval_loo(L; holdout=:location) -> (lp, ld)
+
+Held-out log-probabilities for interval data: `lp[j]` is `ln(P₋/Z₋)` for group `j` refitted
+with one of its observations deleted, and `ld[i]` the held-out log-density at node `i`
+(`NaN` where the node carries no point observation), with `holdout` choosing whether one point
+or the whole location is deleted, as for `_loo_density`. Entries are `NaN` where the
+deleted fit collapses (a non-positive held-out probability, density, or normalization).
+
+Both come from the full fit's Hessian without refitting. Each deletion is minimized over a
+local set of nodal amplitudes: those of the group losing the observation (or, for a point, of
+the groups occupying the cells beside it), widened by the groups occupying the adjacent cells.
+The terms of those groups and any point terms on those nodes are kept exact, with the
+multiplicity or point weight reduced; the rest of the problem enters through its quadratic
+model in the amplitudes, reduced onto the local nodes by the Schur complement `(K_ll)⁻¹ - A`
+(`K` the inverse Hessian in amplitudes, `A` the Hessian of the exact terms). The remaining
+nodes follow the quadratic model, which carries the normalization to first order. The exact
+terms matter where the smoothing length is well below the interval width: deleting an
+observation then reshapes the field across its own and the neighboring intervals. The
+quadratic model is taken in amplitudes because empty cells are exactly quadratic there. A
+point bordered only by empty cells uses the nonlinear step of the point-data score. Where a
+deletion leaves a stretch with no observations (a singleton interval, or a location deleted
+whole, bordered only by empty cells), the held-out value comes from the source-free
+stationarity there in the log domain, as in `_loo_terms`, so that it keeps its relative accuracy
+when it is of order e^{-2κ·gap}. Cost is `O(m·bw²)` for the band of the inverse plus a few
+small solves per group and per point beside an occupied cell.
+"""
+function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {T}
+    holdout in (:location, :observation) ||
+        throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
+    m = length(L.y)
+    s, E = _solve_interval(L)
+    Z = E.Z
+    v = sqrt.(s)
+    chol = _banded_cholesky!(copy(E.band))
+    Ks = _banded_inverse_band(chol)             # band of the inverse Hessian in s
+    Kv(i, j) = (i >= j ? Ks[1+i-j, j] : Ks[1+j-i, i]) / (4 * v[i] * v[j])   # ∇²ᵥΦ = 4V(∇²ₛΦ)V
+    Kvblock(r) = _inverse_block(chol, Ks, r) ./ (4 .* v[r] .* v[r]')
+    locals = [_group_local(L, g, g.r, v, E.τ[j]) for (j, g) in pairs(L.groups)]
+    gZ = _grad_Z(L, v, (loc.gP for loc in locals))
+    KgZ = _banded_solve!(chol, gZ ./ (2 .* v)) ./ (2 .* v)                  # K_v ∇ᵥZ
+    lp = fill(T(NaN), length(L.groups))
+    for (j, g) in pairs(L.groups)
+        js = _with_neighbors(L, [j])            # js[1] == j
+        gs = L.groups[js]
+        nodes = _span_nodes(gs, m)
+        pw = L.w[nodes]
+        rs = [gq.r for gq in gs]
+        loc = _local_terms(L, gs, rs, E.τ[js], nodes, pw, v)
+        Kll = Kvblock(nodes)
+        S = inv(Kll) - loc.Hv                   # the rest's Hessian, reduced onto the local nodes
+        rs[1] -= 1
+        vl, new, resolved = _delete_local(L, gs, rs, pw, v, nodes, loc, S, E.τ[js])
+        δ = vl .- v[nodes]
+        # The group's mass needs at least one of its own amplitudes resolved.
+        own = _group_nodes(g, m) .- (first(nodes) - 1)
+        lP = any(resolved[own]) ? log(new.Ps[1]) : T(NaN)
+        Pm = new.P
+        if _empties_isolated(L, g)
+            lP, δ = _emptied_group(L, g, v, nodes, Kll \ δ, Kvblock)
+            Pm = exp(lP)
+        end
+        Zm = Z - loc.P + Pm + dot(KgZ[nodes] .- Kll * loc.gP, Kll \ δ)
+        isfinite(lP) && Zm > 0 && (lp[j] = lP - log(Zm))
+    end
+    ld = fill(T(NaN), m)
+    for i in 1:m
+        w = L.w[i]
+        w == 0 && continue
+        h = 2 * Kv(i, i) / v[i]^2               # leverage, in the convention of `_loo_density`
+        c = holdout === :location ? w : one(T)
+        τ = _deletion_step(h, w, c)
+        Zm = Z - 2 * τ * KgZ[i] / v[i]
+        touching = unique!(filter(!=(0), [L.cellgroup[i], L.cellgroup[i+1]]))
+        if !isempty(touching)
+            # Inside or beside an occupied interval: deleting the point reshapes that interval's
+            # field, so its term (and its neighbors') is kept exact alongside the point's, as for
+            # a group deletion.
+            js = _with_neighbors(L, touching)
+            gs = L.groups[js]
+            nodes = _span_nodes(gs, m)
+            pw = L.w[nodes]
+            rs = [g.r for g in gs]
+            loc = _local_terms(L, gs, rs, E.τ[js], nodes, pw, v)
+            pw[i-first(nodes)+1] -= c
+            Kll = Kvblock(nodes)
+            S = inv(Kll) - loc.Hv
+            vl, new, resolved = _delete_local(L, gs, rs, pw, v, nodes, loc, S, E.τ[js])
+            Zm = Z - loc.P + new.P + dot(KgZ[nodes] .- Kll * loc.gP, Kll \ (vl .- v[nodes]))
+            p = i - first(nodes) + 1
+            lv2 = resolved[p] ? 2 * log(vl[p]) : T(NaN)
+        elseif c == w
+            # Source-free after deletion: the neighbor sum of `_loo_terms`, over the empty cells.
+            a = zero(T)
+            l = T(-Inf)
+            for (cell, nb) in ((i - 1, i - 1), (i, i + 1))
+                acell, lb = _empty_flux_log(L, cell)
+                a += acell
+                1 <= cell <= m - 1 || continue
+                vnb = v[nb] - 2τ * Kv(nb, i) / v[i]
+                l = vnb > 0 ? logaddexp(l, lb + log(vnb)) : T(NaN)
+            end
+            lv2 = 2 * (l - log(a))
+        else
+            lv2 = log((v[i] * (1 - τ * h))^2)
+        end
+        isfinite(lv2) && Zm > 0 && (ld[i] = lv2 - log(Zm))
+    end
+    return lp, ld
+end
+
+# The flux form of empty cell c divided by κ², as `_eval_phi!` adds it: its diagonal entry a and
+# ln(-b) for its off-diagonal b (-Inf for a tail), formed directly so that it stays finite where
+# csch(κh) underflows.
+function _empty_flux_log(L::_IntervalLayout{T}, c::Int) where {T}
+    m = length(L.y)
+    if c == 0 || c == m
+        κ, Δ = c == 0 ? (L.κL, L.y[1] - L.lo) : (L.κR, L.hi - L.y[m])
+        return _tail_diag(κ, Δ) / κ, T(-Inf)
+    end
+    κ = L.κs[c]
+    θ = κ * (L.y[c+1] - L.y[c])
+    return coth(θ) / κ, -log(κ) - logabssinh(θ)
+end
+
+# Whether deleting group g's single observation leaves its nodes source-free: no point
+# observations on them and no occupied cell beside the group.
+function _empties_isolated(L::_IntervalLayout, g::_IntervalGroup)
+    m = length(L.y)
+    g.r == 1 || return false
+    all(i -> L.w[i] == 0, _group_nodes(g, m)) || return false
+    g.first >= 1 && L.cellgroup[g.first] != 0 && return false       # cell g.first - 1
+    g.last + 1 <= m && L.cellgroup[g.last+2] != 0 && return false   # cell g.last + 1
+    return true
+end
+
+# Held-out log-probability ln P₋ of a group that `_empties_isolated`, and the change δ in its
+# nodal amplitudes. With every cell touching the group's nodes empty, the deleted model's
+# stationarity there is linear: C vₗ = -Bᵀv'ₒ, where C is the empty-cell flux form on the group's
+# nodes, B couples them to the outer neighbors o, and v'ₒ = vₒ + Kₒₗ Kₗₗ⁻¹δ are those neighbors
+# under the quadratic model (`y = Kₗₗ⁻¹δ` from the model's minimizer). C is an M-matrix and the
+# right side is positive, so the solve has no cancellation; it is scaled by the largest coupling
+# so that vₗ, of order e^{-κ·gap}, never underflows. `Kvblock(r)` gives the block of the inverse
+# Hessian in amplitudes on the index range r.
+function _emptied_group(L::_IntervalLayout{T}, g::_IntervalGroup{T}, v::Vector{T}, nodes,
+                        y::Vector{T}, Kvblock) where {T}
+    m = length(L.y)
+    k = length(nodes)
+    C = _group_local(L, g, zero(T), v, one(T)).Hv
+    ext = max(first(nodes) - 1, 1):min(last(nodes) + 1, m)
+    Kext = Kvblock(ext)
+    Kvfar(i, j) = Kext[i-first(ext)+1, j-first(ext)+1]
+    lr = fill(T(-Inf), k)
+    for (c, o, q) in ((g.first - 1, first(nodes) - 1, 1), (g.last + 1, last(nodes) + 1, k))
+        0 <= c <= m || continue
+        a, lb = _empty_flux_log(L, c)
+        C[q, q] += a
+        1 <= c <= m - 1 || continue
+        vo = v[o] + sum(p -> Kvfar(o, nodes[p]) * y[p], 1:k)
+        vo > 0 || return T(NaN), fill(T(NaN), k)
+        lr[q] = logaddexp(lr[q], lb + log(vo))
+    end
+    mx = maximum(lr)
+    isfinite(mx) || return T(NaN), fill(T(NaN), k)
+    x = C \ exp.(lr .- mx)
+    all(>(0), x) || return T(NaN), fill(T(NaN), k)
+    vv = copy(v)
+    vv[nodes] .= x
+    return 2mx + log(_group_mass(L, g, vv, one(T))[1]), exp(mx) .* x .- v[nodes]
+end
+
+# The exact terms of a local deletion problem on the contiguous `nodes`, summed: each group
+# `gs[q]` at multiplicity `rs[q]` (seeded by `τs[q]`), and point terms -2pw[p] ln v at
+# nodes[p]. Returns their value, scale, total mass P, the groups' roots τ, and the gradient,
+# Hessian, and mass gradient in the amplitudes at `nodes`.
+function _local_terms(L::_IntervalLayout{T}, gs, rs, τs, nodes, pw::Vector{T}, v::Vector{T}) where {T}
+    m = length(L.y)
+    k = length(nodes)
+    φ = scale = P = zero(T)
+    gv = zeros(T, k); Hv = zeros(T, k, k); gP = zeros(T, k)
+    τ = collect(T, τs)
+    Ps = similar(τ)
+    for q in eachindex(gs, rs, τ)
+        loc = _group_local(L, gs[q], rs[q], v, τ[q])
+        idx = _group_nodes(gs[q], m) .- (first(nodes) - 1)
+        φ += loc.φ; scale += loc.scale; P += loc.P; Ps[q] = loc.P; τ[q] = loc.τ
+        gv[idx] .+= loc.gv; Hv[idx, idx] .+= loc.Hv; gP[idx] .+= loc.gP
+    end
+    for (p, i) in pairs(nodes)
+        pw[p] == 0 && continue
+        φ -= 2pw[p] * log(v[i])
+        scale += 2pw[p] * abs(log(v[i]))
+        gv[p] -= 2pw[p] / v[i]
+        Hv[p, p] += 2pw[p] / v[i]^2
+    end
+    return (; φ, scale, P, Ps, τ, gv, Hv, gP)
+end
+
+# Indices of the groups in `js` together with the groups occupying the cells just outside each.
+# A deletion reshapes the field in its own cells; where a neighboring cell is occupied, that
+# group's term responds nonlinearly through the shared node and is kept exact too.
+function _with_neighbors(L::_IntervalLayout, js::Vector{Int})
+    m = length(L.y)
+    out = copy(js)
+    for j in js
+        g = L.groups[j]
+        for c in (g.first - 1, g.last + 1)
+            0 <= c <= m || continue
+            q = L.cellgroup[c+1]
+            q == 0 || q in out || push!(out, q)
+        end
+    end
+    return out
+end
+
+# The contiguous node range spanned by groups `gs`.
+_span_nodes(gs, m::Int) = minimum(g -> first(_group_nodes(g, m)), gs):maximum(g -> last(_group_nodes(g, m)), gs)
+
+# Minimize the deleted local model  φ'(vl) - ∇φ(v)ᵀΔ + ½ΔᵀSΔ,  Δ = vl - v[nodes],  by damped
+# Newton over positive amplitudes, where φ = `loc` holds the local terms of the full fit and φ'
+# the same terms (`_local_terms`) with multiplicities `rs` and point weights `pw`. Returns the
+# minimizer, the local terms there, and which amplitudes are resolved.
+#
+# A node that the deletion leaves source-free next to an emptied cell falls by a factor of order
+# e^{-κh}, which the positivity cap on the step approaches only geometrically. Once an amplitude
+# is below √eps of its starting value it is negligible: its effect on the other nodes and on the
+# masses is below roundoff. Such nodes are excluded from the step cap and the convergence test and
+# held positive by dividing them by 100 whenever the step would overshoot; they are reported as
+# unresolved, and a caller that needs one of their values must not use it.
+function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T}, nodes,
+                       loc, S::Matrix{T}, τ0) where {T}
+    v0 = v[nodes]
+    w = copy(v)
+    τ = τ0
+    resolved = trues(length(v0))
+    function advance(vl, α, step)
+        vn = vl .- α .* step
+        for i in eachindex(vn, vl)
+            resolved[i] || vn[i] > 0 || (vn[i] = vl[i] / 100)
+        end
+        return vn
+    end
+    function model!(vl)
+        w[nodes] .= vl
+        new = _local_terms(L, gs, rs, τ, nodes, pw, w)
+        Δ = vl .- v0
+        return new.φ - dot(loc.gv, Δ) + dot(Δ, S * Δ) / 2, new
+    end
+    vl = copy(v0)
+    f, cur = model!(vl)
+    tol = eps(T)^(3 // 4)
+    converged = unguarded = false
+    prevstep = T(Inf)
+    for _ in 1:100
+        τ = cur.τ
+        Δ = vl .- v0
+        grad = cur.gv .- loc.gv .+ S * Δ
+        Hm = Symmetric(cur.Hv .+ S)
+        F = cholesky(Hm; check=false)
+        μ = zero(T)
+        while !issuccess(F)                     # far from the minimizer: regularize to descend
+            μ = max(2μ, sqrt(eps(T)) * maximum(abs, Hm))
+            F = cholesky(Hm + μ * I; check=false)
+        end
+        step = F \ grad
+        relstep = maximum(i -> resolved[i] ? abs(step[i]) / vl[i] : zero(T), eachindex(vl, step))
+        # Converged, or at the floor roundoff imposes (unguarded steps no longer shrinking).
+        if relstep <= tol || (unguarded && relstep >= prevstep)
+            converged = true
+            break
+        end
+        prevstep = relstep
+        α = one(T)
+        for i in eachindex(vl, step)
+            resolved[i] && step[i] > 0 && (α = min(α, T(0.99) * vl[i] / step[i]))
+        end
+        # Once the predicted decrease is below the roundoff in the model's value (measured by the
+        # magnitude of the terms summed into it), the value can no longer guard the step; take it
+        # as Newton gives it.
+        roundoff = 16 * eps(T) * (cur.scale + abs(dot(loc.gv, Δ)) + abs(dot(Δ, S * Δ)))
+        guarded = α * dot(grad, step) > roundoff
+        unguarded |= !guarded
+        if !guarded
+            vl = advance(vl, α, step)
+            f, cur = model!(vl)
+        end
+        while guarded
+            vn = advance(vl, α, step)
+            fn, new = model!(vn)
+            if fn <= f || α * relstep <= eps(T)
+                vl = vn
+                f, cur = fn, new
+                break
+            end
+            α /= 2
+        end
+        for i in eachindex(vl, v0)
+            vl[i] <= sqrt(eps(T)) * v0[i] && (resolved[i] = false)
+        end
+    end
+    converged || error("deleting an observation in [$(L.y[first(nodes)]), $(L.y[last(nodes)])] " *
+                       "did not converge; please report this")
+    return vl, cur, resolved
+end
+
+# Kullback–Leibler cross-validation score for interval data: the mean negative held-out
+# log-likelihood, each interval observation contributing its held-out log-probability and each
+# point its held-out log-density. NaN if any held-out value is undefined, so the search rejects κ.
+function _interval_klcv(L::_IntervalLayout{T}; holdout::Symbol=:location) where {T}
+    lp, ld = _interval_loo(L; holdout)
+    s = zero(T)
+    n = zero(T)
+    for (g, l) in zip(L.groups, lp)
+        isfinite(l) || return T(NaN)
+        s += g.r * l
+        n += g.r
+    end
+    for i in eachindex(L.w, ld)
+        L.w[i] == 0 && continue
+        isfinite(ld[i]) || return T(NaN)
+        s += L.w[i] * ld[i]
+        n += L.w[i]
+    end
+    return -s / n
+end
+
+function select_kappa_kl(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
+                         κs::Union{AbstractVector{<:Real},Nothing}=nothing,
+                         rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
+                         support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location)
+    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    a, b = support
+    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    axes(lower) == axes(upper) ||
+        throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
+    grid = κs === nothing ? _default_interval_κs(lower, upper) : κs
+    _check_kappa_grid(grid)
+    T = float(promote_type(eltype(lower), eltype(upper), eltype(grid), typeof(rtol),
+                           _support_eltype(a), _support_eltype(b)))
+    r, slo, shi = T(rtol), T(a), T(b)
+    lu, uu, counts = _tally_intervals(lower, upper, T)
+    function score(κ)
+        L = _interval_layout(lu, uu, κ, r, slo, shi; counts)
+        v = _unless_unresolvable(() -> _interval_klcv(L; holdout), T(NaN))
+        return isfinite(v) ? v : typemax(T)
+    end
+    return _minimize_on_grid(score, grid, T)
+end
+
+# The distinct (lower, upper) pairs, sorted, with the number of observations sharing each.
+# Rounded data have far fewer distinct intervals than observations, and a selector lays out the
+# data once per candidate scale.
+function _tally_intervals(lower::AbstractVector, upper::AbstractVector, ::Type{T}) where {T}
+    ps = sort!([(T(lower[i]), T(upper[i])) for i in eachindex(lower, upper)])
+    lu, uu, counts = T[], T[], T[]
+    for p in ps
+        if !isempty(counts) && p == (lu[end], uu[end])
+            counts[end] += 1
+        else
+            push!(lu, p[1]); push!(uu, p[2]); push!(counts, one(T))
+        end
+    end
+    return lu, uu, counts
+end
+
+# Geometric κ grid for interval data: from one blob over the finite bounds up to one scale per
+# observation, stopping where κ times the widest finite interval reaches half the fit's accuracy
+# limit (`_check_resolvable`).
+function _default_interval_κs(lower::AbstractVector, upper::AbstractVector)
+    T = float(promote_type(eltype(lower), eltype(upper)))
+    lo, hi = T(Inf), T(-Inf)
+    wmax = zero(T)
+    for i in eachindex(lower, upper)
+        a, b = T(lower[i]), T(upper[i])
+        for t in (a, b)
+            isfinite(t) && (lo = min(lo, t); hi = max(hi, t))
+        end
+        isfinite(a) && isfinite(b) && (wmax = max(wmax, b - a))
+    end
+    span = hi - lo
+    span > 0 || throw(ArgumentError("need at least two distinct finite bounds to select κ"))
+    κhi = 5 * length(lower) / span
+    wmax > 0 && (κhi = min(κhi, eps(T)^(-1 // 4) / (2wmax)))
+    return exp.(range(log(T(0.5) / span), log(κhi); length = 40))
 end
 
 # ---------------------------------------------------------------------------------------------

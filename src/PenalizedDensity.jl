@@ -1,6 +1,7 @@
 module PenalizedDensity
 
-using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, ZeroPivotException, dot, ldiv!, ldlt!, mul!
+using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, Symmetric, ZeroPivotException, cholesky, dot,
+                     issuccess, ldiv!, ldlt!, mul!
 using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
@@ -2295,9 +2296,8 @@ values to bracket the minimum, and defaults to a geometric range scaled to the d
 
 This and the entropy-based [`kappa_interval`](@ref) both resolve *information* and over-resolve
 smooth densities; to target estimation error instead, prefer [`select_kappa_kl`](@ref) (the
-recommended default) or [`select_kappa_cv`](@ref). The information-resolving scales here and in
-`kappa_interval` are the better choice only for heavily tied or discrete data, where the
-cross-validation scores are unbounded.
+recommended default) or [`select_kappa_cv`](@ref); for rounded data, pass the rounding increment
+to `select_kappa_kl` as `resolution`.
 
 This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
 are derived for the unbounded line and do not generalize to a finite domain, so it always
@@ -2567,7 +2567,7 @@ _klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes,
 
 """
     select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
-                    holdout=:location) -> κ
+                    resolution=nothing, holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
 
@@ -2586,12 +2586,18 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
+Cross-validation assumes the data are draws from a continuous density. If more than 1% of the
+observations repeat another value, the data are probably rounded, and an `ArgumentError`
+explains the options unless `resolution` is given. `resolution=0` accepts the values as exact
+points. Rounded data are better handled by [`select_kappa_kl`](@ref) with `resolution` set to the
+rounding increment, which fits the interval likelihood; this function has no interval form,
+because with only the interval of each observation known, the cross term has no unbiased
+estimate.
+
 `holdout` chooses what each held-out term leaves out: `:location` (the default) all
 observations at the held-out value, `:observation` just one of them. The two agree when every
-value is distinct. Cross-validation assumes the data are draws from a continuous density. On
-heavily tied or coarsely rounded data, leaving out a single copy of a repeated value rewards
-density spikes at the repeated values, and `:observation` then selects a large `κ`. `:location`
-removes that incentive, but the fit still treats the repeated values as exact points.
+value is distinct. On tied data leaving out a single copy rewards density spikes at the repeated
+values.
 
 # Extended help
 
@@ -2600,12 +2606,21 @@ segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a one-step leave-
 the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per-point refitting is
 needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
 """
-select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
-    _select_by_score(_lscv, x, κs, rtol, support; holdout)
+function select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x),
+                         rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
+                         resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
+    resolution === nothing || resolution == 0 ||
+        throw(ArgumentError("select_kappa_cv has no form for rounded (interval) data; use " *
+                            "select_kappa_kl(x; resolution=$resolution), or resolution=0 to treat " *
+                            "the values as exact points"))
+    return _select_by_score(_lscv, x, κs, rtol, support; holdout, checkties=resolution === nothing,
+                            caller="select_kappa_cv")
+end
 
 """
     select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                    resolution=nothing, holdout=:location) -> κ
+    select_kappa_kl(lower, upper; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
                     holdout=:location) -> κ
 
 Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
@@ -2626,13 +2641,23 @@ itself selected, and is held fixed across every candidate `κ`. Data outside `[a
 `a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
 to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
-`holdout` chooses what each held-out term leaves out: `:location` (the default) all
-observations at the held-out value, `:observation` just one of them. The two agree when every
-value is distinct. Cross-validation assumes the data are draws from a continuous density. On
-heavily tied or coarsely rounded data, leaving out a single copy of a repeated value barely
-perturbs the fit, so the leave-one-out log-likelihood rewards density spikes at the repeated
-values and `:observation` then selects a large `κ`. `:location` removes that incentive, but the
-fit still treats the repeated values as exact points.
+Cross-validation of the point likelihood assumes the data are draws from a continuous
+density. If more than 1% of the observations repeat another value, the data are probably
+rounded, and an `ArgumentError` explains the options unless `resolution` is given:
+
+- `resolution = δ > 0`: each `x[i]` was rounded to a lattice of spacing `δ`, and the scale is
+  chosen for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`. Each observation then
+  contributes the held-out log-probability of its rounding interval.
+- `resolution = 0`: the values are exact points, fitted by [`DensityEstimate`](@ref).
+
+The second form takes the bounds of interval observations directly, for
+[`IntervalDensityEstimate`](@ref)`(lower, upper, κ)`, including censored values and a mix of
+points and intervals.
+
+`holdout` chooses what each held-out term for a point observation leaves out: `:location` (the
+default) all observations at the held-out value, `:observation` just one of them. The two agree
+when every value is distinct. On tied data leaving out a single copy rewards density spikes at
+the repeated values. Interval observations are always left out one at a time.
 
 # Extended help
 
@@ -2640,26 +2665,44 @@ fit still treats the repeated values as exact points.
 `KL(Q ‖ Q̂_κ)`; minimizing it is maximum-likelihood cross-validation. It is the criterion native
 to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-likelihood, and to
 leading order it selects the same error-optimal scale as [`select_kappa_cv`](@ref) while being
-cheaper: the `∫Q̂²` roughness term is not needed.
+cheaper: the `∫Q̂²` roughness term is not needed. For interval data it estimates the divergence
+between the true and fitted probabilities of the recorded intervals, which is all such data
+determine.
 
 Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a one-step leave-one-out expansion of the fit
 in the dropped point's weight — a Newton step whose length is set so the deleted node's own
 stationarity holds exactly, which tracks a literal refit closely without a linear step's blindness
-to over-fitting — so no per-point refitting is needed and the score costs `O(N)`. The score is
-minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
+to over-fitting — so no per-point refitting is needed and the score costs `O(N)`. For an interval
+observation, the refit is approximated by minimizing over the interval's own nodal values with
+its term in the likelihood exact and the rest of the problem replaced by its quadratic model,
+which stays accurate when the deletion empties the interval. The score is minimized by a
+golden-section search over `ln κ`, bracketed by the grid `κs`. For interval data the default
+grid stops where `κ` times the widest interval reaches 4096, beyond which the fit is at its
+histogram limit and cannot be computed accurately.
 """
-select_kappa_kl(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-               support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location) =
-    _select_by_score(_klcv, x, κs, rtol, support; holdout)
+function select_kappa_kl(x::AbstractVector{<:Real}; κs::Union{AbstractVector{<:Real},Nothing}=nothing,
+                         rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
+                         resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
+    if resolution === nothing || resolution == 0
+        return _select_by_score(_klcv, x, κs === nothing ? _default_κs(x) : κs, rtol, support;
+                                holdout, checkties=resolution === nothing, caller="select_kappa_kl")
+    end
+    isfinite(resolution) && resolution > 0 ||
+        throw(ArgumentError("resolution must be finite and nonnegative, got $resolution"))
+    isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
+    T = float(promote_type(eltype(x), typeof(resolution)))
+    lower, upper = _lattice_bounds(x, T(resolution), support)
+    return select_kappa_kl(lower, upper; κs, rtol, support, holdout)
+end
 
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
 # search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
 # nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
 # to a non-finite score; those are treated as +∞ so the search never selects a degenerate scale.
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
-                          support::Tuple{Real,Real}; holdout::Symbol=:location)
-    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
-    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+                          support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false,
+                          caller::String="")
+    _check_kappa_grid(κs)
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     a, b = support
     a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
@@ -2667,13 +2710,52 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     xs = _sorted_sample(x, T)
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
+    checkties && _check_ties(xs, caller)
     r = T(rtol)
     score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout); isfinite(v) ? v : typemax(T))
+    return _minimize_on_grid(score, κs, T)
+end
+
+function _check_kappa_grid(κs)
+    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
+    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+    return nothing
+end
+
+# Bracket the minimum of `score(κ)` on the grid `κs`, then refine by golden section in ln κ.
+function _minimize_on_grid(score, κs, ::Type{T}) where {T}
     lnκ = log.(T.(κs))
-    i = argmin(score.(exp.(lnκ)))               # coarse bracket on the grid
+    i = argmin(score.(exp.(lnκ)))
     loκ = lnκ[max(i - 1, firstindex(lnκ))]
     hiκ = lnκ[min(i + 1, lastindex(lnκ))]
     return exp(_golden_min(l -> score(exp(l)), loκ, hiκ))
+end
+
+# Fraction of repeated values above which the point-likelihood selectors refuse the sample.
+const _TIE_FRACTION = 0.01
+
+# Throw if more than `_TIE_FRACTION` of the sorted sample `xs` repeats an earlier value, naming
+# the lattice spacing when the distinct values lie on one.
+function _check_ties(xs::Vector{T}, caller::String) where {T}
+    n = length(xs)
+    ntied = count(i -> xs[i] == xs[i-1], 2:n)
+    ntied > _TIE_FRACTION * n || return nothing
+    pct = round(100 * ntied / n; digits=1)
+    msg = "$ntied of the $n observations ($pct%) repeat another value, as rounded data do; the " *
+          "point likelihood treats them as exact. "
+    d = T[xs[i] - xs[i-1] for i in 2:n if xs[i] != xs[i-1]]    # gaps between distinct values
+    δ = isempty(d) ? zero(T) : minimum(d)
+    fix = caller == "select_kappa_kl" ?
+          "pass `resolution=δ` to fit them as rounded (interval) data" :
+          "use `select_kappa_kl(x; resolution=δ)` to fit them as rounded (interval) data"
+    if length(d) >= 2 && all(di -> abs(di / δ - round(di / δ)) <= 1e-3, d)
+        msg *= "The distinct values lie on a lattice of spacing δ ≈ $(round(δ; sigdigits=6)): $fix, " *
+               "or pass `resolution=0` to treat them as exact points."
+    else
+        msg *= "Pass `resolution=0` to treat them as exact points, or give each observation's bounds " *
+               "with `select_kappa_kl(lower, upper)`."
+    end
+    throw(ArgumentError(msg))
 end
 
 """

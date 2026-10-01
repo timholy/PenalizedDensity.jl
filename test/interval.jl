@@ -321,3 +321,202 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test occursin("support", sprint(show, IntervalDensityEstimate([0.0], [0.5], 1.0; support=(0, 1))))
     end
 end
+
+# Literal deletion refits, the estimand of `_interval_loo`: for each interval group of the layout,
+# the log-probability of its interval under the fit with one of its observations removed, and for
+# each point node the log-density there with all of its observations removed.
+function held_out_refit(lower, upper, κ; support=(-Inf, Inf))
+    L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), float.(support)...)
+    m = length(L.y)
+    lp = map(L.groups) do g
+        a = g.first == 0 ? -Inf : L.y[g.first]
+        b = g.last == m ? Inf : L.y[g.last+1]
+        # Endpoints merged into one node may differ from it by rounding.
+        near(s, t) = s == t || abs(s - t) <= 1e-9 * max(1, abs(t))
+        k = findfirst(i -> near(lower[i], a) && near(upper[i], b), eachindex(lower, upper))
+        keep = setdiff(eachindex(lower), k)
+        d = IntervalDensityEstimate(lower[keep], upper[keep], κ; support)
+        ia, ib = searchsortedfirst(d.x, a), searchsortedfirst(d.x, b)
+        if ib <= length(d.x) && d.x[ia] == a && d.x[ib] == b     # interval still bounded by nodes
+            F, total = PenalizedDensity._node_cdf(d)
+            log(sum(c -> PenalizedDensity._cell_mass(d, c), ia:ib-1) / total)
+        else
+            log(cdf(d, b) - cdf(d, a))
+        end
+    end
+    pts = [i for i in 1:m if L.w[i] > 0]
+    ld = map(pts) do i
+        keep = [j for j in eachindex(lower, upper) if !(lower[j] == upper[j] == L.y[i])]
+        logdensity(IntervalDensityEstimate(lower[keep], upper[keep], κ; support), L.y[i])
+    end
+    return L, lp, pts, ld
+end
+
+@testset "interval scale selection" begin
+    @testset "band of the inverse of a banded SPD matrix" begin
+        rng = Xoshiro(3)
+        for (bw, m) in ((0, 5), (1, 1), (1, 9), (3, 12))
+            H = zeros(m, m)
+            for j in 1:m, i in j:min(m, j + bw)
+                H[i, j] = H[j, i] = i == j ? 4 + bw + rand(rng) : randn(rng) / 2
+            end
+            band = zeros(bw + 1, m)
+            for j in 1:m, i in j:min(m, j + bw)
+                band[1+i-j, j] = H[i, j]
+            end
+            K = PenalizedDensity._banded_inverse_band(PenalizedDensity._banded_cholesky!(band))
+            Hinv = inv(H)
+            @test all(K[1+i-j, j] ≈ Hinv[i, j] for j in 1:m for i in j:min(m, j + bw))
+        end
+    end
+
+    @testset "held-out values match literal deletion refits" begin
+        cases = (
+            (rounded_intervals(), (-Inf, Inf)),                                   # rounded
+            (rounded_intervals(; cens=(1.375, 6)), (-Inf, Inf)),                  # right-censored
+            (rounded_intervals(; δr=0.2, support=(0.0, Inf), seed=2), (0.0, Inf)),# bounded
+            (rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), seed=4), (-Inf, Inf)),  # mixed
+        )
+        for ((lower, upper), support) in cases, κ in (1.0, 3.0)
+            L, lp_ref, pts, ld_ref = held_out_refit(lower, upper, κ; support)
+            lp, ld = PenalizedDensity._interval_loo(L)
+            @test maximum(abs.(lp .- lp_ref)) < 0.02
+            @test isempty(pts) || maximum(abs.(ld[pts] .- ld_ref)) < 0.02
+            rs = [g.r for g in L.groups]
+            score_ref = -(sum(rs .* lp_ref) + sum(L.w[pts] .* ld_ref)) / length(lower)
+            @test PenalizedDensity._interval_klcv(L) ≈ score_ref atol = 2e-3
+        end
+        # Smoothing lengths far below the bin width: deleting an observation reshapes its own and
+        # the neighboring bins, and points inside or on the edge of occupied bins reshape them.
+        grid = [repeat(-1.0:0.25:1.0, 3); 6.0]
+        cases = (
+            ("mixed", rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), seed=4)),
+            ("point inside a bin", ([grid; -4.0; 0.1], [grid .+ 0.25; -4.0; 0.1])),
+            ("points on a shared edge", ([grid; 0.25; 0.25], [grid .+ 0.25; 0.25; 0.25])),
+            ("rounded", rounded_intervals()),
+        )
+        for (_, (lower, upper)) in cases, κ in (30.0, 200.0)
+            L, lp_ref, pts, ld_ref = held_out_refit(lower, upper, κ)
+            lp, ld = PenalizedDensity._interval_loo(L)
+            fin = isfinite.(lp_ref)       # the refit's cdf difference underflows for far bins
+            @test maximum(abs.(lp[fin] .- lp_ref[fin])) < 0.02
+            @test all(isfinite, lp)
+            @test isempty(pts) || maximum(abs.(ld[pts] .- ld_ref)) < 0.02
+        end
+        # The mixed case includes intervals spanning several cells (a point inside a bin).
+        L = PenalizedDensity._interval_layout(rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), seed=4)..., 1.0,
+                                cbrt(eps()), -Inf, Inf)
+        @test any(g -> g.last > g.first, L.groups)
+    end
+
+    @testset "point observations reproduce the point-data held-out densities" begin
+        x = sort(randn(Xoshiro(5), 80))
+        x = [x; x[1:10]]                          # ten locations with two copies
+        for κ in (1.0, 4.0), holdout in (:location, :observation)
+            L = PenalizedDensity._interval_layout(x, x, κ, cbrt(eps()), -Inf, Inf)
+            _, ld = PenalizedDensity._interval_loo(L; holdout)
+            _, looi = PenalizedDensity._loo_density(L.y, L.w, κ, κ, κ; holdout)
+            @test ld ≈ log.(looi) rtol = 1e-10
+        end
+    end
+
+    @testset "blocks of the inverse beyond the band" begin
+        rng = Xoshiro(6)
+        for (bw, m) in ((1, 9), (2, 10))
+            H = zeros(m, m)
+            for j in 1:m, i in j:min(m, j + bw)
+                H[i, j] = H[j, i] = i == j ? 4 + bw + rand(rng) : randn(rng) / 2
+            end
+            band = zeros(bw + 1, m)
+            for j in 1:m, i in j:min(m, j + bw)
+                band[1+i-j, j] = H[i, j]
+            end
+            chol = PenalizedDensity._banded_cholesky!(band)
+            K = PenalizedDensity._banded_inverse_band(chol)
+            Hinv = inv(H)
+            for r in (1:m, 2:6, 4:4, m-bw-1:m)
+                @test PenalizedDensity._inverse_block(chol, K, r) ≈ Hinv[r, r]
+            end
+        end
+    end
+
+    @testset "held-out values of isolated observations far in the tail" begin
+        # A singleton interval and a point far out: their held-out values are of order
+        # e^{-2κ·gap}, far below roundoff relative to the fit, and must still track the refit.
+        # The reference is the refit's right-tail mass, formed in the log domain.
+        lower = [repeat(-1.0:0.25:1.0, 3); 6.0]; upper = lower .+ 0.25
+        for κ in (3.0, 30.0, 200.0)
+            L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), -Inf, Inf)
+            lp, _ = PenalizedDensity._interval_loo(L)
+            d = IntervalDensityEstimate(lower[1:end-1], upper[1:end-1], κ)
+            _, total = PenalizedDensity._node_cdf(d)
+            ref = 2log(d.ψ[end]) - log(2d.kR) - 2d.kR * (6.0 - d.x[end]) +
+                  log(-expm1(-2d.kR * 0.25)) - log(total)
+            @test lp[end] ≈ ref atol = 0.02
+            @test isfinite(PenalizedDensity._interval_klcv(L))
+            lo2 = [lower[1:end-1]; -4.0]
+            up2 = [upper[1:end-1]; -4.0]
+            L2 = PenalizedDensity._interval_layout(lo2, up2, κ, cbrt(eps()), -Inf, Inf)
+            _, ld = PenalizedDensity._interval_loo(L2)
+            @test ld[1] ≈ logdensity(IntervalDensityEstimate(lower[1:end-1], upper[1:end-1], κ), -4.0) atol = 0.03
+        end
+    end
+
+    @testset "select_kappa_kl on rounded data" begin
+        δr = 0.25
+        z = round.(randn(Xoshiro(2), 200) ./ δr) .* δr
+        lower, upper = PenalizedDensity._lattice_bounds(z, δr, (-Inf, Inf))
+        κ = select_kappa_kl(z; resolution=δr)
+        @test κ == select_kappa_kl(lower, upper)
+        @test κ == select_kappa_kl(OffsetArray(z, -7); resolution=δr)
+        # The minimizer of the literal-refit score on a grid.
+        grid = exp.(range(log(0.5), log(30); length=25))
+        refit_score(κ0) = (r = held_out_refit(lower, upper, κ0);
+                           -sum(g.r * l for (g, l) in zip(r[1].groups, r[2])) / length(lower))
+        κgrid = grid[argmin(refit_score.(grid))]
+        @test κgrid / 1.2 < κ < κgrid * 1.2
+        # The default grid stays below the fit's accuracy limit.
+        @test maximum(PenalizedDensity._default_interval_κs(lower, upper)) * δr <= eps()^(-1 / 4) / 2
+        @test PenalizedDensity._default_interval_κs([0.0, 0.0, 1.0], [0.0, 1.0, Inf]) isa AbstractVector
+        # Censored and mixed observations, through the bounds form.
+        lc, uc = rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), cens=(1.375, 6), seed=4)
+        @test 0 < select_kappa_kl(lc, uc) < Inf
+    end
+
+    @testset "tie check and holdout" begin
+        z = round.(randn(Xoshiro(2), 200); digits=1)
+        for f in (select_kappa_kl, select_kappa_cv)
+            @test_throws ArgumentError f(z)
+            @test_throws "lattice of spacing δ ≈ 0.1" f(z)
+            @test_throws "resolution=0" f(z)
+            @test 0 < f(z; resolution=0) < Inf
+        end
+        @test_throws "pass `resolution=δ`" select_kappa_kl(z)
+        @test_throws "select_kappa_kl(x; resolution=δ)" select_kappa_cv(z)
+        @test_throws "no form for rounded (interval) data" select_kappa_cv(z; resolution=0.1)
+        @test_throws "resolution must be finite and nonnegative" select_kappa_kl(z; resolution=-0.1)
+        # Ties off a lattice: the message points to the bounds form.
+        zt = [randn(Xoshiro(1), 100); fill(0.123, 5)]
+        @test_throws "select_kappa_kl(lower, upper)" select_kappa_kl(zt)
+        # At most 1% repeated values is accepted as point data.
+        zs = [randn(Xoshiro(1), 200); 0.5; 0.5]
+        @test 0 < select_kappa_kl(zs) < Inf
+        # Distinct values: both holdouts give the same scale.
+        x = randn(Xoshiro(6), 300)
+        @test select_kappa_kl(x) == select_kappa_kl(x; holdout=:observation)
+        @test_throws "holdout must be :location or :observation" select_kappa_kl(x; holdout=:point)
+        @test_throws "holdout must be :location or :observation" select_kappa_kl(x, x; holdout=:point)
+    end
+
+    @testset "an underflowing interval edge is rejected, not an error" begin
+        # A point near one edge of an occupied interval: as κ grows the density at the far edge
+        # falls toward e^{-κ·distance} and the Newton solve in nodal densities overflows, well
+        # inside the κ·width limit of the layout. The selector skips those scales.
+        lower = [0.0, 1.0, 2.0, 0.9, 1.5, 2.5]
+        upper = [1.0, 2.0, 3.0, 0.9, 1.5, 2.5]
+        κs = exp.(range(log(0.5), log(400.0); length=12))
+        κ = select_kappa_kl(lower, upper; κs)
+        @test κ < 50
+        @test κ ≈ select_kappa_kl(lower, upper; κs=filter(<(50), κs)) rtol = 1e-6
+    end
+end
