@@ -784,7 +784,10 @@ end
 
 # H \ b by the Woodbury identity on the tridiagonal part, in O(k) per rank-one term. Returns
 # `nothing` unless the tridiagonal part is positive definite (its LDLᵀ pivots all positive);
-# the rank-one terms are positive semidefinite, so H is then positive definite too.
+# the rank-one terms are positive semidefinite, so H is then positive definite too. Also returns
+# `nothing` when the result is inaccurate: a tridiagonal part that is nearly singular while the
+# rank-one terms make H well conditioned (an occupied interval's cells near κ·h ≫ 1) makes the
+# identity cancel, so the solution is accepted only if its residual is below √eps of `b`.
 function _solve_pd(H::_LocalHessian{T}, b::AbstractVector) where {T}
     k = length(H.d)
     piv = similar(H.d); l = similar(H.e)        # LDLᵀ of the tridiagonal part
@@ -826,7 +829,12 @@ function _solve_pd(H::_LocalHessian{T}, b::AbstractVector) where {T}
             C[c2, c] += dot(H.n[q2], view(W, H.rq[q2], c))
         end
     end
-    return x .- W * (cholesky(Symmetric(C)) \ Utx)
+    F = cholesky(Symmetric(C); check=false)
+    issuccess(F) || return nothing
+    x .-= W * (F \ Utx)
+    r = _mul(H, x) .- b
+    maximum(abs, r) <= sqrt(eps(T)) * maximum(abs, b) || return nothing
+    return x
 end
 
 # ∇ᵥZ, the gradient of the unnormalized mass in the nodal amplitudes, given each group's ∇ᵥP.
