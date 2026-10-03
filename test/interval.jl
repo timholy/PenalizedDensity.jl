@@ -458,6 +458,18 @@ end
         # An indefinite tridiagonal part is declined, even where the rank-one terms would repair it.
         Hneg = PenalizedDensity._LocalHessian([d[1:end-1]; -0.1], e, H.γ, H.rq, H.n)
         @test PenalizedDensity._solve_pd(Hneg, x) === nothing
+        # A tridiagonal part that is positive definite but nearly singular (last pivot ~1e-18),
+        # made well conditioned by the rank-one terms: a Newton iterate of a far-tail deletion
+        # on a rounded normal sample of 10⁵ at κ·width ≈ 17. Woodbury cancels there; the
+        # result must be declined or accurate, never an error.
+        Hns = PenalizedDensity._LocalHessian(
+            [0.0005565405939444408, 9.62217862535374e-6, 0.0006043233352390404],
+            [-6.481865618175143e-5, -3.539386296912471e-5],
+            [0.022021975303037372, 0.006333619499304914], [2:3, 1:2],
+            [[0.08371827928331622, 0.04699555620569504], [0.11880785610036468, 0.15734551396286225]])
+        b = [1.0, -2.0, 0.5]
+        xs = PenalizedDensity._solve_pd(Hns, b)
+        @test xs === nothing || PenalizedDensity._dense(Hns) * xs ≈ b
     end
 
     @testset "the rest's Hessian on a local set is tridiagonal" begin
