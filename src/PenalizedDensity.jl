@@ -8,7 +8,7 @@ using SpecialFunctions: erfc, erfcinv, erfcx
 using Statistics: Statistics, mean, quantile, std
 
 export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
-export AdaptiveScale, select_kappa_adaptive
+export AdaptiveScale, WindowScale, WindowRule, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
@@ -3006,9 +3006,12 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
     error("the $label kept running off its search bracket after $maxshifts expansions")
 end
 
+include("window.jl")
+
 """
     select_kappa_adaptive(x; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), pilot_selector=nothing,
-        nse=1, rtol=cbrt(eps(T)), support=(-Inf, Inf), resolution=nothing) -> κ
+        window=nothing, nse=(window === nothing ? 1 : 0), rtol=cbrt(eps(T)),
+        support=(-Inf, Inf), resolution=nothing) -> κ
     select_kappa_adaptive(lower, upper; alphas, pilot_selector, nse, rtol, support) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
@@ -3032,6 +3035,15 @@ may be any callable returning a positive scale from the sample (from `(lower, up
 interval data); the default `nothing` uses [`select_kappa_kl`](@ref). `rtol` is the
 node-merging tolerance, as a fraction of the local smoothing length, matching
 [`DensityEstimate`](@ref)'s.
+
+`window = WindowRule()` (see [`WindowRule`](@ref)) adds a second family, a scale that is
+large where a window around `x` must be small before the sample shows a slope or curvature:
+it resolves narrow features whatever their height, where the power family can only refine
+the scale where the density is high. The window candidate is returned, as a
+[`WindowScale`](@ref), when its score plus a penalty is below the score of the scale the
+power family would return; `nse` then defaults to `0`. The window rule needs point
+locations; with `resolution = δ > 0` or the `(lower, upper)` form it throws an
+`ArgumentError`.
 
 `resolution` and the `(lower, upper)` form work as for [`select_kappa_kl`](@ref): more than 1%
 repeated values throw an `ArgumentError` unless `resolution` is given; `resolution = δ > 0`
@@ -3100,6 +3112,35 @@ constant scale is the unresolvable one, the best finite adaptive candidate is
 returned regardless of `nse`. The rule applies only to this final choice, not among the
 exponents.
 
+With `window = WindowRule(; gamma, k, z, nmin)`, the window half-width `ĥ(x)` is the smallest
+on a logarithmic scan (24 steps per decade, starting at the distance to the `nmin`-th
+nearest observation) at which the window `|t - x| ≤ ĥ` holds at least `nmin` observations
+and either of its statistics
+
+    |Σu| / √(N/3)      or      |Σu² - N/3| / √(4N/45),      u = (t - x)/ĥ,
+
+over its `N` observations `t` reaches `z`. Each is a moment's departure from its value for
+points spread uniformly over the window, in units of its standard deviation under that
+spread: a slope and a curvature test of "no structure within the window". `ĥ` is computed on
+a grid of 200 evenly spaced points over the sample's range plus 201 sample quantiles (prefix
+sums make each window cost two binary searches) and interpolated linearly between them. The
+candidate is `κ(x) = c·exp(gamma·s(x))` with `s = ln(1/ĥ)` shifted to mean zero over the
+sample, `c` chosen by the same golden-section search on KLCV as for the power family, starting
+from the pilot scale. It is returned if
+
+    KLCV(window) + k·gamma/√N  <  KLCV(power),
+
+where `KLCV(power)` is the score of the scale the power family would return (the constant
+scale or an [`AdaptiveScale`](@ref), chosen with `nse` as above); a window candidate with no
+resolvable `c` never wins. The penalty accounts for `ĥ` depending on the held-out point
+itself: KLCV treats the shape as fixed, and so rates the window candidate too well, by an
+amount that grows with `gamma` and shrinks like `1/√N`. The default `k = 0.11` matches the
+optimism measured by exact leave-one-out refits (with `ĥ` re-estimated without the held-out
+point) on smooth and bimodal densities at `N = 1000` and `4000`. The threshold `z = 4` keeps
+the scan above the noise of the window statistics, which have unit standard deviation in any
+window without structure. `gamma` is fixed rather than selected per sample, because a
+per-sample choice of `gamma` is dominated by sampling noise in the score.
+
 `pilot_selector` is a scale-selection method, and is called on the sample alone with no notion
 of `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
 notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot_selector` on a
@@ -3111,7 +3152,8 @@ unbounded selection that saw a different edge.
 function select_kappa_adaptive(x::AbstractVector{<:Real};
                                alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
                                pilot_selector=nothing,
-                               nse::Real=1,
+                               window::Union{WindowRule,Nothing}=nothing,
+                               nse::Real=window === nothing ? 1 : 0,
                                rtol::Real=cbrt(eps(float(eltype(x)))),
                                support::Tuple{Real,Real}=(-Inf, Inf),
                                resolution::Union{Real,Nothing}=nothing)
@@ -3121,7 +3163,7 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
         isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
         TR = float(promote_type(eltype(x), typeof(resolution)))
         lower, upper = _lattice_bounds(x, TR(resolution), support)
-        return select_kappa_adaptive(lower, upper; alphas, pilot_selector, nse, rtol, support)
+        return select_kappa_adaptive(lower, upper; alphas, pilot_selector, window, nse, rtol, support)
     end
     _check_adaptive_args(alphas, nse, rtol)
     a, b = support
@@ -3145,7 +3187,9 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
     score(κfun) = _score_kappa(_klcv, xs, κfun, r, slo, shi)
     gain_se(κa) = _adaptive_gain(xs, κ0, κa, r, slo, shi)
-    return _select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse)
+    κp, sp = _select_power(score, gain_se, p, κ0, const_score, alphas, nse)
+    window === nothing && return κp
+    return _choose_window(score, xs, κ0, κp, sp, window)
 end
 
 function _check_adaptive_args(alphas, nse, rtol)
@@ -3161,7 +3205,11 @@ end
 # The search shared by point and interval data. `score(κfun)` is the KLCV score of the scale
 # function `κfun` (NaN when unresolvable), `const_score` that of the pilot's constant scale `κ0`,
 # and `gain_se(κa)` the per-observation gain of `κa` over `κ0` as `(mean, standard error)`.
-function _select_adaptive(score, gain_se, p, κ0::T, const_score::T, alphas, nse) where {T}
+_select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse) =
+    first(_select_power(score, gain_se, p, κ0, const_score, alphas, nse))
+
+# `_select_adaptive`, returning `(κ, score)`: the chosen scale and its KLCV score.
+function _select_power(score, gain_se, p, κ0::T, const_score::T, alphas, nse) where {T}
     loggbar = _log_geomean(p)
 
     # The exponents are searched in increasing order, each bracket centered on the previous
@@ -3181,20 +3229,20 @@ function _select_adaptive(score, gain_se, p, κ0::T, const_score::T, alphas, nse
             best_score, best_c, best_α = s, c0, α
         end
     end
-    best_α == 0 && return κ0                           # no adaptive candidate resolved
+    best_α == 0 && return (κ0, const_score)            # no adaptive candidate resolved
     κa = AdaptiveScale(best_c, best_α, p)
-    isfinite(const_score) || return κa                 # the constant scale is unresolvable
+    isfinite(const_score) || return (κa, best_score)   # the constant scale is unresolvable
 
     # Constant versus adaptive: keep the adaptive scale only if its gain in score exceeds `nse`
     # standard errors. The gain is taken as the score difference itself, so `nse = 0` is exactly
     # the comparison of scores.
     gain = const_score - best_score
-    gain > 0 || return κ0
-    nse == 0 && return κa
+    gain > 0 || return (κ0, const_score)
+    nse == 0 && return (κa, best_score)
     _, se = gain_se(κa)
     isfinite(se) || error("nonfinite standard error of the adaptive gain, although both " *
                           "candidates have finite scores")
-    return se == 0 || gain > nse * se ? κa : κ0      # se == 0: the gain alone decides
+    return se == 0 || gain > nse * se ? (κa, best_score) : (κ0, const_score)  # se == 0: the gain alone decides
 end
 
 # Mean spacing of the `k` points nearest one edge of the sorted sample `xs`: the local scale a

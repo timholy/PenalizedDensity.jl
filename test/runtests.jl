@@ -1099,6 +1099,122 @@ end
         end
     end
 
+    @testset "adaptive κ: the window rule" begin
+        PD = PenalizedDensity
+        rtol = cbrt(eps(Float64))
+        klcv_scale(x, k) = PD._score_kappa(PD._klcv, x, k, rtol)
+        klcv_const(x, κ) = PD._klcv(PD._merge_presorted(x, rtol / κ)..., κ)
+
+        @testset "window statistics match their definition" begin
+            y = sort!(randn(Xoshiro(1), 500))
+            W = PD._WindowMoments(y)
+            for (x0, h) in ((0.3, 0.7), (-1.2, 0.25), (2.0, 3.0))
+                u = [(t - x0) / h for t in y if abs(t - x0) <= h]
+                N = length(u)
+                s = PD._window_statistics(W, x0, h)
+                @test s.N == N
+                @test s.slope ≈ abs(sum(u)) / sqrt(N / 3)
+                @test s.curvature ≈ abs(sum(u .^ 2) - N / 3) / sqrt(4N / 45)
+            end
+            @test PD._window_statistics(W, 100.0, 1.0).N == 0
+        end
+
+        @testset "on a lattice, windows grow until they reach an edge" begin
+            # Evenly spaced points show no slope or curvature in any window inside the range,
+            # so the first crossing comes only once the window runs past the nearest edge.
+            xl = collect(range(0, 1; length=2001))
+            W = PD._WindowMoments(xl)
+            ts = (0.1, 0.25, 0.5, 0.75, 0.9)
+            hs = [PD._window_halfwidth(W, t, 4.0, 30) for t in ts]
+            @test all(hs .> min.(ts, 1 .- ts))
+            @test argmax(hs) == 3
+            @test hs ≈ reverse(hs) rtol=1e-8
+        end
+
+        @testset "WindowScale evaluates c·exp(γ·s)" begin
+            k = WindowScale(2.0, 0.5, [0.0, 1.0, 3.0], [1.0, -1.0, 0.0])
+            @test k(0.5) ≈ 2.0                         # s interpolates linearly: s(0.5) = 0
+            @test k(2.0) ≈ 2.0 * exp(0.5 * -0.5)
+            @test k(-10.0) ≈ 2.0 * exp(0.5)            # held constant beyond the grid
+            @test k(10.0) ≈ 2.0
+            @test WindowScale(2.0, 1e3, [0.0, 1.0], [0.0, -1.0])(1.0) == 2e-6   # the floor
+            @test sprint(show, k) == "WindowScale(c=2.0, γ=0.5) on a grid of 3 points"
+            @test WindowScale(2.0f0, 0.5f0, Float32[0, 1], Float32[0, 1]) isa WindowScale{Float32}
+            @test_throws "scale c must be positive" WindowScale(0.0, 1.0, [0.0, 1.0], [0.0, 0.0])
+            @test_throws "grid must be sorted" WindowScale(1.0, 1.0, [1.0, 0.0], [0.0, 0.0])
+            @test_throws "must be finite" WindowScale(1.0, 1.0, [0.0, 1.0], [0.0, Inf])
+            @test_throws DimensionMismatch WindowScale(1.0, 1.0, [0.0, 1.0], [0.0])
+        end
+
+        # A narrow bump beside a broad mode, with its peak above the mode's: the window rule's
+        # target case.
+        rng = Xoshiro(7)
+        xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:1000]
+        xbs = sort(xb)
+
+        @testset "the window shape" begin
+            grid, logb = PD._window_shape(xbs, 4.0, 30)
+            s = WindowScale(1.0, 1.0, grid, logb)
+            @test issorted(grid) && allunique(grid)
+            @test first(grid) == first(xbs) && last(grid) == last(xbs)
+            @test mean(PD._window_shape_at(s, t) for t in xbs) ≈ 0 atol=1e-12
+            # Smaller windows (larger ln 1/ĥ) at the narrow bump than at the broad mode.
+            @test s(3.0) > 2 * s(0.0)
+            @test_throws "at least two distinct observations" PD._window_shape([1.0, 1.0], 4.0, 30)
+        end
+
+        @testset "selection" begin
+            κ = select_kappa_adaptive(xb; window=WindowRule())
+            @test κ isa WindowScale
+            @test κ.γ == 0.75
+            @test κ(3.0) > κ(0.0)
+            # The rule's guarantee: the window candidate's penalized score beats the score of
+            # the scale the power family returns, with nse = 0 by default.
+            κp = select_kappa_adaptive(xb; nse=0)
+            sp = κp isa Real ? klcv_const(xbs, κp) : klcv_scale(xbs, κp)
+            @test klcv_scale(xbs, κ) + 0.11 * 0.75 / sqrt(1000) < sp
+            d = DensityEstimate(xb, κ)
+            @test length(d.κ) == length(d.x) - 1
+            @test cdf(d, Inf) == 1
+
+            # An infinite penalty leaves the power family's choice, made with nse = 0.
+            κinf = select_kappa_adaptive(xb; window=WindowRule(k=Inf))
+            @test typeof(κinf) == typeof(κp)
+            @test κp isa Real ? κinf == κp : (κinf.c, κinf.α) == (κp.c, κp.α)
+            κinf1 = select_kappa_adaptive(xb; window=WindowRule(k=Inf), nse=1)
+            κp1 = select_kappa_adaptive(xb)
+            @test typeof(κinf1) == typeof(κp1)
+
+            # Other settings are honored.
+            @test select_kappa_adaptive(xb; window=WindowRule(gamma=0.5, k=0)).γ == 0.5
+
+            # Generic input: offset axes and views select the same scale.
+            for xg in (OffsetVector(xb, -400), view([xb; xb], 1:1000))
+                κg = select_kappa_adaptive(xg; window=WindowRule())
+                @test κg isa WindowScale && κg.c == κ.c && κg.x == κ.x && κg.logb == κ.logb
+            end
+
+            # A bounded domain: the shape comes from the sample, the score from the domain.
+            xe = -log.(1 .- (0.5:999.5) ./ 1000)
+            κe = select_kappa_adaptive(xe; window=WindowRule(), support=(0.0, Inf))
+            de = DensityEstimate(xe, κe; support=(0.0, Inf))
+            @test cdf(de, Inf) ≈ 1
+        end
+
+        @testset "input validation" begin
+            @test_throws "gamma must be positive" WindowRule(gamma=0)
+            @test_throws "gamma must be positive" WindowRule(gamma=Inf)
+            @test_throws "k must be nonnegative" WindowRule(k=-0.1)
+            @test_throws "threshold z must be positive" WindowRule(z=0)
+            @test_throws "nmin must be at least 2" WindowRule(nmin=1)
+            @test WindowRule() == WindowRule(0.75, 0.11, 4, 30)
+            # Interval data: no point locations to grow windows around.
+            xr = round.(xb; digits=1)
+            @test_throws "not available for rounded or interval data" select_kappa_adaptive(xr; resolution=0.1, window=WindowRule())
+            @test_throws "not available for rounded or interval data" select_kappa_adaptive(xr .- 0.05, xr .+ 0.05; window=WindowRule())
+        end
+    end
+
     @testset "deprecated keyword κ" begin
         x = [-1.0, 0.0, 0.0, 1.0]
         d = @test_deprecated DensityEstimate(x; κ=1.0)

@@ -1736,9 +1736,13 @@ end
 function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
                                alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
                                pilot_selector=nothing,
-                               nse::Real=1,
+                               window::Union{WindowRule,Nothing}=nothing,
+                               nse::Real=window === nothing ? 1 : 0,
                                rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                support::Tuple{Real,Real}=(-Inf, Inf))
+    window === nothing ||
+        throw(ArgumentError("the window rule needs the observations' locations and is not available " *
+                            "for rounded or interval data; omit `window`"))
     _check_adaptive_args(alphas, nse, rtol)
     a, b = support
     a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
