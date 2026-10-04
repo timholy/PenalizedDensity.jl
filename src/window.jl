@@ -164,16 +164,36 @@ function _window_shape(xs::Vector{T}, z::Real, nmin::Integer) where {T}
     return grid, logb .- m
 end
 
+# Locations for the window rule from tallied interval observations (`_tally_intervals`): the
+# `counts[j]` observations in interval j sit at its quantile midpoints, evenly spread over it.
+# Within a window this gives the sums of u and u² expected for observations spread uniformly
+# over their intervals, to O(1/counts[j]), while the counts between intervals keep their
+# sampling noise. Exact points (lu[j] == uu[j]) stay where they are; intervals with an infinite
+# bound have no location and are left out.
+function _spread_intervals(lu::AbstractVector{T}, uu::AbstractVector{T}, counts::AbstractVector) where {T}
+    xs = T[]
+    for j in eachindex(lu, uu, counts)
+        a, b = lu[j], uu[j]
+        isfinite(a) && isfinite(b) || continue
+        m = Int(counts[j])
+        a == b ? append!(xs, Iterators.repeated(a, m)) :
+                 append!(xs, (a + (b - a) * ((k - T(1) / 2) / m) for k in 1:m))
+    end
+    return sort!(xs)
+end
+
 # The window rule's choice between the scale `κp` the power family selected (with score `sp`)
 # and the window candidate, for the sorted sample `xs`; `score(κfun)` is the KLCV score of a
 # scale function and `κ0` the pilot scale, which centers the search for c. An unresolvable
 # window candidate never wins; an unresolvable `κp` loses to any resolvable window candidate.
-function _choose_window(score, xs::Vector{T}, κ0::T, κp, sp::T, rule::WindowRule) where {T}
+# `N` is the number of observations the scores are taken over.
+function _choose_window(score, xs::Vector{T}, κ0::T, κp, sp::T, rule::WindowRule;
+                        N::Integer=length(xs)) where {T}
     grid, logb = _window_shape(xs, rule.z, rule.nmin)
     γ = T(rule.gamma)
     res = _select_c_scored(c -> score(WindowScale(c, γ, grid, logb)), κ0; skip_unresolved=true)
     res === nothing && return κp
     c, sw = res
     isfinite(sp) || return WindowScale(c, γ, grid, logb)
-    return sw + rule.k * γ / sqrt(T(length(xs))) < sp ? WindowScale(c, γ, grid, logb) : κp
+    return sw + rule.k * γ / sqrt(T(N)) < sp ? WindowScale(c, γ, grid, logb) : κp
 end

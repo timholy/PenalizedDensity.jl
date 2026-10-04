@@ -3012,7 +3012,7 @@ include("window.jl")
     select_kappa_adaptive(x; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), pilot_selector=nothing,
         window=nothing, nse=(window === nothing ? 1 : 0), rtol=cbrt(eps(T)),
         support=(-Inf, Inf), resolution=nothing) -> κ
-    select_kappa_adaptive(lower, upper; alphas, pilot_selector, nse, rtol, support) -> κ
+    select_kappa_adaptive(lower, upper; alphas, pilot_selector, window, nse, rtol, support) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
 return it ready to pass to [`DensityEstimate`](@ref) (or, for interval data,
@@ -3041,9 +3041,9 @@ large where a window around `x` must be small before the sample shows a slope or
 it resolves narrow features whatever their height, where the power family can only refine
 the scale where the density is high. The window candidate is returned, as a
 [`WindowScale`](@ref), when its score plus a penalty is below the score of the scale the
-power family would return; `nse` then defaults to `0`. The window rule needs point
-locations; with `resolution = δ > 0` or the `(lower, upper)` form it throws an
-`ArgumentError`.
+power family would return; `nse` then defaults to `0`. With `resolution = δ > 0` or the
+`(lower, upper)` form, the windows are computed from the observations spread evenly over
+their intervals (see the extended help).
 
 `resolution` and the `(lower, upper)` form work as for [`select_kappa_kl`](@ref): more than 1%
 repeated values throw an `ArgumentError` unless `resolution` is given; `resolution = δ > 0`
@@ -3141,6 +3141,14 @@ the scan above the noise of the window statistics, which have unit standard devi
 window without structure. `gamma` is fixed rather than selected per sample, because a
 per-sample choice of `gamma` is dominated by sampling noise in the score.
 
+For rounded or interval data, the observations recorded in an interval are placed at its
+quantile midpoints, `lower + (upper - lower)·(j - ½)/m` for the `m` observations of that
+interval, and the window statistics are computed from these locations; exact observations stay
+where they are, and observations with an infinite bound (censored) enter the score but not the
+shape. Within a window this gives the sums of `u` and `u²` expected if each observation were
+spread uniformly over its interval, while the counts in different intervals keep their sampling
+noise. The scores are the interval-likelihood KLCV scores, and `N` counts all observations.
+
 `pilot_selector` is a scale-selection method, and is called on the sample alone with no notion
 of `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
 notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot_selector` on a
@@ -3205,10 +3213,7 @@ end
 # The search shared by point and interval data. `score(κfun)` is the KLCV score of the scale
 # function `κfun` (NaN when unresolvable), `const_score` that of the pilot's constant scale `κ0`,
 # and `gain_se(κa)` the per-observation gain of `κa` over `κ0` as `(mean, standard error)`.
-_select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse) =
-    first(_select_power(score, gain_se, p, κ0, const_score, alphas, nse))
-
-# `_select_adaptive`, returning `(κ, score)`: the chosen scale and its KLCV score.
+# Returns `(κ, score)`: the chosen scale and its KLCV score.
 function _select_power(score, gain_se, p, κ0::T, const_score::T, alphas, nse) where {T}
     loggbar = _log_geomean(p)
 

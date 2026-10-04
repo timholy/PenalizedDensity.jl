@@ -1208,10 +1208,37 @@ end
             @test_throws "threshold z must be positive" WindowRule(z=0)
             @test_throws "nmin must be at least 2" WindowRule(nmin=1)
             @test WindowRule() == WindowRule(0.75, 0.11, 4, 30)
-            # Interval data: no point locations to grow windows around.
-            xr = round.(xb; digits=1)
-            @test_throws "not available for rounded or interval data" select_kappa_adaptive(xr; resolution=0.1, window=WindowRule())
-            @test_throws "not available for rounded or interval data" select_kappa_adaptive(xr .- 0.05, xr .+ 0.05; window=WindowRule())
+        end
+
+        @testset "rounded and interval data" begin
+            # Each interval's observations sit at its quantile midpoints; exact points stay;
+            # intervals with an infinite bound are left out.
+            @test PD._spread_intervals([0.0, 2.0, 5.0], [1.0, 2.0, Inf], [4.0, 2.0, 3.0]) ==
+                  [0.125, 0.375, 0.625, 0.875, 2.0, 2.0]
+            κpt = select_kappa_adaptive(xb; window=WindowRule())
+            # Rounding far below every window's size leaves the rule as on the exact sample.
+            δ = 0.001
+            κf = select_kappa_adaptive(round.(xb ./ δ) .* δ; resolution=δ, window=WindowRule())
+            @test κf isa WindowScale
+            @test κf.c ≈ κpt.c rtol=0.01
+            ts = range(-2.5, 3.5; length=301)
+            @test mean(abs(log(κf(t) / κf.c) - log(κpt(t) / κpt.c)) for t in ts) < 0.02
+            # At a coarser increment the window candidate still resolves the narrow bump.
+            δ = 0.1
+            xr = round.(xb ./ δ) .* δ
+            κr = select_kappa_adaptive(xr; resolution=δ, window=WindowRule())
+            @test κr isa WindowScale && κr(3.0) > 2 * κr(0.0)
+            # (`resolution` builds the bounds by its own arithmetic; they agree to roundoff.)
+            @test select_kappa_adaptive(xr .- δ / 2, xr .+ δ / 2; window=WindowRule()).c ≈ κr.c rtol=1e-8
+            d = IntervalDensityEstimate(xr .- δ / 2, xr .+ δ / 2, κr)
+            @test cdf(d, Inf) ≈ 1
+            # An infinite penalty leaves the power family's choice, made with nse = 0.
+            κi = select_kappa_adaptive(xr; resolution=δ, window=WindowRule(k=Inf))
+            κp = select_kappa_adaptive(xr; resolution=δ, nse=0)
+            @test typeof(κi) == typeof(κp) && κi.c == κp.c
+            # Censored observations enter the score but not the window shape.
+            κc = select_kappa_adaptive([xr .- δ / 2; 5.0; 5.0], [xr .+ δ / 2; Inf; Inf]; window=WindowRule())
+            @test κc isa WindowScale && last(κc.x) < maximum(xr) + δ / 2 < 5
         end
     end
 

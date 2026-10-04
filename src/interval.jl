@@ -1740,9 +1740,6 @@ function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVec
                                nse::Real=window === nothing ? 1 : 0,
                                rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                support::Tuple{Real,Real}=(-Inf, Inf))
-    window === nothing ||
-        throw(ArgumentError("the window rule needs the observations' locations and is not available " *
-                            "for rounded or interval data; omit `window`"))
     _check_adaptive_args(alphas, nse, rtol)
     a, b = support
     a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
@@ -1763,5 +1760,8 @@ function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVec
     score(κfun) = _interval_score(lu, uu, counts, κfun, r, slo, shi)
     gain_se(κa) = _mean_se(_interval_loo_obs(lu, uu, counts, κa, r, slo, shi) .-
                            _interval_loo_obs(lu, uu, counts, κ0, r, slo, shi), counts)
-    return _select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse)
+    κp, sp = _select_power(score, gain_se, p, κ0, const_score, alphas, nse)
+    window === nothing && return κp
+    return _choose_window(score, _spread_intervals(lu, uu, counts), κ0, κp, sp, window;
+                          N=length(lower))
 end
