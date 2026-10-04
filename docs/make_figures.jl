@@ -109,7 +109,7 @@ mids = [(d_adapt.x[k] + d_adapt.x[k+1]) / 2 for k in 1:length(d_adapt.κ)]
 lines!(axk, mids, d_adapt.κ; color=:crimson, linewidth=2.5, label="varying κ(x)")
 hlines!(axk, κconst; color=:steelblue, linestyle=:dash, linewidth=2, label="constant κ")
 axislegend(axk; position=:rt, framevisible=false)
-xlims!(axk, 0, 6); ylims!(axk, 1, 2000)
+xlims!(axk, 0, 6); ylims!(axk, 1, 5000)
 
 save(joinpath(ASSETS, "adaptive_kappa.png"), fig3; px_per_unit=2)
 

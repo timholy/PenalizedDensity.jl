@@ -137,9 +137,8 @@ On a smooth density that compromise costs little. But when the density is *irreg
 divergent or discontinuous edge, a kink, a heavy tail — a constant ``\kappa`` is limited not
 by noise but by the density's own shape, and no choice of it is good everywhere.
 
-[`select_kappa_adaptive`](@ref) lifts the compromise by letting the scale follow the density,
-``\kappa(x)`` large where the density is high, and small where it is low.
-In other words, the smoothing length scale will grow with the size of the expected gap between adjacent sampled points.
+[`select_kappa_adaptive`](@ref) lifts the compromise by letting the scale vary with ``x``:
+``\kappa(x)`` large where the data resolve fine detail, small where they do not.
 
 As an example, take a ``\chi^2_1`` sample, whose density diverges as ``x^{-1/2}`` at the origin:
 
@@ -150,11 +149,11 @@ Random.seed!(7)
 z = randn(4000) .^ 2                  # χ²₁: the density diverges at x = 0
 
 κ_const = select_kappa_kl(z)          # one scale everywhere
-κ_var = select_kappa_adaptive(z)      # a scale that follows the density
+κ_var = select_kappa_adaptive(z)      # a scale that varies with x
 ```
 
-The adaptive selector returns an [`AdaptiveScale`](@ref) — a callable ``\kappa(x)`` — which
-[`DensityEstimate`](@ref) takes exactly where a number would go:
+The adaptive selector returns a callable ``\kappa(x)`` — here a [`WindowScale`](@ref), explained
+below — which [`DensityEstimate`](@ref) takes exactly where a number would go:
 
 ```@example adaptive
 d_const = DensityEstimate(z, κ_const)
@@ -166,9 +165,9 @@ the right panel shows how `κ_const` and `κ_var` depend on position.
 
 ![A varying κ against a divergent edge](assets/adaptive_kappa.png)
 
-Neither density estimate can track much below ``x \approx 10^{-3}`` (typically, fewer than one hundred points land within `[0, 1e-3]`),
-but the adaptive one tracks the power law to about tenfold-smaller `x` than the one with constant `κ`.
-The payoff is measurable on held-out data — the mean
+The estimate with constant `κ` departs from the power law below ``x \approx 3\times 10^{-2}``;
+the adaptive one tracks it to about hundredfold-smaller `x` (typically, fewer than one hundred
+points land within `[0, 1e-3]`). The payoff is measurable on held-out data — the mean
 log-likelihood of a fresh sample, whose gap is the reduction in KL divergence, in nats per
 sample:
 
@@ -181,28 +180,47 @@ loglik(d) = mean(log.(d.(ztest)))
  gain = round(loglik(d_var) - loglik(d_const); digits = 3))
 ```
 
-Concretely, how is ``\kappa(x)`` determined? The rule is a *plug-in* of the variable-bandwidth kind; Abramson's square-root law,
+Concretely, how is ``\kappa(x)`` determined? Two families of scales compete with the constant
+one, all on the *same* leave-one-out KL score that [`select_kappa_kl`](@ref) minimizes,
+generalized to a varying scale and still evaluated in closed form and in ``O(N)``.
+
+The first is a *plug-in* of the variable-bandwidth kind; Abramson's square-root law,
 [*Ann. Statist.* **10**, 1217 (1982)](https://doi.org/10.1214/aos/1176345986), is the
 ``\alpha = 1/2`` member. A pilot fit ``\hat p`` at the constant scale supplies the shape, and
 the scale is drawn from the family ``\kappa(x) = c\,(\hat p(x)/\bar g)^{\alpha}`` (``\bar g``
-the geometric mean of ``\hat p`` over the sample). Both the overall scale ``c`` and the
-exponent ``\alpha`` — how strongly ``\kappa`` follows the density — are chosen by the *same*
-leave-one-out KL score that [`select_kappa_kl`](@ref) minimizes, generalized to a varying
-scale and still evaluated in closed form and in ``O(N)``:
+the geometric mean of ``\hat p`` over the sample), an [`AdaptiveScale`](@ref); both ``c`` and the
+exponent ``\alpha`` are chosen by the score. This family can only refine the scale where the
+density is high.
+
+The second, the *window rule*, asks instead how far one can look around ``x`` before the
+sample shows structure: ``\hat h(x)`` is the smallest half-width at which the points in
+``[x - \hat h, x + \hat h]`` show a slope or a curvature (their first or second moment departs
+from that of a uniform spread by a set number of standard deviations), and
+``\kappa(x) = c\,(1/\hat h(x))^{\gamma}`` with ``\gamma`` fixed and ``c`` chosen by the score.
+It refines the scale wherever the density changes on a short length scale, whatever its height
+— at a divergent edge, as here, but also at a narrow bump beside a broad mode, where the power
+family has nothing to work with:
 
 ```@example adaptive
-(c = round(κ_var.c; digits = 1), α = κ_var.α)   # the selected scale and exponent
+rng = Xoshiro(7)
+xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:2000]   # a narrow bump at 3
+κb = select_kappa_adaptive(xb)
+round(κb(3.0) / κb(0.0); digits = 1)    # finer at the bump than at the broad mode
 ```
 
-Crucially, the constant scale competes in that same comparison: it's the ``\alpha = 0`` member
-of the family, ``\kappa(x) = c``, so **adaptivity is used only when it wins**, and by default
-only when its gain in score exceeds one standard error of that gain (the keyword `nse`
-sets the multiple; `nse = 0` keeps whichever score is smaller). When it does not, the selector
-says so by returning a plain number rather than an `AdaptiveScale` — as on uniform data,
-where ``\kappa \propto \hat p^\alpha`` has no contrast to exploit:
+Because the window shape is estimated from the same sample the score holds points out of, the
+score rates the window candidate slightly too well; it is charged a penalty for that (see
+[`WindowRule`](@ref)) before it is compared with the power family's choice.
+
+The constant scale competes in the same comparison — it's the ``\alpha = 0`` member of the
+power family — and when it scores best the selector returns a plain number rather than a
+callable, keeping the fast path and the goodness-of-fit machinery. `window = nothing` leaves the
+window rule out; the power family then must beat the constant scale by more than one standard
+error of the gain in score (the keyword `nse` sets the multiple). On uniform data, where
+``\kappa \propto \hat p^\alpha`` has no contrast to exploit, that returns the constant:
 
 ```@example adaptive
-select_kappa_adaptive(rand(2000)) isa Real   # nothing to buy: the constant scale wins
+select_kappa_adaptive(rand(2000); window = nothing) isa Real   # nothing to buy
 ```
 
 ## Fitting a hard edge

@@ -1736,7 +1736,7 @@ end
 function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
                                alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
                                pilot_selector=nothing,
-                               window::Union{WindowRule,Nothing}=nothing,
+                               window::Union{WindowRule,Nothing}=WindowRule(),
                                nse::Real=window === nothing ? 1 : 0,
                                rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                support::Tuple{Real,Real}=(-Inf, Inf))

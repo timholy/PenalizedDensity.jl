@@ -4,7 +4,8 @@
 """
     WindowRule(; gamma=0.75, k=0.11, z=4, nmin=30)
 
-Settings of the window candidate in [`select_kappa_adaptive`](@ref)`(x; window)`.
+Settings of the window candidate in [`select_kappa_adaptive`](@ref)`(x; window)`, whose
+default is `WindowRule()`.
 
 The candidate is the scale `κ(x) = c·(1/ĥ(x))^gamma` (a [`WindowScale`](@ref)), where `ĥ(x)` is
 the smallest half-width at which a window centered on `x` holds at least `nmin` observations
