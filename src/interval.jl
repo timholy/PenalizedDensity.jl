@@ -1736,7 +1736,8 @@ end
 function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
                                alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
                                pilot_selector=nothing,
-                               nse::Real=1,
+                               window::Union{WindowRule,Nothing}=WindowRule(),
+                               nse::Real=window === nothing ? 1 : 0,
                                rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                support::Tuple{Real,Real}=(-Inf, Inf))
     _check_adaptive_args(alphas, nse, rtol)
@@ -1759,5 +1760,8 @@ function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVec
     score(κfun) = _interval_score(lu, uu, counts, κfun, r, slo, shi)
     gain_se(κa) = _mean_se(_interval_loo_obs(lu, uu, counts, κa, r, slo, shi) .-
                            _interval_loo_obs(lu, uu, counts, κ0, r, slo, shi), counts)
-    return _select_adaptive(score, gain_se, p, κ0, const_score, alphas, nse)
+    κp, sp = _select_power(score, gain_se, p, κ0, const_score, alphas, nse)
+    window === nothing && return κp
+    return _choose_window(score, _spread_intervals(lu, uu, counts), κ0, κp, sp, window;
+                          N=length(lower))
 end

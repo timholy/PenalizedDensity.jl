@@ -600,25 +600,25 @@ end
             @test maximum(d.(-4:0.01:4)) < 0.5
         end
         lower, upper = PenalizedDensity._lattice_bounds(x, 0.1, (-Inf, Inf))
-        κ = select_kappa_adaptive(x; resolution=0.1, nse=0)
-        κb = select_kappa_adaptive(lower, upper; nse=0)
+        κ = select_kappa_adaptive(x; window=nothing, resolution=0.1, nse=0)
+        κb = select_kappa_adaptive(lower, upper; window=nothing, nse=0)
         @test κ isa AdaptiveScale && κb isa AdaptiveScale
         @test (κ.c, κ.α) == (κb.c, κb.α)
-        κo = select_kappa_adaptive(OffsetArray(x, -3); resolution=0.1, nse=0)
+        κo = select_kappa_adaptive(OffsetArray(x, -3); window=nothing, resolution=0.1, nse=0)
         @test (κo.c, κo.α) == (κ.c, κ.α)
         # resolution = 0: exact points, through the point path.
-        @test select_kappa_adaptive(round.(randn(Xoshiro(2), 300); digits=2); resolution=0) isa Union{Real,AdaptiveScale}
+        @test select_kappa_adaptive(round.(randn(Xoshiro(2), 300); digits=2); resolution=0) isa Union{Real,AdaptiveScale,WindowScale}
         # pilot_selector receives the bounds.
         seen = Ref{Any}(nothing)
         spy(l, u) = (seen[] = (l, u); 3.0)
-        κp = select_kappa_adaptive(lower, upper; alphas=(0.5,), pilot_selector=spy)
+        κp = select_kappa_adaptive(lower, upper; window=nothing, alphas=(0.5,), pilot_selector=spy)
         @test seen[] == (lower, upper)
         @test κp isa AdaptiveScale ? κp.pilot.κ == 3.0 : κp == 3.0
     end
 
     @testset "a rounded edge density selects an adaptive scale" begin
         xe = round.(-log.(rand(Xoshiro(2), 2000)); digits=1)
-        κ = select_kappa_adaptive(xe; resolution=0.1)
+        κ = select_kappa_adaptive(xe; window=nothing, resolution=0.1)
         @test κ isa AdaptiveScale
         @test κ.pilot isa IntervalDensityEstimate
         d = IntervalDensityEstimate(xe, κ; resolution=0.1)
@@ -630,13 +630,18 @@ end
     @testset "point observations as degenerate intervals" begin
         # Exact points reproduce the point-data selection.
         x = randn(Xoshiro(5), 300) .^ 2
-        κp = select_kappa_adaptive(x; nse=0)
-        κi = select_kappa_adaptive(x, x; nse=0)
+        κp = select_kappa_adaptive(x; window=nothing, nse=0)
+        κi = select_kappa_adaptive(x, x; window=nothing, nse=0)
         @test κi.α == κp.α
         @test κi.c ≈ κp.c rtol = 1e-3
         # The pilots' scales come from different default grids and agree only to ~1e-5.
         @test κi.pilot.κ ≈ κp.pilot.κ rtol = 1e-4
         @test κi.loggbar ≈ κp.loggbar rtol = 1e-5
+        # And under the default window rule.
+        κpw = select_kappa_adaptive(x)
+        κiw = select_kappa_adaptive(x, x)
+        @test typeof(κiw) == typeof(κpw)
+        κpw isa WindowScale && @test κiw.c ≈ κpw.c rtol = 1e-3
     end
 
     @testset "per-observation held-out values and tallies" begin

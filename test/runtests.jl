@@ -947,7 +947,7 @@ end
         end
 
         @testset "adaptivity is used only when it wins" begin
-            κ = select_kappa_adaptive(chisq1)
+            κ = select_kappa_adaptive(chisq1; window=nothing)
             @test κ isa AdaptiveScale
             @test κ.α > 0
             # The selector's own guarantee: the chosen scale beats the constant one on the
@@ -967,21 +967,21 @@ end
             # so the α = 0 candidate wins and a plain scalar comes back, keeping the fast path
             # and the goodness-of-fit machinery.
             u = sort!(rand(Xoshiro(5), 3000))
-            κu = select_kappa_adaptive(u)
+            κu = select_kappa_adaptive(u; window=nothing)
             @test κu isa Real
             @test DensityEstimate(u, κu).κ isa Real
             @test chisq_reference(DensityEstimate(u, κu)) isa ChisqReference
         end
 
         @testset "alphas and pilot are honored" begin
-            κ = select_kappa_adaptive(chisq1; alphas=(1.0,))
+            κ = select_kappa_adaptive(chisq1; window=nothing, alphas=(1.0,))
             @test κ isa AdaptiveScale && κ.α == 1.0
             # pilot_selector: any callable returning a positive scale from the sample.
-            κms = select_kappa_adaptive(chisq1; alphas=(0.5,), pilot_selector=select_kappa_ms)
+            κms = select_kappa_adaptive(chisq1; window=nothing, alphas=(0.5,), pilot_selector=select_kappa_ms)
             @test κms isa AdaptiveScale
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
-            @test select_kappa_adaptive(OffsetVector(chisq1, -1500)) isa AdaptiveScale
+            @test select_kappa_adaptive(OffsetVector(chisq1, -1500); window=nothing) isa AdaptiveScale
         end
 
         @testset "per-observation leave-one-out log densities" begin
@@ -1013,7 +1013,7 @@ end
 
         @testset "one-standard-error rule" begin
             # nse = 0 is the minimum-score choice, and the gain is the score difference.
-            κa = select_kappa_adaptive(chisq1; nse=0)
+            κa = select_kappa_adaptive(chisq1; window=nothing, nse=0)
             @test κa isa AdaptiveScale
             κ0 = select_kappa_kl(chisq1)
             gain, se = PenalizedDensity._adaptive_gain(chisq1, κ0, κa, rtol, -Inf, Inf)
@@ -1023,9 +1023,9 @@ end
             # A smooth density where the best exponent edges out the constant scale by far less
             # than one standard error: nse = 0 takes the adaptive scale, nse = 1 the constant.
             xn = sort!(randn(Xoshiro(3), 500))
-            κn0 = select_kappa_adaptive(xn; nse=0)
+            κn0 = select_kappa_adaptive(xn; window=nothing, nse=0)
             @test κn0 isa AdaptiveScale
-            κn = select_kappa_adaptive(xn)
+            κn = select_kappa_adaptive(xn; window=nothing)
             @test κn isa Real && κn == select_kappa_kl(xn)
             gain, se = PenalizedDensity._adaptive_gain(xn, κn, κn0, rtol, -Inf, Inf)
             @test 0 < gain < se
@@ -1033,11 +1033,11 @@ end
 
             # A divergent edge: adaptivity wins by several standard errors.
             xc = sort!(randn(Xoshiro(2), 250) .^ 2)
-            κc = select_kappa_adaptive(xc)
+            κc = select_kappa_adaptive(xc; window=nothing)
             @test κc isa AdaptiveScale
             gain, se = PenalizedDensity._adaptive_gain(xc, select_kappa_kl(xc), κc, rtol, -Inf, Inf)
             @test gain > 3se
-            @test select_kappa_adaptive(xc; nse=Inf) isa Real
+            @test select_kappa_adaptive(xc; window=nothing, nse=Inf) isa Real
 
             @test_throws "nse must be nonnegative" select_kappa_adaptive(xc; nse=-1)
         end
@@ -1096,6 +1096,157 @@ end
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
+        end
+    end
+
+    @testset "adaptive κ: the window rule" begin
+        PD = PenalizedDensity
+        rtol = cbrt(eps(Float64))
+        klcv_scale(x, k) = PD._score_kappa(PD._klcv, x, k, rtol)
+        klcv_const(x, κ) = PD._klcv(PD._merge_presorted(x, rtol / κ)..., κ)
+
+        @testset "window statistics match their definition" begin
+            y = sort!(randn(Xoshiro(1), 500))
+            W = PD._WindowMoments(y)
+            for (x0, h) in ((0.3, 0.7), (-1.2, 0.25), (2.0, 3.0))
+                u = [(t - x0) / h for t in y if abs(t - x0) <= h]
+                N = length(u)
+                s = PD._window_statistics(W, x0, h)
+                @test s.N == N
+                @test s.slope ≈ abs(sum(u)) / sqrt(N / 3)
+                @test s.curvature ≈ abs(sum(u .^ 2) - N / 3) / sqrt(4N / 45)
+            end
+            @test PD._window_statistics(W, 100.0, 1.0).N == 0
+        end
+
+        @testset "on a lattice, windows grow until they reach an edge" begin
+            # Evenly spaced points show no slope or curvature in any window inside the range,
+            # so the first crossing comes only once the window runs past the nearest edge.
+            xl = collect(range(0, 1; length=2001))
+            W = PD._WindowMoments(xl)
+            ts = (0.1, 0.25, 0.5, 0.75, 0.9)
+            hs = [PD._window_halfwidth(W, t, 4.0, 30) for t in ts]
+            @test all(hs .> min.(ts, 1 .- ts))
+            @test argmax(hs) == 3
+            @test hs ≈ reverse(hs) rtol=1e-8
+        end
+
+        @testset "WindowScale evaluates c·exp(γ·s)" begin
+            k = WindowScale(2.0, 0.5, [0.0, 1.0, 3.0], [1.0, -1.0, 0.0])
+            @test k(0.5) ≈ 2.0                         # s interpolates linearly: s(0.5) = 0
+            @test k(2.0) ≈ 2.0 * exp(0.5 * -0.5)
+            @test k(-10.0) ≈ 2.0 * exp(0.5)            # held constant beyond the grid
+            @test k(10.0) ≈ 2.0
+            @test WindowScale(2.0, 1e3, [0.0, 1.0], [0.0, -1.0])(1.0) == 2e-6   # the floor
+            @test sprint(show, k) == "WindowScale(c=2.0, γ=0.5) on a grid of 3 points"
+            @test WindowScale(2.0f0, 0.5f0, Float32[0, 1], Float32[0, 1]) isa WindowScale{Float32}
+            @test_throws "scale c must be positive" WindowScale(0.0, 1.0, [0.0, 1.0], [0.0, 0.0])
+            @test_throws "grid must be sorted" WindowScale(1.0, 1.0, [1.0, 0.0], [0.0, 0.0])
+            @test_throws "must be finite" WindowScale(1.0, 1.0, [0.0, 1.0], [0.0, Inf])
+            @test_throws DimensionMismatch WindowScale(1.0, 1.0, [0.0, 1.0], [0.0])
+        end
+
+        # A narrow bump beside a broad mode, with its peak above the mode's: the window rule's
+        # target case.
+        rng = Xoshiro(7)
+        xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:1000]
+        xbs = sort(xb)
+
+        @testset "the window shape" begin
+            grid, logb = PD._window_shape(xbs, 4.0, 30)
+            s = WindowScale(1.0, 1.0, grid, logb)
+            @test issorted(grid) && allunique(grid)
+            @test first(grid) == first(xbs) && last(grid) == last(xbs)
+            @test mean(PD._window_shape_at(s, t) for t in xbs) ≈ 0 atol=1e-12
+            # Smaller windows (larger ln 1/ĥ) at the narrow bump than at the broad mode.
+            @test s(3.0) > 2 * s(0.0)
+            @test_throws "at least two distinct observations" PD._window_shape([1.0, 1.0], 4.0, 30)
+        end
+
+        @testset "selection" begin
+            κ = select_kappa_adaptive(xb; window=WindowRule())
+            @test κ isa WindowScale
+            @test κ.γ == 0.75
+            @test κ(3.0) > κ(0.0)
+            # The rule's guarantee: the window candidate's penalized score beats the score of
+            # the scale the power family returns, with nse = 0 by default.
+            κp = select_kappa_adaptive(xb; window=nothing, nse=0)
+            sp = κp isa Real ? klcv_const(xbs, κp) : klcv_scale(xbs, κp)
+            @test klcv_scale(xbs, κ) + 0.11 * 0.75 / sqrt(1000) < sp
+            d = DensityEstimate(xb, κ)
+            @test length(d.κ) == length(d.x) - 1
+            @test cdf(d, Inf) == 1
+
+            # An infinite penalty leaves the power family's choice, made with nse = 0.
+            κinf = select_kappa_adaptive(xb; window=WindowRule(k=Inf))
+            @test typeof(κinf) == typeof(κp)
+            @test κp isa Real ? κinf == κp : (κinf.c, κinf.α) == (κp.c, κp.α)
+            κinf1 = select_kappa_adaptive(xb; window=WindowRule(k=Inf), nse=1)
+            κp1 = select_kappa_adaptive(xb; window=nothing)
+            @test typeof(κinf1) == typeof(κp1)
+
+            # The window rule is the default, for point and interval data alike.
+            κd = select_kappa_adaptive(xb)
+            @test κd isa WindowScale && (κd.c, κd.x, κd.logb) == (κ.c, κ.x, κ.logb)
+            xr = round.(xb; digits=1)
+            κrd = select_kappa_adaptive(xr; resolution=0.1)
+            κrw = select_kappa_adaptive(xr; resolution=0.1, window=WindowRule())
+            @test κrd isa WindowScale && (κrd.c, κrd.x, κrd.logb) == (κrw.c, κrw.x, κrw.logb)
+
+            # Other settings are honored.
+            @test select_kappa_adaptive(xb; window=WindowRule(gamma=0.5, k=0)).γ == 0.5
+
+            # Generic input: offset axes and views select the same scale.
+            for xg in (OffsetVector(xb, -400), view([xb; xb], 1:1000))
+                κg = select_kappa_adaptive(xg; window=WindowRule())
+                @test κg isa WindowScale && κg.c == κ.c && κg.x == κ.x && κg.logb == κ.logb
+            end
+
+            # A bounded domain: the shape comes from the sample, the score from the domain.
+            xe = -log.(1 .- (0.5:999.5) ./ 1000)
+            κe = select_kappa_adaptive(xe; window=WindowRule(), support=(0.0, Inf))
+            de = DensityEstimate(xe, κe; support=(0.0, Inf))
+            @test cdf(de, Inf) ≈ 1
+        end
+
+        @testset "input validation" begin
+            @test_throws "gamma must be positive" WindowRule(gamma=0)
+            @test_throws "gamma must be positive" WindowRule(gamma=Inf)
+            @test_throws "k must be nonnegative" WindowRule(k=-0.1)
+            @test_throws "threshold z must be positive" WindowRule(z=0)
+            @test_throws "nmin must be at least 2" WindowRule(nmin=1)
+            @test WindowRule() == WindowRule(0.75, 0.11, 4, 30)
+        end
+
+        @testset "rounded and interval data" begin
+            # Each interval's observations sit at its quantile midpoints; exact points stay;
+            # intervals with an infinite bound are left out.
+            @test PD._spread_intervals([0.0, 2.0, 5.0], [1.0, 2.0, Inf], [4.0, 2.0, 3.0]) ==
+                  [0.125, 0.375, 0.625, 0.875, 2.0, 2.0]
+            κpt = select_kappa_adaptive(xb; window=WindowRule())
+            # Rounding far below every window's size leaves the rule as on the exact sample.
+            δ = 0.001
+            κf = select_kappa_adaptive(round.(xb ./ δ) .* δ; resolution=δ, window=WindowRule())
+            @test κf isa WindowScale
+            @test κf.c ≈ κpt.c rtol=0.01
+            ts = range(-2.5, 3.5; length=301)
+            @test mean(abs(log(κf(t) / κf.c) - log(κpt(t) / κpt.c)) for t in ts) < 0.02
+            # At a coarser increment the window candidate still resolves the narrow bump.
+            δ = 0.1
+            xr = round.(xb ./ δ) .* δ
+            κr = select_kappa_adaptive(xr; resolution=δ, window=WindowRule())
+            @test κr isa WindowScale && κr(3.0) > 2 * κr(0.0)
+            # (`resolution` builds the bounds by its own arithmetic; they agree to roundoff.)
+            @test select_kappa_adaptive(xr .- δ / 2, xr .+ δ / 2; window=WindowRule()).c ≈ κr.c rtol=1e-8
+            d = IntervalDensityEstimate(xr .- δ / 2, xr .+ δ / 2, κr)
+            @test cdf(d, Inf) ≈ 1
+            # An infinite penalty leaves the power family's choice, made with nse = 0.
+            κi = select_kappa_adaptive(xr; resolution=δ, window=WindowRule(k=Inf))
+            κp = select_kappa_adaptive(xr; window=nothing, resolution=δ, nse=0)
+            @test typeof(κi) == typeof(κp) && κi.c == κp.c
+            # Censored observations enter the score but not the window shape.
+            κc = select_kappa_adaptive([xr .- δ / 2; 5.0; 5.0], [xr .+ δ / 2; Inf; Inf]; window=WindowRule())
+            @test κc isa WindowScale && last(κc.x) < maximum(xr) + δ / 2 < 5
         end
     end
 
@@ -1220,7 +1371,7 @@ end
         # orders of magnitude — every quantity the reference is built from is propagated in
         # scaled form precisely so this does not overflow.
         xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
-        da = DensityEstimate(xa, select_kappa_adaptive(xa))
+        da = DensityEstimate(xa, select_kappa_adaptive(xa; window=nothing))
         @test maximum(da.κ) / minimum(da.κ) > 1e4
         ra = chisq_reference(da)
         chis = fieldmc_chisq(da; nsamp=40_000, seed=3)
@@ -1229,6 +1380,18 @@ end
             @test chisq_ccdf(ra, z) ≈ mean(>(z), chis) atol = 0.012
         end
         @test green_identity(da) ≈ 1 rtol = 1e-5
+
+        # The default selector's window scale on a narrow bump beside a broad mode.
+        rng = Xoshiro(7)
+        xw = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:400]
+        dw = DensityEstimate(xw, select_kappa_adaptive(xw))
+        @test dw.κ isa AbstractVector
+        rw = chisq_reference(dw)
+        chw = fieldmc_chisq(dw; nsamp=40_000, seed=3)
+        @test expected_chisq(rw) ≈ mean(chw) rtol = 0.02
+        for z in quantile(chw, (0.3, 0.9, 0.99))
+            @test chisq_ccdf(rw, z) ≈ mean(>(z), chw) atol = 0.012
+        end
 
         # And a smooth family at small N, under a hand-chosen scale.
         xs = sort!(randn(Xoshiro(2), 60))
@@ -2066,7 +2229,7 @@ end
     @testset "field Monte Carlo: bounded fit with adaptive κ" begin
         Random.seed!(65)
         x = sort!(randn(Xoshiro(66), 300) .^ 2)
-        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        κ = select_kappa_adaptive(x; window=nothing, support=(0.0, Inf))
         d = DensityEstimate(x, κ; support=(0.0, Inf))
         @test maximum(d.κ) / minimum(d.κ) > 1e4
         r = chisq_reference(d)
@@ -2098,7 +2261,7 @@ end
         # not asserted.
         xu = rand(Xoshiro(71), 500)
         κu = select_kappa_adaptive(xu; support=(0.0, 1.0))
-        @test κu isa Real || κu isa AdaptiveScale
+        @test κu isa Union{Real,AdaptiveScale,WindowScale}
         du = DensityEstimate(xu, κu; support=(0.0, 1.0))
         @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
         mass, _ = quadgk(du, 0.0, 1.0; rtol=1e-8)
