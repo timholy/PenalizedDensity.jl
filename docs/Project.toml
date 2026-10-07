@@ -2,6 +2,9 @@
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 PenalizedDensity = "a53fa1a1-8a2d-4fe0-8d35-d78a1429f885"
 
+[sources]
+PenalizedDensity = {path = ".."}
+
 [compat]
 Documenter = "1.17.0"
 PenalizedDensity = "1.0.0"
