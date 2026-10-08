@@ -1328,6 +1328,13 @@ end
         @test all(≥(0), chisq_pdf.(Ref(r), grid))
         h = 1e-3
         @test -(chisq_ccdf(r, μ + h) - chisq_ccdf(r, μ - h)) / 2h ≈ chisq_pdf(r, μ) rtol = 1e-4
+        # At the median the tail integral is ~0; evaluation must still terminate.
+        a, b = 0.5μ, 2μ
+        for _ in 1:60
+            m = (a + b) / 2
+            chisq_ccdf(r, m) > 0.5 ? (a = m) : (b = m)
+        end
+        @test chisq_ccdf(r, (a + b) / 2) ≈ 0.5 atol = 1e-6
 
         # Reference reuse and default-exact wiring.
         Q(x) = exp(-x^2 / 2) / sqrt(2π)
