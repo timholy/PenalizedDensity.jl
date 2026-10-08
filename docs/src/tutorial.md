@@ -85,13 +85,21 @@ cross-validation score:
 κ_cv = select_kappa_cv(xs)       # least-squares cross-validation (MISE)
 ```
 
-Both are evaluated analytically — each leave-one-out density comes from a first-order
+Both are evaluated analytically — each leave-one-out density comes from a one-step
 expansion of the fit, so no point-by-point refitting is needed — and to leading order they
 select the same ``\kappa \propto N^{1/5}``. Across a range of test densities `select_kappa_kl`
 tracks the error-optimal scale most closely (see `benchmarks/`) and is the cheaper of the
-two, which is why it is the default. Both assume a *continuous* underlying density; on
-heavily tied or coarsely rounded data their scores are unbounded as ``\kappa\to\infty``, and
-the two information-resolving selectors below are the better choice.
+two, which is why it is the default.
+
+Both assume a *continuous* underlying density, in which no two observations coincide. If
+more than 1% of the observations repeat another value, they throw an `ArgumentError` unless
+you say what the repeats mean with the `resolution` keyword. For values rounded to a lattice of
+spacing `δ`, `select_kappa_kl(x; resolution = δ)` selects the scale for
+[`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
+rounding interval; `select_kappa_cv` has no interval form. `resolution = 0` declares the
+repeats to be exact points. On heavily tied exact points the cross-validation scores can
+favor over-resolved scales, and the two information-resolving selectors below are the safer
+choice.
 
 The first information-resolving selector, [`kappa_interval`](@ref), returns a principled
 scale with a plausible range. Its basis is that the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa``

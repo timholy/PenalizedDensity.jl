@@ -2650,7 +2650,9 @@ rounded, and an `ArgumentError` explains the options unless `resolution` is give
 - `resolution = δ > 0`: each `x[i]` was rounded to a lattice of spacing `δ`, and the scale is
   chosen for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`. Each observation then
   contributes the held-out log-probability of its rounding interval.
-- `resolution = 0`: the values are exact points, fitted by [`DensityEstimate`](@ref).
+- `resolution = 0`: the values are exact points, fitted by [`DensityEstimate`](@ref). On
+  heavily tied points the score can favor over-resolved scales; [`select_kappa_ms`](@ref) and
+  [`kappa_interval`](@ref) are safer there.
 
 The second form takes the bounds of interval observations directly, for
 [`IntervalDensityEstimate`](@ref)`(lower, upper, κ)`, including censored values and a mix of
