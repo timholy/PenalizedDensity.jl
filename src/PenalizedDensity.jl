@@ -2199,14 +2199,16 @@ the large-`N` limit (Eq. 26), parameterized by the mean [`expected_chisq`](@ref)
 is a closed form, far cheaper per call, and — like the exact law — defined at every scale.
 Pass a prebuilt [`ChisqReference`](@ref) to avoid reassembling it across calls.
 """
-function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T))) where {T}
+function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
     method === :largeN && return _wald_ccdf(r.mean, z)
     method === :exact || throw(ArgumentError("method must be :exact or :largeN, got :$method"))
+    # atol is required: at the median of the law the integral is ~0, and a purely relative
+    # tolerance would subdivide without end. It bounds the error in the probability by atol/π.
     zT = T(z)
     piv, rhs = _logΦ_scratch(r)
     f(u) = u == 0 ? (r.mean - zT) / 2 :
         (θ = _logΦ!(piv, rhs, r, u); sin((θ[1] - zT * u) / 2) / (u * sqrt(θ[2])))
-    I, _ = quadgk(f, zero(T), T(Inf); rtol)      # I ∈ [-π/2, π/2]; no tiny-value churn
+    I, _ = quadgk(f, zero(T), T(Inf); rtol, atol)  # I ∈ [-π/2, π/2]
     return clamp(one(T)/2 + I / T(π), zero(T), one(T))
 end
 chisq_ccdf(d::DensityEstimate, z::Real; method::Symbol=:exact) =
