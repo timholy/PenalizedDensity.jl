@@ -1517,6 +1517,72 @@ end
         @test negentropy(dfar) ≈ negentropy(d0) rtol = 1e-6
     end
 
+    @testset "fit moments, sampling, and support" begin
+        # Reference moments by quadrature, split at every node and wall so each piece is smooth.
+        function quad_moments(d)
+            pts = [d.lo; d.x; d.hi]
+            seg(f) = sum(quadgk(f, pts[i], pts[i+1]; rtol=1e-13)[1] for i in 1:length(pts)-1)
+            Z = seg(d)
+            m = seg(t -> t * d(t)) / Z
+            return Z, m, seg(t -> (t - m)^2 * d(t)) / Z
+        end
+        rng = Xoshiro(7)
+        x = randn(rng, 40) .+ 3
+        a, b = minimum(x), maximum(x)
+        κfun = t -> 1 + 0.5 * abs(t - 3)
+        fits = (
+            unbounded       = DensityEstimate(x, 2.0),
+            left_wall       = DensityEstimate(x, 2.0; support=(a - 0.05, Inf)),
+            both_walls      = DensityEstimate(x, 2.0; support=(a - 0.05, b + 0.3)),
+            touching_wall   = DensityEstimate(x, 2.0; support=(a, b)),
+            varying         = DensityEstimate(x, κfun),
+            varying_bounded = DensityEstimate(x, κfun; support=(a - 0.01, 10.0)),
+        )
+        for (name, d) in pairs(fits)
+            Z, m, v = quad_moments(d)
+            @test Z ≈ 1 rtol = 1e-10
+            @test mean(d) ≈ m atol = 1e-10
+            @test var(d) ≈ v rtol = 1e-10
+            @test std(d) == sqrt(var(d))
+            @test negentropy(d) ≈ log(2π * ℯ * v) / 2 - entropy(d) rtol = 1e-10
+            @test extrema(d) === (minimum(d), maximum(d)) === (d.lo, d.hi)
+        end
+        @test extrema(fits.unbounded) === (-Inf, Inf)
+        # A wide gap makes the Neumann arc indistinguishable from the exponential tail.
+        far = DensityEstimate(x, 2.0; support=(a - 40, b + 40))
+        @test var(far) ≈ var(fits.unbounded) rtol = 1e-12
+        # Translation far from the origin keeps the variance well-conditioned.
+        shifted = DensityEstimate(x .+ 1e8, κfun ∘ (t -> t - 1e8); support=(a - 0.01 + 1e8, 10.0 + 1e8))
+        @test var(shifted) ≈ var(fits.varying_bounded) rtol = 1e-6
+        d32 = DensityEstimate(Float32.(x), 2.0f0; support=(Float32(a) - 0.05f0, Float32(b) + 0.3f0))
+        @test @inferred(mean(d32)) isa Float32
+        @test @inferred(var(d32)) ≈ var(fits.both_walls) rtol = 1e-4
+
+        # Sampling by inversion: reproducible, inside the support, and distributed as the fit
+        # (the probability-integral transform of the draws is uniform).
+        for d in (fits.unbounded, fits.both_walls, fits.varying)
+            ys = rand(Xoshiro(3), d, 20_000)
+            @test ys == rand(Xoshiro(3), d, 20_000)
+            @test all(y -> d.lo <= y <= d.hi, ys)
+            u = sort!(cdf(d, ys))
+            @test maximum(abs.(u .- (1:length(u)) ./ length(u))) < 0.015   # KS distance
+            @test mean(ys) ≈ mean(d) atol = 4 * std(d) / sqrt(length(ys))
+        end
+        @test rand(Xoshiro(3), fits.both_walls) isa Float64
+        @test eltype(rand(d32, 3)) === Float32
+        @test rand!(Xoshiro(1), OffsetArray(zeros(5), -2), fits.unbounded) isa OffsetArray
+        di = IntervalDensityEstimate(round.(x; digits=1), 2.0; resolution=0.1)
+        ys = rand(Xoshiro(5), di, 2_000)
+        @test eltype(ys) === Float64 && all(isfinite, ys)
+        @test extrema(di) === (-Inf, Inf)
+
+        # Held-out entropy is computed in the log domain: finite far into an unbounded tail
+        # where the density underflows, infinite only outside a finite support.
+        d = fits.unbounded
+        @test d(-800.0) == 0 && isfinite(entropy(d, [-800.0, 3.0]))
+        @test entropy(fits.both_walls, [a - 1, 3.0]) == Inf
+    end
+
     @testset "held-out entropy and negentropy" begin
         Random.seed!(17)
         x = 1.2 .* randn(400) .+ 0.5

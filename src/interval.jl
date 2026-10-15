@@ -1442,6 +1442,8 @@ function _interval_fit(L::_IntervalLayout{T}, κ; stats=nothing) where {T}
                                                  L.groups, Z / 2)
 end
 
+Base.eltype(::Type{<:IntervalDensityEstimate{T}}) where {T} = T
+
 function Base.show(io::IO, d::IntervalDensityEstimate)
     nint = isempty(d.groups) ? 0 : sum(g -> g.r, d.groups)
     κstr = d.κ isa Real ? "κ=$(d.κ)" :
