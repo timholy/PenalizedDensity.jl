@@ -1338,8 +1338,9 @@ recorded values; the finest structure they can support is the histogram at the r
 increment.
 
 The result is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
-[`logdensity`](@ref), [`cdf`](@ref), and [`quantile`](@ref Statistics.quantile). With point
-observations only, the fit equals `DensityEstimate(x, κ)`.
+[`logdensity`](@ref), [`cdf`](@ref), [`quantile`](@ref Statistics.quantile), and the moments
+[`mean`](@ref Statistics.mean), [`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
+With point observations only, the fit equals `DensityEstimate(x, κ)`.
 
 # Examples
 ```jldoctest
@@ -1551,6 +1552,9 @@ logdensity(d::IntervalDensityEstimate, x::Real) = _logdensity(d, x)
 logdensity(d::IntervalDensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi), x)
 
 (d::IntervalDensityEstimate)(x::Real) = _amplitude(d, x)^2
+
+_tail_rates(d::IntervalDensityEstimate) = (d.kL, d.kR)
+_cell_k2(d::IntervalDensityEstimate, k::Integer) = d.k2[k]
 
 # Mass of interior cell c.
 function _cell_mass(d::IntervalDensityEstimate{T}, c::Int) where {T}

@@ -155,6 +155,8 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             ts = range(-5, 5; length=101)
             @test di.(ts) ≈ d.(ts) rtol = 1e-11
             @test cdf(di, ts) ≈ cdf(d, ts) rtol = 1e-11
+            @test mean(di) ≈ mean(d) rtol = 1e-11
+            @test var(di) ≈ var(d) rtol = 1e-11
         end
     end
 
@@ -239,6 +241,40 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         d = IntervalDensityEstimate(rounded_intervals(; support=(-1.625, 2.125))..., 3.0; support=(-1.625, 2.125))
         @test d(-2.0) == 0 && logdensity(d, 3.0) == -Inf
         @test_throws DomainError quantile(d, 1.5)
+    end
+
+    @testset "moments" begin
+        # Each branch of the cell moments (closed form, short and long quadrature rules) against
+        # high-precision quadrature, including cells too narrow for the closed form.
+        for (k2, h) in ((4.0, 1e-4), (4.0, 0.05), (4.0, 0.49), (4.0, 0.51), (4.0, 5.0),
+                        (-4.0, 0.3), (-4.0, 0.51), (-4.0, 1.5))
+            p, q = 0.7, 1.1
+            ψ(t) = (p * PenalizedDensity._Sfun(big(k2), big(h) - t) +
+                    q * PenalizedDensity._Sfun(big(k2), t)) / PenalizedDensity._Sfun(big(k2), big(h))
+            ref = [Float64(quadgk(t -> t^m * ψ(t)^2, big(0.0), big(h); rtol=1e-25)[1]) for m in 0:2]
+            @test all(isapprox.(PenalizedDensity._cell_moments(k2, h, p, q), ref; rtol=1e-13))
+        end
+        x = randn(Xoshiro(7), 40) .+ 3
+        a, b = extrema(x)
+        xr = round.(x; digits=1)
+        fits = (rounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1),
+                fine     = IntervalDensityEstimate(round.(x; digits=3), 3.0; resolution=0.001),
+                censored = IntervalDensityEstimate([x[1:30]; fill(4.0, 10)], [x[1:30]; fill(Inf, 10)], 2.0),
+                bounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1, support=(a - 0.3, b + 0.5)),
+                varying  = IntervalDensityEstimate(xr, t -> 1 + abs(t - 3) / 2; resolution=0.1))
+        @test any(<(0), fits.rounded.k2) && fits.censored.kR < fits.censored.κR
+        for (name, d) in pairs(fits)
+            edges = [d.lo; d.x; d.hi]
+            seg(f) = sum(quadgk(f, edges[i], edges[i+1]; rtol=1e-13)[1] for i in 1:length(edges)-1)
+            m = seg(t -> t * d(t))
+            v = seg(t -> (t - m)^2 * d(t))
+            @test mean(d) ≈ m atol = 1e-12
+            @test var(d) ≈ v rtol = 1e-12
+            @test std(d) == sqrt(var(d))
+        end
+        d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
+        @test @inferred(mean(d32)) isa Float32
+        @test @inferred(var(d32)) ≈ var(fits.rounded) rtol = 1e-4
     end
 
     @testset "lattice data (resolution)" begin

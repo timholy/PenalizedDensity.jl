@@ -844,49 +844,30 @@ end
 _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
     _norm_sq_gram(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 
-# (μ, σ²) of the fitted density Q = ψ², i.e. ∫x Q dx / Z and ∫x² Q dx / Z - μ² with Z = ∫Q dx,
-# from per-interval hyperbolic closed forms. On interior interval k, with local coordinate
-# t = x - x[k] ∈ [0, h] and rate κ = `_kappa(d, k)`, ∫₀ʰ Q dt, ∫₀ʰ t Q dt and ∫₀ʰ t² Q dt are
-# tridiagonal quadratic forms in the nodal amplitudes with the coth/csch coefficients fdiag,
-# fcross (weight 1), gdiag1, gdiag2, gcross (weight t) and hdiag1, hdiag2, hcross (weight t²);
-# the interval's contribution then picks up the node offset x[k] as in ∫x Q dx = ∫(x[k] + t) Q dt.
-# The tails contribute `_tail_moments` at their own rates and boundary gaps. Z is accumulated in
-# the same pass rather than assumed to be 1, so the result does not depend on how precisely ψ was
-# normalized.
+# (μ, σ²) of the fitted density Q = ψ², i.e. ∫x Q dx / Z and ∫x² Q dx / Z - μ² with Z = ∫Q dx.
+# Interior cell k contributes `_cell_moments` in its local coordinate t = x - x[k] ∈ [0, h], and
+# picks up the node offset x[k] as in ∫x Q dx = ∫(x[k] + t) Q dt. The tails contribute
+# `_tail_moments` at their decay rates and boundary gaps. Z is accumulated in the same pass rather
+# than assumed to be 1, so the result does not depend on how precisely ψ was normalized.
 #
 # Node positions are measured relative to x[1] throughout (not the caller's absolute
 # coordinate) before accumulating M1, M2: since μ, σ² are translation-covariant/-invariant,
 # this doesn't change the result, but it keeps M1, M2 (and hence M2 - M1²) of order the data's
 # spread rather than of order its absolute location, which is what M2 - M1² needs to stay
 # well-conditioned. Without it, data far from the origin (e.g. x .+ 1e8) can drive σ² negative.
-function _moments(d::DensityEstimate{T}) where {T}
+function _moments(d::AbstractDensityEstimate)
     x, ψ = d.x, d.ψ
     n = length(x)
     x0 = x[1]
     xn = x[n] - x0
-    L0, L1, L2 = _tail_moments(d.κL, x[1] - d.lo)     # left tail, r = x[1] - x ≥ 0
-    R0, R1, R2 = _tail_moments(d.κR, d.hi - x[n])     # right tail, r = x - x[n] ≥ 0
+    rL, rR = _tail_rates(d)
+    L0, L1, L2 = _tail_moments(rL, x[1] - d.lo)     # left tail, r = x[1] - x ≥ 0
+    R0, R1, R2 = _tail_moments(rR, d.hi - x[n])     # right tail, r = x - x[n] ≥ 0
     Z  = ψ[1]^2 * L0 + ψ[n]^2 * R0
     M1 = -ψ[1]^2 * L1 + ψ[n]^2 * (xn * R0 + R1)
     M2 = ψ[1]^2 * L2 + ψ[n]^2 * (xn^2 * R0 + 2 * xn * R1 + R2)
     for k in 1:n-1
-        κ = _kappa(d, k)
-        h = x[k+1] - x[k]; θ = κ * h; ct, cs = coth(θ), csch(θ)
-        p, q = ψ[k], ψ[k+1]
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
-        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q                     # ∫₀ʰ Q dt
-
-        gdiag1 = (1 - θ^2 * cs^2) / (4κ^2)
-        gdiag2 = (2θ * ct - 1 - θ^2 * cs^2) / (4κ^2)
-        gcross = θ * cs * (θ * ct - 1) / (4κ^2)
-        Jseg = gdiag1 * p^2 + gdiag2 * q^2 + 2 * gcross * p * q             # ∫₀ʰ t Q dt
-
-        hdiag1 = (3ct - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
-        hdiag2 = (3ct + 6θ^2 * ct - 6θ - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
-        hcross = cs * (2θ^3 * ct - 3θ^2 + 3θ * ct - 3) / (12κ^3)
-        Kseg = hdiag1 * p^2 + hdiag2 * q^2 + 2 * hcross * p * q             # ∫₀ʰ t² Q dt
-
+        Iseg, Jseg, Kseg = _cell_moments(_cell_k2(d, k), x[k+1] - x[k], ψ[k], ψ[k+1])
         xk = x[k] - x0
         Z  += Iseg
         M1 += xk * Iseg + Jseg
@@ -895,6 +876,51 @@ function _moments(d::DensityEstimate{T}) where {T}
     μ = M1 / Z
     return μ + x0, M2 / Z - μ^2
 end
+
+# The decay rates of the two tails beyond the outermost nodes, and k² = ψ''/ψ on interior cell k.
+_tail_rates(d::DensityEstimate) = (d.κL, d.κR)
+_cell_k2(d::DensityEstimate, k::Integer) = _kappa(d, k)^2
+
+# (∫₀ʰ Q dt, ∫₀ʰ t Q dt, ∫₀ʰ t² Q dt) for Q = ψ² on a cell of length h on which ψ'' = k2·ψ, with
+# ψ(0) = p and ψ(h) = q. For k2·h² ≥ 1 these are quadratic forms in (p, q) with the coth/csch
+# coefficients fdiag, fcross (weight 1), gdiag1, gdiag2, gcross (weight t) and hdiag1, hdiag2,
+# hcross (weight t²). Those coefficients cancel catastrophically as κh → 0 (a relative error of
+# 2e-4 at κh = 1e-3), so narrower cells, and trigonometric ones (k2 < 0, |k|h < π), use
+# Gauss–Legendre quadrature, which is exact to roundoff there: 8 points for |k2|h² < 1, 16 beyond.
+function _cell_moments(k2::T, h::T, p::T, q::T) where {T}
+    z = k2 * h^2
+    if z >= 1
+        κ = sqrt(k2)
+        θ = κ * h; ct, cs = coth(θ), csch(θ)
+        fdiag  = (ct - θ * cs^2) / (2κ)
+        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        gdiag1 = (1 - θ^2 * cs^2) / (4κ^2)
+        gdiag2 = (2θ * ct - 1 - θ^2 * cs^2) / (4κ^2)
+        gcross = θ * cs * (θ * ct - 1) / (4κ^2)
+        hdiag1 = (3ct - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
+        hdiag2 = (3ct + 6θ^2 * ct - 6θ - 3θ * cs^2 - 2θ^3 * cs^2) / (12κ^3)
+        hcross = cs * (2θ^3 * ct - 3θ^2 + 3θ * ct - 3) / (12κ^3)
+        return (fdiag * (p^2 + q^2) + 2 * fcross * p * q,
+                gdiag1 * p^2 + gdiag2 * q^2 + 2 * gcross * p * q,
+                hdiag1 * p^2 + hdiag2 * q^2 + 2 * hcross * p * q)
+    end
+    nodes, weights = z > -1 ? _gauss8(T) : _gauss16(T)
+    half = h / 2
+    Sh = _Sfun(k2, h)
+    I = J = K = zero(T)
+    for i in eachindex(nodes, weights)
+        t = half * (1 + nodes[i])
+        wQ = weights[i] * ((p * _Sfun(k2, h - t) + q * _Sfun(k2, t)) / Sh)^2
+        I += wQ
+        J += t * wQ
+        K += t^2 * wQ
+    end
+    return half * I, half * J, half * K
+end
+
+_gauss8(::Type{T}) where {T} = gauss(T, 8)
+const _GAUSS8_F64 = gauss(Float64, 8)
+_gauss8(::Type{Float64}) = _GAUSS8_F64
 
 # Moments (J₀, J₁, J₂) = ∫ rᵐ ψ̂(r)² dr, m = 0, 1, 2, of a tail field with unit amplitude at the
 # outermost node, r ≥ 0 being the distance from that node outward. On an unbounded side
@@ -915,10 +941,10 @@ function _tail_moments(κ::T, Δ::T) where {T}
 end
 
 """
-    mean(d::DensityEstimate)
+    mean(d::AbstractDensityEstimate)
 
-Mean `∫ x Q̂(x) dx` of the fitted density, computed in closed form from the nodal amplitudes
-(per-interval hyperbolic integrals plus the exponential or bounded tails). See also
+Mean `∫ x Q̂(x) dx` of the fitted density, computed from the nodal amplitudes cell by cell (in
+closed form, or by quadrature that is exact to roundoff) plus the exponential or bounded tails. See also
 [`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
 
 # Examples
@@ -930,12 +956,12 @@ julia> abs(mean(d)) < 1e-12
 true
 ```
 """
-Statistics.mean(d::DensityEstimate) = first(_moments(d))
+Statistics.mean(d::AbstractDensityEstimate) = first(_moments(d))
 
 """
-    var(d::DensityEstimate)
+    var(d::AbstractDensityEstimate)
 
-Variance `∫ (x - μ)² Q̂(x) dx` of the fitted density, computed in closed form like
+Variance `∫ (x - μ)² Q̂(x) dx` of the fitted density, computed like
 [`mean`](@ref Statistics.mean). This is the variance of the fitted density itself, not of the
 sample it was fitted to.
 
@@ -948,14 +974,14 @@ julia> var(d) ≈ 2 / (2 * 1.0)^2
 true
 ```
 """
-Statistics.var(d::DensityEstimate) = last(_moments(d))
+Statistics.var(d::AbstractDensityEstimate) = last(_moments(d))
 
 """
-    std(d::DensityEstimate)
+    std(d::AbstractDensityEstimate)
 
 Standard deviation `√var(d)` of the fitted density; see [`var`](@ref Statistics.var).
 """
-Statistics.std(d::DensityEstimate) = sqrt(var(d))
+Statistics.std(d::AbstractDensityEstimate) = sqrt(var(d))
 
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
