@@ -29,14 +29,14 @@ To construct an estimate of the density from the points `xs`, we first select a 
 ```@example tutorial
 using PenalizedDensity
 
-κ = select_kappa_kl(xs)                 # recommended scale (KL cross-validation)
+κ = select_kappa(xs)                    # recommended scale (KL cross-validation)
 d = DensityEstimate(xs, κ)              # fit at the recommended scale
 nothing # hide
 ```
 
 `κ` determines the amount of smoothing: the amplitude of the density estimate will decay over a length scale `1/κ`.
 `d` is a callable density: `d(x)` returns the estimated density at a single point `x`.
-Let's plot this estimate (constructed using the recommended [`select_kappa_kl`](@ref) to compute the scale),
+Let's plot this estimate (constructed using the recommended [`select_kappa`](@ref) to compute the scale),
 along with the result for a different ``\kappa`` estimator, the half-entropy as computed by
 [`kappa_interval`](@ref): 
 
@@ -66,11 +66,11 @@ from it.
 PenalizedDensity offers four automatic selectors. They split into two families: two that
 target *estimation error* (recommended for smooth data) and two that resolve *information*
 in the data (the right choice for heavily tied or discrete data). The **recommended
-default** is [`select_kappa_kl`](@ref), which minimizes a likelihood (Kullback–Leibler)
+default** is [`select_kappa`](@ref), which minimizes a likelihood (Kullback–Leibler)
 cross-validation score:
 
 ```@example tutorial
-κ_kl = select_kappa_kl(xs)       # recommended: error-optimal, likelihood cross-validation
+κ_kl = select_kappa(xs)                     # recommended: error-optimal, likelihood cross-validation
 ```
 
 Its score is the leave-one-out log-likelihood ``-\tfrac1N\sum_i \ln \hat
@@ -78,25 +78,25 @@ Q_{-i}(x_i)``, where ``\hat Q_{-i}(x_i)`` is an estimate at the point ``x_i``
 formed from all points *except* ``x_i`` itself. This score is an estimate of
 ``\mathrm{KL}(Q \,\|\, \hat Q_\kappa)`` up to a constant; it is the criterion
 native to the estimator, whose action is itself a log-likelihood. A close
-relative, [`select_kappa_cv`](@ref), instead minimizes a least-squares (MISE)
+relative, `PenalizedDensity.select_kappa_cv` (not exported; used here for comparison), instead minimizes a least-squares (MISE)
 cross-validation score:
 
 ```@example tutorial
-κ_cv = select_kappa_cv(xs)       # least-squares cross-validation (MISE)
+κ_cv = PenalizedDensity.select_kappa_cv(xs) # least-squares cross-validation (MISE)
 ```
 
 Both are evaluated analytically — each leave-one-out density comes from a one-step
 expansion of the fit, so no point-by-point refitting is needed — and to leading order they
-select the same ``\kappa \propto N^{1/5}``. Across a range of test densities `select_kappa_kl`
+select the same ``\kappa \propto N^{1/5}``. Across a range of test densities `select_kappa`
 tracks the error-optimal scale most closely (see `benchmarks/`) and is the cheaper of the
 two, which is why it is the default.
 
 Both assume a *continuous* underlying density, in which no two observations coincide. If
 more than 1% of the observations repeat another value, they throw an `ArgumentError` unless
 you say what the repeats mean with the `resolution` keyword. For values rounded to a lattice of
-spacing `δ`, `select_kappa_kl(x; resolution = δ)` selects the scale for
+spacing `δ`, `select_kappa(x; resolution = δ)` selects the scale for
 [`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
-rounding interval; `select_kappa_cv` and [`select_support`](@ref) have no interval form.
+rounding interval; `PenalizedDensity.select_kappa_cv` and [`select_support`](@ref) have no interval form.
 `resolution = 0` declares the repeats to be exact points. On heavily tied exact points the
 cross-validation scores can favor over-resolved scales, and the two information-resolving
 selectors below are the safer choice.
@@ -122,16 +122,16 @@ resolved — and the shaded band is the plausible range:
 
 ![Reduced action rising between its two entropy limits](assets/action_entropy.png)
 
-The second information-resolving selector, [`select_kappa_ms`](@ref), returns a related but
+The second information-resolving selector, `PenalizedDensity.select_kappa_ms` (also not exported), returns a related but
 distinct scale: the point of *minimum sensitivity*, where `|dS/d ln κ|` is smallest. Its
 derivative is computed analytically, so the result is free of the noise that
 finite-differencing the action curve would introduce.
 
 ```@example tutorial
-κ_ms = select_kappa_ms(xs)       # minimum-sensitivity scale
+κ_ms = PenalizedDensity.select_kappa_ms(xs) # minimum-sensitivity scale
 ```
 
-`select_kappa_ms` and `kappa_interval` generally select different scales, but both resolve
+`PenalizedDensity.select_kappa_ms` and `kappa_interval` generally select different scales, but both resolve
 *information* in the data rather than minimizing error, and on smooth densities they tend to
 over-resolve — which is why the cross-validation selectors are recommended by default. Their
 value is on heavily tied or discrete data, where they stay bounded and the cross-validation
@@ -145,7 +145,7 @@ On a smooth density that compromise costs little. But when the density is *irreg
 divergent or discontinuous edge, a kink, a heavy tail — a constant ``\kappa`` is limited not
 by noise but by the density's own shape, and no choice of it is good everywhere.
 
-[`select_kappa_adaptive`](@ref) lifts the compromise by letting the scale vary with ``x``:
+[`select_kappa`](@ref)`(x, Adaptive())` lifts the compromise by letting the scale vary with ``x``:
 ``\kappa(x)`` large where the data resolve fine detail, small where they do not.
 
 As an example, take a ``\chi^2_1`` sample, whose density diverges as ``x^{-1/2}`` at the origin:
@@ -156,8 +156,8 @@ using PenalizedDensity, Random, Statistics
 Random.seed!(7)
 z = randn(4000) .^ 2                  # χ²₁: the density diverges at x = 0
 
-κ_const = select_kappa_kl(z)          # one scale everywhere
-κ_var = select_kappa_adaptive(z)      # a scale that varies with x
+κ_const = select_kappa(z)           # one scale everywhere
+κ_var = select_kappa(z, Adaptive())   # a scale that varies with x
 ```
 
 The adaptive selector returns a callable ``\kappa(x)`` — here a [`WindowScale`](@ref), explained
@@ -189,7 +189,7 @@ loglik(d) = mean(log.(d.(ztest)))
 ```
 
 Concretely, how is ``\kappa(x)`` determined? Two families of scales compete with the constant
-one, all on the *same* leave-one-out KL score that [`select_kappa_kl`](@ref) minimizes,
+one, all on the *same* leave-one-out KL score that [`select_kappa`](@ref) minimizes,
 generalized to a varying scale and still evaluated in closed form and in ``O(N)``.
 
 The first is a *plug-in* of the variable-bandwidth kind; Abramson's square-root law,
@@ -212,7 +212,7 @@ family has nothing to work with:
 ```@example adaptive
 rng = Xoshiro(7)
 xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:2000]   # a narrow bump at 3
-κb = select_kappa_adaptive(xb)
+κb = select_kappa(xb, Adaptive())
 round(κb(3.0) / κb(0.0); digits = 1)    # finer at the bump than at the broad mode
 ```
 
@@ -228,7 +228,7 @@ error of the gain in score (the keyword `nse` sets the multiple). On uniform dat
 ``\kappa \propto \hat p^\alpha`` has no contrast to exploit, that returns the constant:
 
 ```@example adaptive
-select_kappa_adaptive(rand(2000); window = nothing) isa Real   # nothing to buy
+select_kappa(rand(2000), Adaptive(; window=nothing)) isa Real   # nothing to buy
 ```
 
 ## Fitting a hard edge
@@ -251,7 +251,7 @@ Random.seed!(11)
 N = 1500
 x = -log.(1 .- rand(N))                 # exponential(1): a jump edge at x = 0
 
-κ_const = select_kappa_kl(x)
+κ_const = select_kappa(x)
 d_unbounded = DensityEstimate(x, κ_const)
 
 (κ = round(κ_const; digits=1), leaked_mass = round(cdf(d_unbounded, 0.0); digits=4))
@@ -292,17 +292,17 @@ returning the unbounded candidate:
 xg = randn(1500)
 rg = select_support(xg)
 
-(support = rg.support, κ_matches_plain_selection = rg.κ === select_kappa_kl(xg))
+(support = rg.support, κ_matches_plain_selection = rg.κ === select_kappa(xg))
 ```
 
-`support == (-Inf, Inf)` and the returned `κ` is not merely close to `select_kappa_kl(xg)` but
+`support == (-Inf, Inf)` and the returned `κ` is not merely close to `select_kappa(xg)` but
 *identical* to it — the unbounded candidate always competes, and here it wins outright.
 
 To combine a boundary with a varying scale, pass the chosen
-`support` on to [`select_kappa_adaptive`](@ref) so that its own search runs on the bounded domain:
+`support` on to [`select_kappa`](@ref)`(x, Adaptive())` so that its own search runs on the bounded domain:
 
 ```@example bounded
-κ_composed = select_kappa_adaptive(x; support = r.support)
+κ_composed = select_kappa(x, Adaptive(); support=r.support)
 d_composed = DensityEstimate(x, κ_composed; support = r.support)
 
 (α = κ_composed.α, c = round(κ_composed.c; digits=2))
@@ -412,7 +412,7 @@ xeval = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 The held-out negentropy is close to the in-sample value here because the fit generalizes
 well. Scoring on points that did not build the fit is what makes the held-out form
 informative: unlike the in-sample value, it is not inflated by concentrating the density
-onto the fit sample, the same reason [`select_kappa_cv`](@ref) cross-validates.
+onto the fit sample, the same reason `PenalizedDensity.select_kappa_cv` cross-validates.
 
 The log density itself is [`logdensity`](@ref), and it can be used to circumvent
 density underflows to zero once ``2\kappa`` times the distance to the nearest

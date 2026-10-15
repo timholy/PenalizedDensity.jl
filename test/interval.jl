@@ -523,13 +523,13 @@ end
         end
     end
 
-    @testset "select_kappa_kl on rounded data" begin
+    @testset "select_kappa on rounded data" begin
         δr = 0.25
         z = round.(randn(Xoshiro(2), 200) ./ δr) .* δr
         lower, upper = PenalizedDensity._lattice_bounds(z, δr, (-Inf, Inf))
-        κ = select_kappa_kl(z; resolution=δr)
-        @test κ == select_kappa_kl(lower, upper)
-        @test κ == select_kappa_kl(OffsetArray(z, -7); resolution=δr)
+        κ = select_kappa(z; resolution=δr)
+        @test κ == select_kappa(lower, upper)
+        @test κ == select_kappa(OffsetArray(z, -7); resolution=δr)
         # The minimizer of the literal-refit score on a grid.
         grid = exp.(range(log(0.5), log(30); length=25))
         refit_score(κ0) = (r = held_out_refit(lower, upper, κ0);
@@ -541,32 +541,32 @@ end
         @test PenalizedDensity._default_interval_κs([0.0, 0.0, 1.0], [0.0, 1.0, Inf]) isa AbstractVector
         # Censored and mixed observations, through the bounds form.
         lc, uc = rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), cens=(1.375, 6), seed=4)
-        @test 0 < select_kappa_kl(lc, uc) < Inf
+        @test 0 < select_kappa(lc, uc) < Inf
     end
 
     @testset "tie check and holdout" begin
         z = round.(randn(Xoshiro(2), 200); digits=1)
-        for f in (select_kappa_kl, select_kappa_cv)
+        for f in (select_kappa, select_kappa_cv)
             @test_throws ArgumentError f(z)
             @test_throws "lattice of spacing δ ≈ 0.1" f(z)
             @test_throws "resolution=0" f(z)
             @test 0 < f(z; resolution=0) < Inf
         end
-        @test_throws "pass `resolution=δ`" select_kappa_kl(z)
-        @test_throws "select_kappa_kl(x; resolution=δ)" select_kappa_cv(z)
+        @test_throws "pass `resolution=δ`" select_kappa(z)
+        @test_throws "pass `resolution=δ` to `select_kappa`" select_kappa_cv(z)
         @test_throws "no form for rounded (interval) data" select_kappa_cv(z; resolution=0.1)
-        @test_throws "resolution must be finite and nonnegative" select_kappa_kl(z; resolution=-0.1)
+        @test_throws "resolution must be finite and nonnegative" select_kappa(z; resolution=-0.1)
         # Ties off a lattice: the message points to the bounds form.
         zt = [randn(Xoshiro(1), 100); fill(0.123, 5)]
-        @test_throws "select_kappa_kl(lower, upper)" select_kappa_kl(zt)
+        @test_throws "select_kappa(lower, upper)" select_kappa(zt)
         # At most 1% repeated values is accepted as point data.
         zs = [randn(Xoshiro(1), 200); 0.5; 0.5]
-        @test 0 < select_kappa_kl(zs) < Inf
+        @test 0 < select_kappa(zs) < Inf
         # Distinct values: both holdouts give the same scale.
         x = randn(Xoshiro(6), 300)
-        @test select_kappa_kl(x) == select_kappa_kl(x; holdout=:observation)
-        @test_throws "holdout must be :location or :observation" select_kappa_kl(x; holdout=:point)
-        @test_throws "holdout must be :location or :observation" select_kappa_kl(x, x; holdout=:point)
+        @test select_kappa(x) == select_kappa(x; holdout=:observation)
+        @test_throws "holdout must be :location or :observation" select_kappa(x; holdout=:point)
+        @test_throws "holdout must be :location or :observation" select_kappa(x, x; holdout=:point)
     end
 
     @testset "an underflowing interval edge is rejected, not an error" begin
@@ -576,9 +576,9 @@ end
         lower = [0.0, 1.0, 2.0, 0.9, 1.5, 2.5]
         upper = [1.0, 2.0, 3.0, 0.9, 1.5, 2.5]
         κs = exp.(range(log(0.5), log(400.0); length=12))
-        κ = select_kappa_kl(lower, upper; κs)
+        κ = select_kappa(lower, upper; kappas=κs)
         @test κ < 50
-        @test κ ≈ select_kappa_kl(lower, upper; κs=filter(<(50), κs)) rtol = 1e-6
+        @test κ ≈ select_kappa(lower, upper; kappas=filter(<(50), κs)) rtol = 1e-6
     end
 end
 
@@ -587,38 +587,38 @@ end
     @testset "rounded data: the tie check and the resolution path" begin
         # Heavily tied data are refused as point data, naming the fix.
         x = round.(randn(Xoshiro(1), 1000); digits=1)
-        @test_throws "repeat another value" select_kappa_adaptive(x)
-        @test_throws "pass `resolution=δ`" select_kappa_adaptive(x)
+        @test_throws "repeat another value" select_kappa(x, Adaptive())
+        @test_throws "pass `resolution=δ`" select_kappa(x, Adaptive())
         zt = [randn(Xoshiro(1), 100); fill(0.123, 5)]
-        @test_throws "select_kappa_adaptive(lower, upper)" select_kappa_adaptive(zt)
-        @test_throws "resolution must be finite and nonnegative" select_kappa_adaptive(x; resolution=-0.1)
+        @test_throws "select_kappa(lower, upper)" select_kappa(zt, Adaptive())
+        @test_throws "resolution must be finite and nonnegative" select_kappa(x, Adaptive(); resolution=-0.1)
         # With the resolution, the fit follows the rounding intervals, not the repeated values.
         for seed in 1:4
             xs = round.(randn(Xoshiro(seed), 1000); digits=1)
-            κ = select_kappa_adaptive(xs; resolution=0.1)
+            κ = select_kappa(xs, Adaptive(); resolution=0.1)
             d = IntervalDensityEstimate(xs, κ; resolution=0.1)
             @test maximum(d.(-4:0.01:4)) < 0.5
         end
         lower, upper = PenalizedDensity._lattice_bounds(x, 0.1, (-Inf, Inf))
-        κ = select_kappa_adaptive(x; window=nothing, resolution=0.1, nse=0)
-        κb = select_kappa_adaptive(lower, upper; window=nothing, nse=0)
+        κ = select_kappa(x, Adaptive(; window=nothing, nse=0); resolution=0.1)
+        κb = select_kappa(lower, upper, Adaptive(; window=nothing, nse=0))
         @test κ isa AdaptiveScale && κb isa AdaptiveScale
         @test (κ.c, κ.α) == (κb.c, κb.α)
-        κo = select_kappa_adaptive(OffsetArray(x, -3); window=nothing, resolution=0.1, nse=0)
+        κo = select_kappa(OffsetArray(x, -3), Adaptive(; window=nothing, nse=0); resolution=0.1)
         @test (κo.c, κo.α) == (κ.c, κ.α)
         # resolution = 0: exact points, through the point path.
-        @test select_kappa_adaptive(round.(randn(Xoshiro(2), 300); digits=2); resolution=0) isa Union{Real,AdaptiveScale,WindowScale}
-        # pilot_selector receives the bounds.
+        @test select_kappa(round.(randn(Xoshiro(2), 300); digits=2), Adaptive(); resolution=0) isa Union{Real,AdaptiveScale,WindowScale}
+        # pilot receives the bounds.
         seen = Ref{Any}(nothing)
         spy(l, u) = (seen[] = (l, u); 3.0)
-        κp = select_kappa_adaptive(lower, upper; window=nothing, alphas=(0.5,), pilot_selector=spy)
+        κp = select_kappa(lower, upper, Adaptive(; window=nothing, alphas=(0.5,), pilot=spy))
         @test seen[] == (lower, upper)
         @test κp isa AdaptiveScale ? κp.pilot.κ == 3.0 : κp == 3.0
     end
 
     @testset "a rounded edge density selects an adaptive scale" begin
         xe = round.(-log.(rand(Xoshiro(2), 2000)); digits=1)
-        κ = select_kappa_adaptive(xe; window=nothing, resolution=0.1)
+        κ = select_kappa(xe, Adaptive(; window=nothing); resolution=0.1)
         @test κ isa AdaptiveScale
         @test κ.pilot isa IntervalDensityEstimate
         d = IntervalDensityEstimate(xe, κ; resolution=0.1)
@@ -630,16 +630,16 @@ end
     @testset "point observations as degenerate intervals" begin
         # Exact points reproduce the point-data selection.
         x = randn(Xoshiro(5), 300) .^ 2
-        κp = select_kappa_adaptive(x; window=nothing, nse=0)
-        κi = select_kappa_adaptive(x, x; window=nothing, nse=0)
+        κp = select_kappa(x, Adaptive(; window=nothing, nse=0))
+        κi = select_kappa(x, x, Adaptive(; window=nothing, nse=0))
         @test κi.α == κp.α
         @test κi.c ≈ κp.c rtol = 1e-3
         # The pilots' scales come from different default grids and agree only to ~1e-5.
         @test κi.pilot.κ ≈ κp.pilot.κ rtol = 1e-4
         @test κi.loggbar ≈ κp.loggbar rtol = 1e-5
         # And under the default window rule.
-        κpw = select_kappa_adaptive(x)
-        κiw = select_kappa_adaptive(x, x)
+        κpw = select_kappa(x, Adaptive())
+        κiw = select_kappa(x, x, Adaptive())
         @test typeof(κiw) == typeof(κpw)
         κpw isa WindowScale && @test κiw.c ≈ κpw.c rtol = 1e-3
     end
@@ -676,7 +676,7 @@ end
     end
 
     @testset "an underflowing interval edge is unresolvable, not an error" begin
-        # The fixture of the select_kappa_kl test above: the adaptive search's scores reject the
+        # The fixture of the select_kappa test above: the adaptive search's scores reject the
         # scales at which the far edge underflows.
         lower = [0.0, 1.0, 2.0, 0.9, 1.5, 2.5]
         upper = [1.0, 2.0, 3.0, 0.9, 1.5, 2.5]

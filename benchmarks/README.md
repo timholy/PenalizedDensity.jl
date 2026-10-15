@@ -28,14 +28,14 @@ checked in; the first run resolves and installs the comparison packages.
 2. **Accuracy** — each method fits with its *own* automatic bandwidth selection (the quality
    a user gets out of the box) on samples from known densities. Reported as mean integrated
    absolute error (`L1 = ∫|Q̂ − Q|`) and mean integrated squared error (`ISE = ∫(Q̂ − Q)²`)
-   over many trials. `PenalizedDensity` uses `select_kappa_kl`, the winner of the selector
+   over many trials. `PenalizedDensity` uses `select_kappa`, the winner of the selector
    shootout below.
 
 3. **Selector shootout** — `PenalizedDensity` offers several automatic scale selectors; this
    holds the estimator fixed and pits them head-to-head. The action-based selectors
-   (`select_kappa_ms`, minimum sensitivity; `kappa_interval`, half-entropy) resolve information
-   and their κ grows like `√N`; the cross-validation selectors (`select_kappa_cv`, LSCV;
-   `select_kappa_kl`, KL) target error and grow like `N^{1/5}`. Each row's `L1`/`ISE` is
+   (`PenalizedDensity.select_kappa_ms`, minimum sensitivity; `kappa_interval`, half-entropy) resolve information
+   and their κ grows like `√N`; the cross-validation selectors (`PenalizedDensity.select_kappa_cv`, LSCV;
+   `select_kappa`, KL) target error and grow like `N^{1/5}`. Each row's `L1`/`ISE` is
    compared against the `oracle` κ that minimises `L1` on a scan — the best the estimator can
    do at any fixed scale.
 
@@ -55,9 +55,9 @@ checked in; the first run resolves and installs the comparison packages.
   only for heavily tied or discrete data, where the cross-validation scores are unbounded as
   `κ → ∞` (see the docstrings).
 
-- **`select_kappa_kl` is the recommended default.** Across the test densities it sits closest
+- **`select_kappa` is the recommended default.** Across the test densities it sits closest
   to the oracle in `L1` — tracking the oracle κ tightly even on the skewed log-normal, where
-  `select_kappa_cv` over-resolves — and it is the cheapest cross-validation score to compute
+  `PenalizedDensity.select_kappa_cv` over-resolves — and it is the cheapest cross-validation score to compute
   (it reuses the leave-one-out densities and omits the `∫Q̂²` roughness term). The shootout's
   `oracle` column also shows the estimator is competitive with, and often better than, the
   kernel methods once κ is well chosen.

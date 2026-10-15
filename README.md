@@ -24,8 +24,7 @@ candidate models for significance.
 using PenalizedDensity
 
 x = randn(500)                       # samples from an unknown distribution
-κ = select_kappa_kl(x)               # recommended smoothing scale (KL cross-validation);
-                                     # select_kappa_cv, select_kappa_ms, kappa_interval also exist
+κ = select_kappa(x)                  # recommended smoothing scale (KL cross-validation)
 d = DensityEstimate(x, κ)            # callable: d(x) is the density Q(x)
 
 d(0.0)                               # density at a point
@@ -35,12 +34,12 @@ pvalue(ref, chisq(d, x -> exp(-x^2/2)/√(2π)))   # test a model (here a standa
 
 `κ` may also *vary across the data*, resolving densities a single scale cannot — a divergent
 or discontinuous edge, a kink, a heavy tail, a narrow bump beside a broad mode.
-`select_kappa_adaptive` chooses such a scale by the same cross-validation, and returns a
+`select_kappa(x, Adaptive())` chooses such a scale by the same cross-validation, and returns a
 constant one when that scores best:
 
 ```julia
 z = randn(4000).^2                   # χ²₁: the density diverges at x = 0
-d = DensityEstimate(z, select_kappa_adaptive(z))
+d = DensityEstimate(z, select_kappa(z, Adaptive()))
 ```
 
 The domain itself may be bounded: `support = (a, b)` fits a hard edge exactly (zero density

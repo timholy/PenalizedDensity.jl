@@ -26,7 +26,7 @@ x = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 
 # Fit at the recommended KL cross-validation scale and at the half-entropy scale.
 ki = kappa_interval(x)
-κkl = select_kappa_kl(x)
+κkl = select_kappa(x)
 d_half = DensityEstimate(x, ki.κ)
 d_kl = DensityEstimate(x, κkl)
 
@@ -83,8 +83,8 @@ Random.seed!(7)
 z = randn(4000) .^ 2
 chisq1pdf(x) = x <= 0 ? NaN : exp(-x / 2) / sqrt(2π * x)
 
-κconst = select_kappa_kl(z)
-κadapt = select_kappa_adaptive(z)
+κconst = select_kappa(z)
+κadapt = select_kappa(z, Adaptive())
 d_const = DensityEstimate(z, κconst)
 d_adapt = DensityEstimate(z, κadapt)
 
@@ -122,7 +122,7 @@ N = 1500
 xe = -log.(1 .- rand(N))
 exppdf(t) = t >= 0 ? exp(-t) : 0.0
 
-κe = select_kappa_kl(xe)
+κe = select_kappa(xe)
 d_unbounded = DensityEstimate(xe, κe)
 re = select_support(xe)
 d_bounded = DensityEstimate(xe, re.κ; support=re.support)

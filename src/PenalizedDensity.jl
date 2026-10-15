@@ -10,8 +10,8 @@ using Random: Random, AbstractRNG, Repetition, SamplerSimple
 using Statistics: Statistics, mean, quantile, std, var
 using StatsAPI: StatsAPI, pvalue
 
-export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
-export AdaptiveScale, WindowScale, WindowRule, select_kappa_adaptive
+export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support, kappa_interval
+export Adaptive, AdaptiveScale, WindowScale, WindowRule
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
@@ -67,6 +67,14 @@ _check_not_nan(x) = isnan(x) ? throw(DomainError(x, "the evaluation point must n
 _check_no_nan_observations(x) =
     any(isnan, x) ? throw(ArgumentError("observations must not be NaN")) : nothing
 
+_check_rtol(rtol) = rtol >= 0 ? nothing : throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+
+function _check_support_bounds(support)
+    a, b = support
+    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    return a, b
+end
+
 """
     DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
 
@@ -74,9 +82,8 @@ Estimate a continuous one-dimensional probability density from sample points `x`
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
 
 `κ` is either a positive number, giving one scale everywhere, or a callable `κ(x)` returning
-the scale local to `x`; larger `κ` gives a rougher estimate. See [`select_kappa_kl`](@ref) for
-choosing it automatically (the recommended default; [`select_kappa_cv`](@ref),
-[`select_kappa_ms`](@ref), and [`kappa_interval`](@ref) are alternatives).
+the scale local to `x`; larger `κ` gives a rougher estimate. See [`select_kappa`](@ref) for
+choosing it automatically.
 
 `support = (a, b)` fits the density on a finite domain instead of all of `ℝ`; either end may be
 `-Inf`/`Inf` for a one-sided or fully unbounded fit (the default). The density `Q` is exactly
@@ -186,10 +193,9 @@ DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T}
 
 function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
                          rtol::Real=cbrt(eps(R)), stats=nothing) where R<:Real
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
+    _check_rtol(rtol)
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
-    lo, hi = support
-    lo < hi || throw(DomainError((lo, hi), "support must satisfy a < b, got support=($lo, $hi)"))
+    lo, hi = _check_support_bounds(support)
     return _estimate(x, κ, rtol, lo, hi; stats)
 end
 
@@ -2424,25 +2430,45 @@ end
 # Geometric κ grid from coarse (≈ one blob over the data) to fine (≈ individual points),
 # scaled to the data's extent, wide enough to bracket the minimum-sensitivity scale.
 function _default_κs(x::AbstractVector{<:Real})
+    isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
     _check_no_nan_observations(x)
+    T = float(eltype(x))
     lo, hi = extrema(x)
-    span = hi - lo
+    span = T(hi) - T(lo)
     span > 0 || throw(ArgumentError("need at least two distinct points to select κ"))
-    return exp.(range(log(0.5 / span), log(5 * length(x) / span); length = 40))
+    return exp.(range(log(T(0.5) / span), log(5 * length(x) / span); length = 40))
+end
+
+# The default grid of `select_kappa(x; resolution, support)`: rounded values are fitted as
+# intervals, so they get the interval grid.
+function _default_κs(x::AbstractVector{<:Real}, resolution, support)
+    _is_rounded(resolution) || return _default_κs(x)
+    isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
+    T = float(eltype(x))
+    return _default_interval_κs(_lattice_bounds(x, T(resolution), support)...)
+end
+
+# Whether the selectors' `resolution` asks for the interval likelihood: `nothing` (exact points,
+# checked for ties) and `0` (exact points, unchecked) do not; a positive lattice spacing does.
+function _is_rounded(resolution)
+    (resolution === nothing || resolution == 0) && return false
+    isfinite(resolution) && resolution > 0 ||
+        throw(ArgumentError("resolution must be finite and nonnegative, got $resolution"))
+    return true
 end
 
 """
-    select_kappa_ms(x; κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
+    select_kappa_ms(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
 the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
-is smallest (Fig. 1 of the paper). `κs` must be sorted and positive, with at least three
+is smallest (Fig. 1 of the paper). `kappas` must be sorted and positive, with at least three
 values to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
 
 This and the entropy-based [`kappa_interval`](@ref) both resolve *information* and over-resolve
-smooth densities; to target estimation error instead, prefer [`select_kappa_kl`](@ref) (the
-recommended default) or [`select_kappa_cv`](@ref); for rounded data, pass the rounding increment
-to `select_kappa_kl` as `resolution`.
+smooth densities; to target estimation error instead, use [`select_kappa`](@ref) (or
+[`select_kappa_cv`](@ref)); for rounded data, pass the rounding increment to `select_kappa` as
+`resolution`.
 
 This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
 are derived for the unbounded line and do not generalize to a finite domain, so it always
@@ -2451,23 +2477,19 @@ fits (and returns a scale for) the unbounded problem.
 # Extended help
 
 The derivative `dS/d ln κ` is evaluated analytically and minimized over `κ` by a golden-section
-search, bracketed by the grid `κs`. This is a principled convention rather than a unique
+search, bracketed by the grid `kappas`. This is a principled convention rather than a unique
 optimum: `S` has no exact stationary point in `κ`, so the flattest point depends on measuring
 sensitivity in `ln κ`.
 """
-function select_kappa_ms(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
-    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
-    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+function select_kappa_ms(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
+                         rtol::Real=cbrt(eps(float(eltype(x)))))
+    _check_kappa_grid(kappas)
+    _check_rtol(rtol)
+    T = float(promote_type(eltype(x), typeof(rtol)))
     xs = _sorted_sample(x, T)
     r = T(rtol)
     absslope(κ) = abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
-    lnκ = log.(T.(κs))
-    i = argmin(absslope.(exp.(lnκ)))            # coarse bracket on the grid
-    lo = lnκ[max(i - 1, firstindex(lnκ))]
-    hi = lnκ[min(i + 1, lastindex(lnκ))]
-    return exp(_golden_min(l -> absslope(exp(l)), lo, hi))
+    return _minimize_on_grid(absslope, kappas, T)
 end
 
 """
@@ -2501,8 +2523,8 @@ is therefore the fraction of the data's entropy that scale `κ` resolves, and it
 """
 function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=cbrt(eps(float(eltype(x)))))
     0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    T = float(promote_type(eltype(x), typeof(level), typeof(rtol)))
+    _check_rtol(rtol)
+    T = float(promote_type(eltype(x), typeof(rtol)))
     xs = _sorted_sample(x, T)
     nodes0, w0 = _merge_presorted(xs, zero(T))      # exact duplicates fix the entropy baseline
     length(nodes0) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
@@ -2711,7 +2733,7 @@ _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
 _klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes, w, κ, κ, κ; kwargs...)
 
 """
-    select_kappa_cv(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+    select_kappa_cv(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
                     resolution=nothing, holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
@@ -2725,77 +2747,61 @@ selects a finer scale than [`select_kappa_ms`](@ref) (minimum sensitivity) and
 [`kappa_interval`](@ref) (half-entropy), which resolve information rather than squared error
 and tend to over-resolve smooth densities.
 
-`support = (a, b)` (default `(-Inf, Inf)`) fits and cross-validates on a finite domain, as
-[`DensityEstimate`](@ref)'s `support` does; it is a fixed hyperparameter of the search, not
-itself selected, and is held fixed across every candidate `κ`. Data outside `[a, b]`, or
-`a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
-to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
-
-Cross-validation assumes the data are draws from a continuous density. If more than 1% of the
-observations repeat another value, the data are probably rounded, and an `ArgumentError`
-explains the options unless `resolution` is given. `resolution=0` accepts the values as exact
-points. Rounded data are better handled by [`select_kappa_kl`](@ref) with `resolution` set to the
-rounding increment, which fits the interval likelihood; this function has no interval form,
-because with only the interval of each observation known, the cross term has no unbiased
-estimate.
-
-`holdout` chooses what each held-out term leaves out: `:location` (the default) all
-observations at the held-out value, `:observation` just one of them. The two agree when every
-value is distinct. On tied data leaving out a single copy rewards density spikes at the repeated
-values.
+`support`, `kappas`, `rtol` and `holdout` mean what they do for [`select_kappa`](@ref).
+`resolution` may be `nothing` (check for ties) or `0` (accept the values as exact points);
+this criterion has no interval form, because with only the interval of each observation known,
+the cross term has no unbiased estimate, so rounded data should go to `select_kappa` with
+`resolution` set to the rounding increment.
 
 # Extended help
 
 Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
-segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from a one-step leave-one-out expansion of
-the fit in the dropped point's weight (see [`select_kappa_kl`](@ref)), so no per-point refitting is
-needed. The score is minimized by a golden-section search over `ln κ`, bracketed by the grid `κs`.
+segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from the same leave-one-out expansion
+[`select_kappa`](@ref) uses, so no per-point refitting is needed. The score is minimized by a
+golden-section search over `ln κ`, bracketed by the grid `kappas`.
 """
-function select_kappa_cv(x::AbstractVector{<:Real}; κs::AbstractVector{<:Real}=_default_κs(x),
+function select_kappa_cv(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
                          rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
                          resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
-    resolution === nothing || resolution == 0 ||
+    _is_rounded(resolution) &&
         throw(ArgumentError("select_kappa_cv has no form for rounded (interval) data; use " *
-                            "select_kappa_kl(x; resolution=$resolution), or resolution=0 to treat " *
+                            "select_kappa(x; resolution=$resolution), or resolution=0 to treat " *
                             "the values as exact points"))
-    return _select_by_score(_lscv, x, κs, rtol, support; holdout, checkties=resolution === nothing,
-                            caller="select_kappa_cv")
+    return _select_by_score(_lscv, x, kappas, rtol, support; holdout, checkties=resolution === nothing)
 end
 
 """
-    select_kappa_kl(x; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
-                    resolution=nothing, holdout=:location) -> κ
-    select_kappa_kl(lower, upper; κs=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
-                    holdout=:location) -> κ
+    select_kappa(x; support=(-Inf, Inf), rtol=cbrt(eps(T)), resolution=nothing,
+                 holdout=:location, kappas=<data-scaled grid>) -> κ::T
+    select_kappa(lower, upper; support=(-Inf, Inf), rtol=cbrt(eps(T)), holdout=:location,
+                 kappas=<data-scaled grid>) -> κ::T
 
-Choose the smoothing scale by Kullback–Leibler (likelihood) cross-validation: return the `κ`
-minimizing the mean negative leave-one-out log-likelihood
+Choose a constant smoothing scale for [`DensityEstimate`](@ref)`(x, κ; support, rtol)` (or, for
+interval data, [`IntervalDensityEstimate`](@ref)) by Kullback–Leibler (likelihood)
+cross-validation: return the `κ` minimizing the mean negative leave-one-out log-likelihood
 
     KLCV(κ) = -(1/N) Σᵢ wᵢ ln Q̂_{κ,-i}(xᵢ),
 
-where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. This is the
-**recommended default** selector: on a range of test densities it tracks the error-optimal
-scale most closely of the four (see `benchmarks/`), and it is the cheapest of the
-cross-validation scores to evaluate. Like [`select_kappa_cv`](@ref) it generally selects a
-finer scale than [`select_kappa_ms`](@ref) and [`kappa_interval`](@ref), which resolve
-information rather than divergence.
+where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. `κ` has the data's
+floating-point type `T`. For a spatially varying scale, see
+[`select_kappa(x, ::Adaptive)`](@ref select_kappa(::AbstractVector{<:Real}, ::Adaptive)); to
+choose `support` as well, see [`select_support`](@ref).
 
-`support = (a, b)` (default `(-Inf, Inf)`) fits and cross-validates on a finite domain, as
-[`DensityEstimate`](@ref)'s `support` does; it is a fixed hyperparameter of the search, not
-itself selected, and is held fixed across every candidate `κ`. Data outside `[a, b]`, or
-`a ≥ b`, throws a `DomainError`. `κs` must be sorted and positive, with at least three values
-to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
+`support`, `rtol` and `resolution` describe the model and should match the later fit:
 
-Cross-validation of the point likelihood assumes the data are draws from a continuous
-density. If more than 1% of the observations repeat another value, the data are probably
-rounded, and an `ArgumentError` explains the options unless `resolution` is given:
-
-- `resolution = δ > 0`: each `x[i]` was rounded to a lattice of spacing `δ`, and the scale is
-  chosen for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`. Each observation then
-  contributes the held-out log-probability of its rounding interval.
-- `resolution = 0`: the values are exact points, fitted by [`DensityEstimate`](@ref). On
-  heavily tied points the score can favor over-resolved scales; [`select_kappa_ms`](@ref) and
-  [`kappa_interval`](@ref) are safer there.
+- `support = (a, b)` (default `(-Inf, Inf)`) fits and cross-validates on a finite domain, as
+  [`DensityEstimate`](@ref)'s `support` does. It is held fixed across every candidate `κ`. Data
+  outside `[a, b]`, or `a ≥ b`, throws a `DomainError`.
+- `rtol` is the node-merging tolerance, as a fraction of the local smoothing length.
+- Cross-validation of the point likelihood assumes the data are draws from a continuous
+  density. If more than 1% of the observations repeat another value, the data are probably
+  rounded, and an `ArgumentError` explains the options unless `resolution` is given.
+  `resolution = δ > 0` declares that each `x[i]` was rounded to a lattice of spacing `δ`; the
+  scale is then chosen for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, and each
+  observation contributes the held-out log-probability of its rounding interval.
+  `resolution = 0` declares the values exact points, fitted by [`DensityEstimate`](@ref); on
+  heavily tied points the score can favor over-resolved scales, and [`kappa_interval`](@ref) is
+  safer there.
 
 The second form takes the bounds of interval observations directly, for
 [`IntervalDensityEstimate`](@ref)`(lower, upper, κ)`, including censored values and a mix of
@@ -2806,15 +2812,23 @@ default) all observations at the held-out value, `:observation` just one of them
 when every value is distinct. On tied data leaving out a single copy rewards density spikes at
 the repeated values. Interval observations are always left out one at a time.
 
+`kappas` is the grid that brackets the search. It must be sorted and positive, with at least
+three values, and defaults to a geometric range scaled to the data's extent. For interval data
+the default grid stops where `κ` times the widest interval reaches 4096, beyond which the fit is
+at its histogram limit and cannot be computed accurately.
+
+See the "Comparing selection criteria" section of the manual for the alternative criteria
+[`select_kappa_cv`](@ref), [`select_kappa_ms`](@ref) and [`kappa_interval`](@ref).
+
 # Extended help
 
 `KLCV` estimates, up to a `κ`-independent constant, the Kullback–Leibler divergence
 `KL(Q ‖ Q̂_κ)`; minimizing it is maximum-likelihood cross-validation. It is the criterion native
-to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-likelihood, and to
-leading order it selects the same error-optimal scale as [`select_kappa_cv`](@ref) while being
-cheaper: the `∫Q̂²` roughness term is not needed. For interval data it estimates the divergence
-between the true and fitted probabilities of the recorded intervals, which is all such data
-determine.
+to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-likelihood. To
+leading order it selects the same error-optimal scale as least-squares cross-validation
+([`select_kappa_cv`](@ref)), and it is cheaper, because the `∫Q̂²` roughness term is not needed.
+For interval data it estimates the divergence between the true and fitted probabilities of the
+recorded intervals, which is all such data determine.
 
 Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a one-step leave-one-out expansion of the fit
 in the dropped point's weight — a Newton step whose length is set so the deleted node's own
@@ -2823,23 +2837,19 @@ to over-fitting — so no per-point refitting is needed and the score costs `O(N
 observation, the refit is approximated by minimizing over the interval's own nodal values with
 its term in the likelihood exact and the rest of the problem replaced by its quadratic model,
 which stays accurate when the deletion empties the interval. The score is minimized by a
-golden-section search over `ln κ`, bracketed by the grid `κs`. For interval data the default
-grid stops where `κ` times the widest interval reaches 4096, beyond which the fit is at its
-histogram limit and cannot be computed accurately.
+golden-section search over `ln κ`, bracketed by the grid `kappas`.
 """
-function select_kappa_kl(x::AbstractVector{<:Real}; κs::Union{AbstractVector{<:Real},Nothing}=nothing,
-                         rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
-                         resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
-    if resolution === nothing || resolution == 0
-        return _select_by_score(_klcv, x, κs === nothing ? _default_κs(x) : κs, rtol, support;
-                                holdout, checkties=resolution === nothing, caller="select_kappa_kl")
+function select_kappa(x::AbstractVector{<:Real}; support::Tuple{Real,Real}=(-Inf, Inf),
+                      rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,
+                      holdout::Symbol=:location,
+                      kappas::AbstractVector{<:Real}=_default_κs(x, resolution, support))
+    if !_is_rounded(resolution)
+        return _select_by_score(_klcv, x, kappas, rtol, support; holdout, checkties=resolution === nothing)
     end
-    isfinite(resolution) && resolution > 0 ||
-        throw(ArgumentError("resolution must be finite and nonnegative, got $resolution"))
     isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
-    T = float(promote_type(eltype(x), typeof(resolution)))
+    T = float(eltype(x))
     lower, upper = _lattice_bounds(x, T(resolution), support)
-    return select_kappa_kl(lower, upper; κs, rtol, support, holdout)
+    return select_kappa(lower, upper; kappas, rtol, support, holdout)
 end
 
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
@@ -2847,25 +2857,23 @@ end
 # nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
 # to a non-finite score; those are treated as +∞ so the search never selects a degenerate scale.
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
-                          support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false,
-                          caller::String="")
+                          support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false)
     _check_kappa_grid(κs)
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    a, b = support
-    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
-    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol), _support_eltype(a), _support_eltype(b)))
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
+    T = float(promote_type(eltype(x), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
-    checkties && _check_ties(xs, caller)
+    checkties && _check_ties(xs)
     r = T(rtol)
     score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout); isfinite(v) ? v : typemax(T))
     return _minimize_on_grid(score, κs, T)
 end
 
 function _check_kappa_grid(κs)
-    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
-    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
+    issorted(κs) && all(>(0), κs) || throw(ArgumentError("kappas must be sorted and positive"))
+    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in kappas to bracket the minimum"))
     return nothing
 end
 
@@ -2883,7 +2891,7 @@ const _TIE_FRACTION = 0.01
 
 # Throw if more than `_TIE_FRACTION` of the sorted sample `xs` repeats an earlier value, naming
 # the lattice spacing when the distinct values lie on one.
-function _check_ties(xs::Vector{T}, caller::String) where {T}
+function _check_ties(xs::Vector{T}) where {T}
     n = length(xs)
     ntied = count(i -> xs[i] == xs[i-1], 2:n)
     ntied > _TIE_FRACTION * n || return nothing
@@ -2892,15 +2900,13 @@ function _check_ties(xs::Vector{T}, caller::String) where {T}
           "point likelihood treats them as exact. "
     d = T[xs[i] - xs[i-1] for i in 2:n if xs[i] != xs[i-1]]    # gaps between distinct values
     δ = isempty(d) ? zero(T) : minimum(d)
-    fix = caller in ("select_kappa_kl", "select_kappa_adaptive") ?
-          "pass `resolution=δ` to fit them as rounded (interval) data" :
-          "use `select_kappa_kl(x; resolution=δ)` to fit them as rounded (interval) data"
     if length(d) >= 2 && all(di -> abs(di / δ - round(di / δ)) <= 1e-3, d)
-        msg *= "The distinct values lie on a lattice of spacing δ ≈ $(round(δ; sigdigits=6)): $fix, " *
-               "or pass `resolution=0` to treat them as exact points."
+        msg *= "The distinct values lie on a lattice of spacing δ ≈ $(round(δ; sigdigits=6)): pass " *
+               "`resolution=δ` to `select_kappa` to fit them as rounded (interval) data, or " *
+               "`resolution=0` to treat them as exact points."
     else
         msg *= "Pass `resolution=0` to treat them as exact points, or give each observation's bounds " *
-               "with `$(caller == "select_kappa_adaptive" ? caller : "select_kappa_kl")(lower, upper)`."
+               "with `select_kappa(lower, upper)`."
     end
     throw(ArgumentError(msg))
 end
@@ -2913,8 +2919,8 @@ A spatially varying smoothing scale of the plug-in form
     κ(x) = c · (p̂(x) / ḡ)^α,
 
 where `p̂` is the `pilot` density estimate and `ḡ` the geometric mean of `p̂` over the
-sample it was fitted to. [`select_kappa_adaptive`](@ref) constructs one by choosing `c`
-and `α`; the result is callable, and is passed straight to [`DensityEstimate`](@ref) as
+sample it was fitted to. [`select_kappa`](@ref)`(x, Adaptive())` constructs one by choosing
+`c` and `α`; the result is callable, and is passed straight to [`DensityEstimate`](@ref) as
 the smoothing scale.
 
 Dividing by `ḡ` puts `c` on the same footing as a constant scale: where `p̂` equals its
@@ -3014,7 +3020,7 @@ end
 
 # Leave-one-out log densities ln Q̂₋ⱼ(xⱼ), one per observation of the sorted sample `xs`, for the
 # candidate scale `κfun`: a constant (a `Real`, merged and scored exactly as the constant
-# candidate in `select_kappa_adaptive`) or any scale function (merged and scored as
+# candidate in the adaptive `select_kappa`) or any scale function (merged and scored as
 # `_score_kappa` does). Each observation takes the value at the node it merged into; merging
 # collapses contiguous runs of `xs`, so node i covers the next `w[i]` observations in order.
 # Hence `-mean` of the result is `_klcv` on the same nodes, up to rounding. Entries whose node has
@@ -3098,7 +3104,7 @@ const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum befor
 # `bounds`, when given, is an absolute `(lo, hi)` the search may never recenter past: an edge
 # minimum that coincides with a clamped bound is accepted outright rather than triggering
 # another shift, since there is nowhere sane left to look. `select_support`'s chained κ search
-# uses this to stay inside the data-scaled range `select_kappa_kl` itself would ever consider —
+# uses this to stay inside the data-scaled range `select_kappa` itself would ever consider —
 # without it, a handful of gap candidates can warm-start each other up an unbounded chain into
 # a regime where the first-order LOO expansion is no longer trustworthy and spuriously reports
 # ever-improving scores (observed directly: KLCV score turning unboundedly negative for
@@ -3155,15 +3161,59 @@ end
 
 include("window.jl")
 
+const _DEFAULT_ALPHAS = (0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5)
+
 """
-    select_kappa_adaptive(x; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), pilot_selector=nothing,
-        window=WindowRule(), nse=(window === nothing ? 1 : 0), rtol=cbrt(eps(T)),
-        support=(-Inf, Inf), resolution=nothing) -> κ
-    select_kappa_adaptive(lower, upper; alphas, pilot_selector, window, nse, rtol, support) -> κ
+    Adaptive(; alphas=(0.125, 0.25, …, 1.0, 1.25, 1.5), window=WindowRule(),
+             nse=(window === nothing ? 1 : 0), pilot=nothing)
+
+The search settings of [`select_kappa`](@ref)`(x, Adaptive(; …))`, which chooses a spatially
+varying smoothing scale.
+
+- `alphas`: the exponents of the power family `c·(p̂/ḡ)^α`. They must be positive, because
+  `α = 0` is the constant scale, which is always in the comparison. They are stored, and
+  searched, in increasing order. The default is
+  `(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5)`.
+- `window`: the window rule's settings (a [`WindowRule`](@ref)), or `nothing` to leave out the
+  window candidate.
+- `nse ≥ 0`: how many standard errors the power family's gain over the constant scale must
+  exceed. `nse = 0` returns whichever has the smaller score. The default is `0` with a window
+  candidate and `1` without, so that the power family alone must beat the constant scale
+  clearly.
+- `pilot`: a callable returning the positive constant scale of the pilot density from the
+  sample, or from `(lower, upper)` for interval data. The default `nothing` uses the
+  constant-scale [`select_kappa`](@ref).
+"""
+struct Adaptive{P}
+    alphas::Vector{Float64}             # exponents of the power family, increasing
+    window::Union{WindowRule,Nothing}
+    nse::Float64
+    pilot::P
+
+    function Adaptive{P}(alphas, window, nse, pilot) where {P}
+        isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
+        all(>(0), alphas) ||
+            throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
+                                "(α = 0) is always compared against them"))
+        nse >= 0 || throw(ArgumentError("nse must be nonnegative, got $nse"))
+        return new{P}(sort!(collect(Float64, alphas)), window, nse, pilot)
+    end
+end
+
+Adaptive(alphas, window, nse, pilot::P) where {P} = Adaptive{P}(alphas, window, nse, pilot)
+Adaptive(; alphas=_DEFAULT_ALPHAS, window::Union{WindowRule,Nothing}=WindowRule(),
+         nse::Real=window === nothing ? 1 : 0, pilot=nothing) =
+    Adaptive(alphas, window, nse, pilot)
+
+"""
+    select_kappa(x, adaptive::Adaptive; support=(-Inf, Inf), rtol=cbrt(eps(T)),
+                 resolution=nothing) -> κ
+    select_kappa(lower, upper, adaptive::Adaptive; support=(-Inf, Inf), rtol=cbrt(eps(T))) -> κ
 
 Choose a *spatially varying* smoothing scale by Kullback–Leibler cross-validation, and
 return it ready to pass to [`DensityEstimate`](@ref) (or, for interval data,
-[`IntervalDensityEstimate`](@ref)).
+[`IntervalDensityEstimate`](@ref)). `κ` is a `T`, an `AdaptiveScale{T}` or a `WindowScale{T}`,
+with `T` the data's floating-point type.
 
 Three kinds of scale compete on the same score: the constant scale, returned as a number
 (so the fit takes the constant-`κ` path and its goodness-of-fit machinery stays available);
@@ -3174,48 +3224,27 @@ window around `x` already shows a slope or curvature, and so resolves narrow fea
 their height. The window candidate is returned when its score plus a penalty (see
 [`WindowRule`](@ref)) is below that of the power family's choice. Within the power family, an
 exponent `α` is returned when it beats the constant scale by more than `nse` standard errors
-of the score. Selection costs a small multiple of one [`select_kappa_kl`](@ref) call per
-exponent plus one for the window candidate; shorten `alphas` to trade capture for speed.
+of the score. The settings `alphas`, `window`, `nse` and `pilot` are those of `adaptive` (see
+[`Adaptive`](@ref)). Selection costs a small multiple of one constant-scale
+[`select_kappa`](@ref) call per exponent plus one for the window candidate; shorten `alphas` to
+trade capture for speed.
 
-The default `alphas` are `(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5)`.
-They must be positive: `α = 0` is the constant scale, which is always in the
-comparison. They are searched in increasing order, whatever order they are given in.
-`nse ≥ 0` sets how many standard errors the power family's gain over the constant scale must
-exceed (see the extended help); `nse = 0` (the default) returns whichever has the smaller
-score.
-`pilot_selector` sets the constant scale of the pilot density the family is built from, and
-may be any callable returning a positive scale from the sample (from `(lower, upper)` for
-interval data); the default `nothing` uses [`select_kappa_kl`](@ref). `rtol` is the
-node-merging tolerance, as a fraction of the local smoothing length, matching
-[`DensityEstimate`](@ref)'s.
+`support`, `rtol` and `resolution` work as for the constant-scale [`select_kappa`](@ref).
+`support` is fixed across every candidate `α`/`c`, and both the pilot density and every
+candidate are fitted and cross-validated on it. With `resolution = δ > 0` the scale is selected
+for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, with the pilot an interval fit
+and every candidate scored by the held-out log-probabilities of the observations' intervals.
+With `resolution = δ > 0` or the `(lower, upper)` form, the windows are computed from the
+observations spread evenly over their intervals (see the extended help).
 
-`window` holds the window rule's settings (a [`WindowRule`](@ref)); `window = nothing`
-leaves out the window candidate, and `nse` then defaults to `1`, so that the power family
-must beat the constant scale clearly. With `resolution = δ > 0` or the `(lower, upper)`
-form, the windows are computed from the observations spread evenly over their intervals
-(see the extended help).
-
-`resolution` and the `(lower, upper)` form work as for [`select_kappa_kl`](@ref): more than 1%
-repeated values throw an `ArgumentError` unless `resolution` is given; `resolution = δ > 0`
-treats each `x[i]` as rounded to a lattice of spacing `δ` and selects the scale for
-[`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, with the pilot an interval fit and
-every candidate scored by the held-out log-probabilities of the observations' intervals;
-`resolution = 0` treats the values as exact points.
-
-`support = (a, b)` (default `(-Inf, Inf)`) fits the pilot density and cross-validates every
-candidate scale on a finite domain, as [`DensityEstimate`](@ref)'s `support` does; it is a
-fixed hyperparameter of the search, not itself selected, and is held fixed across every
-candidate `α`/`c`. Data outside `[a, b]`, or `a ≥ b`, throws a `DomainError`. Composing this
-selector with [`select_support`](@ref) — which chooses `support` (and a constant `κ`) by the
-same cross-validation score — is two documented steps, not one entry point: call
-`select_support` first, then pass its `support` here, then fit `DensityEstimate(x, κ;
-support)` with the scale this returns.
+To choose `support` as well, call [`select_support`](@ref) first, pass its `support` here, and
+fit `DensityEstimate(x, κ; support)` with the scale this returns.
 
 # Examples
 ```jldoctest
 julia> x = -log.(1 .- (0.5:999.5) ./ 1000);   # exponential: a jump at the left edge
 
-julia> κ = select_kappa_adaptive(x);          # the window rule wins here
+julia> κ = select_kappa(x, Adaptive());      # the window rule wins here
 
 julia> κ isa WindowScale
 true
@@ -3225,10 +3254,10 @@ julia> d = DensityEstimate(x, κ);
 julia> extrema(d.κ)[2] / extrema(d.κ)[1] > 10    # far finer at the edge than in the tail
 true
 
-julia> select_kappa_adaptive(x; window=nothing).α   # the power family alone
+julia> select_kappa(x, Adaptive(window=nothing)).α   # the power family alone
 0.625
 
-julia> select_kappa_adaptive(range(0, 1; length=1000); window=nothing) isa Real   # nothing to buy
+julia> select_kappa(range(0, 1; length=1000), Adaptive(window=nothing)) isa Real   # nothing to buy
 true
 ```
 
@@ -3241,14 +3270,14 @@ kink, or heavy tails, or narrow features beside broad ones. On smooth densities 
 little to buy, and the selector returns a plain number, the constant scale, when it scores
 best; with `nse > 0` the power family must also beat it by that many standard errors.
 
-The rule is a plug-in: fit a pilot density `p̂` at the constant scale `pilot_selector(x)` (by
-default [`select_kappa_kl`](@ref)), then consider the family
+The rule is a plug-in: fit a pilot density `p̂` at the constant scale `pilot(x)` (by default
+[`select_kappa`](@ref)), then consider the family
 
     κ(x; c, α) = c · (p̂(x) / ḡ)^α,     ḡ = geometric mean of p̂ over the sample
 
 (an [`AdaptiveScale`](@ref)). For each exponent `α` in `alphas`, `c` is chosen by
 golden-section search on the leave-one-out score `KLCV(κ) = -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ)`
-generalized to a varying scale — the same criterion [`select_kappa_kl`](@ref) minimizes,
+generalized to a varying scale — the same criterion [`select_kappa`](@ref) minimizes,
 and, like it, evaluated in closed form and `O(N)`, with no refitting. The constant scale
 competes as the `α = 0` member of the same family and on the same score.
 
@@ -3302,45 +3331,36 @@ shape. Within a window this gives the sums of `u` and `u²` expected if each obs
 spread uniformly over its interval, while the counts in different intervals keep their sampling
 noise. The scores are the interval-likelihood KLCV scores, and `N` counts all observations.
 
-`pilot_selector` is a scale-selection method, and is called on the sample alone with no notion
-of `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
-notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot_selector` on a
-bounded domain. Because `support` is fixed throughout the `α` search, composing with
+`pilot` is a scale-selection method, and is called on the sample alone with no notion of
+`support`; the pilot density it scales is what is fitted on `support`. So a selector with no
+notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot` on a bounded
+domain. Because `support` is fixed throughout the `α` search, composing with
 [`select_support`](@ref) re-runs that search on each boundary arm's own domain, so `α` gets to
 respond to whatever regularity a boundary already bought, rather than being reused from an
 unbounded selection that saw a different edge.
 """
-function select_kappa_adaptive(x::AbstractVector{<:Real};
-                               alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
-                               pilot_selector=nothing,
-                               window::Union{WindowRule,Nothing}=WindowRule(),
-                               nse::Real=window === nothing ? 1 : 0,
-                               rtol::Real=cbrt(eps(float(eltype(x)))),
-                               support::Tuple{Real,Real}=(-Inf, Inf),
-                               resolution::Union{Real,Nothing}=nothing)
-    if resolution !== nothing && resolution != 0
-        isfinite(resolution) && resolution > 0 ||
-            throw(ArgumentError("resolution must be finite and nonnegative, got $resolution"))
+function select_kappa(x::AbstractVector{<:Real}, adaptive::Adaptive; support::Tuple{Real,Real}=(-Inf, Inf),
+                      rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing)
+    if _is_rounded(resolution)
         isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
-        TR = float(promote_type(eltype(x), typeof(resolution)))
+        TR = float(eltype(x))
         lower, upper = _lattice_bounds(x, TR(resolution), support)
-        return select_kappa_adaptive(lower, upper; alphas, pilot_selector, window, nse, rtol, support)
+        return select_kappa(lower, upper, adaptive; rtol, support)
     end
-    _check_adaptive_args(alphas, nse, rtol)
-    a, b = support
-    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
-    T = float(promote_type(eltype(x), eltype(alphas), typeof(rtol), _support_eltype(a), _support_eltype(b)))
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
+    T = float(promote_type(eltype(x), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
-    resolution === nothing && _check_ties(xs, "select_kappa_adaptive")
+    resolution === nothing && _check_ties(xs)
     r = T(rtol)
 
-    # pilot_selector chooses only a scalar starting scale, so it is called support-oblivious
-    # (any callable returning a positive scale from the sample, including ones with no notion
-    # of a boundary at all); the pilot density p̂ below is what actually carries the support.
-    κ0 = T(pilot_selector === nothing ? select_kappa_kl(xs; resolution=0) : pilot_selector(xs))
-    κ0 > 0 || throw(ArgumentError("pilot_selector must return a positive scale, got $κ0"))
+    # `pilot` chooses only a scalar starting scale, so it is called support-oblivious (any
+    # callable returning a positive scale from the sample, including ones with no notion of a
+    # boundary at all); the pilot density p̂ below is what actually carries the support.
+    κ0 = T(adaptive.pilot === nothing ? select_kappa(xs; resolution=0) : adaptive.pilot(xs))
+    κ0 > 0 || throw(ArgumentError("pilot must return a positive scale, got $κ0"))
     p = DensityEstimate(xs, κ0; rtol=r, support=(slo, shi))
 
     # The constant scale, scored on the same footing as the adaptive candidates. The 7-arg
@@ -3348,19 +3368,9 @@ function select_kappa_adaptive(x::AbstractVector{<:Real};
     const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
     score(κfun) = _score_kappa(_klcv, xs, κfun, r, slo, shi)
     gain_se(κa) = _adaptive_gain(xs, κ0, κa, r, slo, shi)
-    κp, sp = _select_power(score, gain_se, p, κ0, const_score, alphas, nse)
-    window === nothing && return κp
-    return _choose_window(score, xs, κ0, κp, sp, window)
-end
-
-function _check_adaptive_args(alphas, nse, rtol)
-    isempty(alphas) && throw(ArgumentError("need at least one exponent in alphas"))
-    all(>(0), alphas) ||
-        throw(ArgumentError("the exponents in alphas must be positive; the constant scale " *
-                            "(α = 0) is always compared against them"))
-    nse >= 0 || throw(ArgumentError("nse must be nonnegative, got $nse"))
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    return nothing
+    κp, sp = _select_power(score, gain_se, p, κ0, const_score, adaptive.alphas, adaptive.nse)
+    adaptive.window === nothing && return κp
+    return _choose_window(score, xs, κ0, κp, sp, adaptive.window)
 end
 
 # The search shared by point and interval data. `score(κfun)` is the KLCV score of the scale
@@ -3515,12 +3525,13 @@ _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
 
 """
-    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=cbrt(eps(T)),
-                   resolution=nothing) -> (; κ, support)
+    select_support(x; rtol=cbrt(eps(T)), resolution=nothing, kappas=<data-scaled grid>)
+        -> (; κ, support)
 
 Choose a domain `support = (a, b)` — either side possibly infinite — together with the
 smoothing scale `κ`, jointly, by the same Kullback–Leibler cross-validation score
-[`select_kappa_kl`](@ref) minimizes. Pass the result straight to [`DensityEstimate`](@ref):
+[`select_kappa`](@ref) minimizes. `κ` has the data's floating-point type. Pass the result
+straight to [`DensityEstimate`](@ref):
 
     r = select_support(x)
     d = DensityEstimate(x, r.κ; support = r.support)
@@ -3529,19 +3540,15 @@ A boundary is imposed on a side only when it wins that cross-validation, never a
 the fact that one side of the data has an edge; a side that does not win stays `±Inf`. A
 finite boundary is always placed outward of the extreme data point on its side, and never
 closer to it than five times the mean spacing of the data near that edge. When neither side
-wins, the support is `(-Inf, Inf)` and the returned `κ` equals `kappa(x; κs, rtol)` exactly —
-a family with nothing to gain from a boundary gets the standalone selection itself, not
-merely something close to it.
+wins, the support is `(-Inf, Inf)` and the returned `κ` equals `select_kappa(x; rtol, kappas)`
+exactly.
 
-`kappa` (default [`select_kappa_kl`](@ref)) must share [`select_kappa_kl`](@ref)'s
-`(x; κs, rtol, support)` interface, as [`select_kappa_cv`](@ref) does. `κs` and `rtol` are
-passed through to it, and set the golden-section bracket and the node-merging tolerance (a
-fraction of the local smoothing length) throughout the search.
+`kappas` and `rtol` mean what they do for [`select_kappa`](@ref): the grid bracketing the κ
+search, and the node-merging tolerance (a fraction of the local smoothing length).
 
-More than 1% repeated values throw an `ArgumentError`, as for [`select_kappa_kl`](@ref), unless
-`resolution = 0` is given, which treats the values as exact points; `resolution` is then passed
-to `kappa` as well, which must accept it. `select_support` has no form for rounded (interval)
-data, so `resolution > 0` throws an `ArgumentError`.
+More than 1% repeated values throw an `ArgumentError`, as for [`select_kappa`](@ref), unless
+`resolution = 0` is given, which treats the values as exact points. `select_support` has no
+form for rounded (interval) data, so `resolution > 0` throws an `ArgumentError`.
 
 # Examples
 ```jldoctest
@@ -3584,34 +3591,31 @@ searched from the widest gap to the narrowest, and each candidate's `κ` search 
 in a narrow window about the *previous* candidate's optimum rather than repeating a full search
 from scratch, since `κ*` moves continuously with the gap.
 
-`kappa` is consulted at two points only: once at the start, to seed the unbounded arm's
-competing score and the first (and widest) gap candidate's `κ` warm start; and once at the
-end, to refine `κ` at the winning support over the full `κs` bracket a standalone call would
-use (the chained inner searches above use a narrower window, for speed). When neither side
-wins, no refinement call is made and the returned `κ` *is* that first call. The gap-path
-searches themselves score every candidate directly by the KLCV score `select_kappa_kl` uses,
-not by calling `kappa` per candidate.
+The full constant-scale search of [`select_kappa`](@ref) runs at two points only: once at the
+start, to seed the unbounded arm's competing score and the first (and widest) gap candidate's
+`κ` warm start; and once at the end, to refine `κ` at the winning support over the full
+`kappas` bracket (the chained inner searches above use a narrower window, for speed). When
+neither side wins, no refinement is made and the returned `κ` *is* the first search's result.
 """
-function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
-                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
-                        resolution::Union{Real,Nothing}=nothing)
-    resolution === nothing || resolution == 0 ||
+function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(eltype(x)))),
+                        resolution::Union{Real,Nothing}=nothing,
+                        kappas::AbstractVector{<:Real}=_default_κs(x))
+    _is_rounded(resolution) &&
         throw(ArgumentError("select_support has no form for rounded (interval) data; use " *
-                            "select_kappa_kl(x; resolution=$resolution), or resolution=0 to treat " *
+                            "select_kappa(x; resolution=$resolution), or resolution=0 to treat " *
                             "the values as exact points"))
-    issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
-    length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
+    _check_kappa_grid(kappas)
+    _check_rtol(rtol)
+    T = float(promote_type(eltype(x), typeof(rtol)))
     xs = _sorted_sample(x, T)
-    resolution === nothing && _check_ties(xs, "select_support")
-    kw = resolution === nothing ? (;) : (; resolution)
+    resolution === nothing && _check_ties(xs)
     r = T(rtol)
-    # The chained κ search never leaves the data-scaled range `kappa` itself draws from — see
+    # The chained κ search never leaves the data-scaled range the full search draws from — see
     # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
-    κ_bounds = (T(minimum(κs)), T(maximum(κs)))
+    κ_bounds = (T(minimum(kappas)), T(maximum(kappas)))
+    full_search(support) = _select_by_score(_klcv, xs, kappas, r, support)
 
-    κ_inf = T(kappa(xs; κs, rtol, kw...))
+    κ_inf = full_search((T(-Inf), T(Inf)))
     score_cur = _support_klcv(xs, r, κ_inf, T(-Inf), T(Inf))
     lo, hi, κcur = T(-Inf), T(Inf), κ_inf
 
@@ -3625,7 +3629,7 @@ function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
         hi, κcur = xs[end] + gapR, κR
     end
 
-    κ = isinf(lo) && isinf(hi) ? κ_inf : T(kappa(xs; κs, rtol, support=(lo, hi), kw...))
+    κ = isinf(lo) && isinf(hi) ? κ_inf : full_search((lo, hi))
     return (; κ, support=(lo, hi))
 end
 
