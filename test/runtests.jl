@@ -1250,17 +1250,6 @@ end
         end
     end
 
-    @testset "deprecated keyword κ" begin
-        x = [-1.0, 0.0, 0.0, 1.0]
-        d = @test_deprecated DensityEstimate(x; κ=1.0)
-        @test d.ψ == DensityEstimate(x, 1.0).ψ
-        dr = @test_deprecated DensityEstimate(x; κ=1.0, rtol=1e-3)
-        @test dr.ψ == DensityEstimate(x, 1.0; rtol=1e-3).ψ
-        # A callable scale is reachable only through the positional form, so the keyword
-        # never has to grow a second meaning.
-        @test_throws "must be passed positionally" DensityEstimate(x; κ = t -> 1.0)
-    end
-
     @testset "goodness of fit: statistic" begin
         d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
         @test chisq(d, d) == 0                 # a distribution vs itself
@@ -2357,6 +2346,23 @@ end
         @test_throws "rtol must be nonnegative" select_support([1.0, 2.0, 3.0]; rtol=-1.0)
     end
 
+    @testset "tied data and resolution" begin
+        y = -log.(1 .- (0.5:499.5) ./ 500)
+        x = [y; y[200:219]]          # 4% ties, none near the edge
+        @test_throws "repeat another value" select_support(x)
+        @test_throws "resolution=0" select_support(x)
+        @test_throws ArgumentError select_support(x; resolution=0.1)
+        @test_throws "select_support has no form for rounded (interval) data" select_support(x; resolution=0.1)
+        r = select_support(x; resolution=0)
+        @test r.support[1] <= minimum(x) && isfinite(r.support[1]) && r.support[2] == Inf
+        @test r.κ == select_kappa_kl(x; resolution=0, support=r.support)
+        rcv = select_support(x; kappa=select_kappa_cv, resolution=0)
+        @test rcv.κ == select_kappa_cv(x; resolution=0, support=rcv.support)
+        # Without `resolution`, `kappa` is called with only the documented keywords.
+        kl_only(x; κs, rtol, support=(-Inf, Inf)) = select_kappa_kl(x; κs, rtol, support)
+        @test select_support(y; kappa=kl_only) == select_support(y)
+    end
+
     @testset "_edge_spacing and _select_gap failure paths" begin
         # Fewer than two points near the edge: unreachable through select_support itself (its
         # upstream κ selection already demands at least two distinct points), so exercised
@@ -2369,9 +2375,8 @@ end
         # refuses such heavily tied data first; accepting them as exact points reaches the edge.
         x = vcat(fill(0.0, 10), [100.0])
         @test_throws "repeat another value" select_support(x)
-        points_kl(x; kwargs...) = select_kappa_kl(x; resolution=0, kwargs...)
-        @test_throws ArgumentError select_support(x; kappa=points_kl)
-        @test_throws "the 10 points nearest the left edge coincide" select_support(x; kappa=points_kl)
+        @test_throws ArgumentError select_support(x; resolution=0)
+        @test_throws "the 10 points nearest the left edge coincide" select_support(x; resolution=0)
 
         # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
         @test_throws ErrorException PenalizedDensity._select_gap(gap -> NaN, 1.0)

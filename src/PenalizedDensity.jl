@@ -50,9 +50,6 @@ tridiagonal system can be nearly singular.
 The returned object is callable: `d(x)` evaluates the density `Q(x)` at any real
 `x`, and it can be broadcast over arrays. Use [`amplitude`](@ref) for `ψ(x)`.
 
-Passing `κ` as a keyword, `DensityEstimate(x; κ)`, is deprecated in favor of the
-positional form.
-
 # Examples
 ```jldoctest
 julia> d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0);
@@ -152,14 +149,6 @@ function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-I
     lo, hi = support
     lo < hi || throw(DomainError((lo, hi), "support must satisfy a < b, got support=($lo, $hi)"))
     return _estimate(x, κ, rtol, lo, hi; stats)
-end
-
-function DensityEstimate(x::AbstractVector{R}; κ, rtol::Real=cbrt(eps(R))) where R<:Real
-    κ isa Real || throw(ArgumentError("a callable smoothing scale must be passed positionally: " *
-                                      "`DensityEstimate(x, κ)`"))
-    Base.depwarn("`DensityEstimate(x; κ)` is deprecated, pass the scale positionally as " *
-                 "`DensityEstimate(x, κ)`.", :DensityEstimate)
-    return DensityEstimate(x, κ; rtol)
 end
 
 # Every data point must lie in the requested support, or the boundary terms below (a cosh arc
@@ -1546,7 +1535,7 @@ together with its log-Jacobian, and [`gaussianize_gradient`](@ref) for its deriv
 
 # Examples
 ```jldoctest
-julia> d = DensityEstimate([0.0]; κ=0.5);   # a Laplace density centered at 0
+julia> d = DensityEstimate([0.0], 0.5);   # a Laplace density centered at 0
 
 julia> y = gaussianize(d, 1.0);
 
@@ -3372,7 +3361,8 @@ _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
 
 """
-    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=cbrt(eps(T))) -> (; κ, support)
+    select_support(x; kappa=select_kappa_kl, κs=<data-scaled grid>, rtol=cbrt(eps(T)),
+                   resolution=nothing) -> (; κ, support)
 
 Choose a domain `support = (a, b)` — either side possibly infinite — together with the
 smoothing scale `κ`, jointly, by the same Kullback–Leibler cross-validation score
@@ -3393,6 +3383,11 @@ merely something close to it.
 `(x; κs, rtol, support)` interface, as [`select_kappa_cv`](@ref) does. `κs` and `rtol` are
 passed through to it, and set the golden-section bracket and the node-merging tolerance (a
 fraction of the local smoothing length) throughout the search.
+
+More than 1% repeated values throw an `ArgumentError`, as for [`select_kappa_kl`](@ref), unless
+`resolution = 0` is given, which treats the values as exact points; `resolution` is then passed
+to `kappa` as well, which must accept it. `select_support` has no form for rounded (interval)
+data, so `resolution > 0` throws an `ArgumentError`.
 
 # Examples
 ```jldoctest
@@ -3444,18 +3439,25 @@ searches themselves score every candidate directly by the KLCV score `select_kap
 not by calling `kappa` per candidate.
 """
 function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
-                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))))
+                        κs::AbstractVector{<:Real}=_default_κs(x), rtol::Real=cbrt(eps(float(eltype(x)))),
+                        resolution::Union{Real,Nothing}=nothing)
+    resolution === nothing || resolution == 0 ||
+        throw(ArgumentError("select_support has no form for rounded (interval) data; use " *
+                            "select_kappa_kl(x; resolution=$resolution), or resolution=0 to treat " *
+                            "the values as exact points"))
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("κs must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in κs to bracket the minimum"))
     rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
     T = float(promote_type(eltype(x), eltype(κs), typeof(rtol)))
     xs = _sorted_sample(x, T)
+    resolution === nothing && _check_ties(xs, "select_support")
+    kw = resolution === nothing ? (;) : (; resolution)
     r = T(rtol)
     # The chained κ search never leaves the data-scaled range `kappa` itself draws from — see
     # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
     κ_bounds = (T(minimum(κs)), T(maximum(κs)))
 
-    κ_inf = T(kappa(xs; κs, rtol))
+    κ_inf = T(kappa(xs; κs, rtol, kw...))
     score_cur = _support_klcv(xs, r, κ_inf, T(-Inf), T(Inf))
     lo, hi, κcur = T(-Inf), T(Inf), κ_inf
 
@@ -3469,7 +3471,7 @@ function select_support(x::AbstractVector{<:Real}; kappa=select_kappa_kl,
         hi, κcur = xs[end] + gapR, κR
     end
 
-    κ = isinf(lo) && isinf(hi) ? κ_inf : T(kappa(xs; κs, rtol, support=(lo, hi)))
+    κ = isinf(lo) && isinf(hi) ? κ_inf : T(kappa(xs; κs, rtol, support=(lo, hi), kw...))
     return (; κ, support=(lo, hi))
 end
 
