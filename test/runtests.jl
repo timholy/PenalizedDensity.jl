@@ -1,4 +1,6 @@
 using PenalizedDensity
+using DensityInterface: DensityInterface, DensityKind, HasDensity
+import Distributions, StatsBase
 using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
 using LogExpFunctions: logaddexp
 using OffsetArrays
@@ -1923,6 +1925,37 @@ end
         end
         @test sprint(showerror, err) ==
               "ConvergenceError in the amplitude solve: Newton did not converge in 1 iterations"
+    end
+
+    @testset "interoperability: DensityInterface, Distributions, StatsBase" begin
+        x = [-1.3, -0.2, 0.4, 0.9, 2.1]
+        fits = (DensityEstimate(x, 1.0),
+                DensityEstimate(x, 1.0; support=(-2.0, 3.0)),
+                DensityEstimate(x, t -> 1 + t^2 / 4),
+                IntervalDensityEstimate([-1.0, 0.0, 1.5], [-0.5, 0.5, 2.0], 1.0))
+        for d in fits
+            @test DensityKind(d) === HasDensity()
+            for t in (-1.0, 0.3, 2.5)
+                DensityInterface.test_density_interface(d, t, logdensity(d, t))
+                @test DensityInterface.densityof(d, t) == d(t)
+                @test Distributions.cdf(d, t) == cdf(d, t)
+                @test Distributions.pdf(d, t) == d(t)
+                @test Distributions.logpdf(d, t) == logdensity(d, t)
+            end
+            @test Distributions.quantile(d, 0.3) == quantile(d, 0.3)
+        end
+        for d in fits[1:3]
+            @test StatsBase.entropy(d) == entropy(d)
+        end
+        # StatsBase's two-argument entropy takes a logarithm base, not evaluation points.
+        @test !hasmethod(StatsBase.entropy, Tuple{DensityEstimate,AbstractVector})
+
+        # With both packages loaded, the unqualified name is ambiguous; qualified names work.
+        m = Module()
+        Core.eval(m, :(using Distributions, PenalizedDensity))
+        Core.eval(m, :(d = DensityEstimate([0.0, 1.0], 1.0)))
+        @test Core.eval(m, :(Distributions.cdf(d, 0.5))) == Core.eval(m, :(PenalizedDensity.cdf(d, 0.5)))
+        @test_throws UndefVarError Core.eval(m, :(cdf(d, 0.5)))
     end
 end
 
