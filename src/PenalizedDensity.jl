@@ -1902,7 +1902,8 @@ Plug-in estimate of the differential entropy `H(Q) = -∫ Q ln Q dx` of the fitt
 where `W = Σᵢ wᵢ`. Evaluating `ln Q` at the data rather than integrating it exactly avoids a
 second quadrature pass and is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at
 small `W`: for the one-point fit (a Laplace density with rate `2κ`), `Ĥ = -ln κ` against the
-exact `H = 1 - ln κ`. See [`negentropy`](@ref).
+exact `H = 1 - ln κ`. An [`IntervalDensityEstimate`](@ref) extends the sum to interval
+observations. See [`negentropy`](@ref).
 """
 function entropy(d::DensityEstimate)
     W = sum(d.w)
@@ -1910,28 +1911,28 @@ function entropy(d::DensityEstimate)
 end
 
 """
-    negentropy(d::DensityEstimate) -> J
+    negentropy(d::AbstractDensityEstimate) -> J
 
 Negentropy of the fitted density: the entropy deficit relative to the Gaussian with the same
 mean and variance,
 
     J = ½ ln(2π e σ²) - Ĥ,
 
-where `σ²` is the fit's variance [`var`](@ref Statistics.var)`(d)` (computed in closed form from
-the nodal amplitudes, for any scale profile and support) and `Ĥ` is
-[`entropy`](@ref)`(d)`. `J ≥ 0` in the large-sample limit (the Gaussian maximizes entropy at
+where `σ²` is the fit's variance [`var`](@ref Statistics.var)`(d)` (computed from the nodal
+amplitudes, for any scale profile and support) and `Ĥ` is [`entropy`](@ref)`(d)`. `J ≥ 0` in the large-sample limit (the Gaussian maximizes entropy at
 fixed variance), but the plug-in `Ĥ` can push a finite-sample estimate slightly off zero even
 when the underlying density is Gaussian. `J` is invariant under `x ↦ a·x + b` (with `κ ↦ κ/|a|`
 for the corresponding fit, per the package's scale equivariance): both terms shift by `ln|a|`
 under the rescaling and cancel.
 """
-function negentropy(d::DensityEstimate{T}) where {T}
+function negentropy(d::AbstractDensityEstimate)
+    T = eltype(d)
     σ² = var(d)
     return log(2 * T(π) * exp(one(T)) * σ²) / 2 - entropy(d)
 end
 
 """
-    entropy(d::DensityEstimate, xeval::AbstractVector) -> Ĥ
+    entropy(d::AbstractDensityEstimate, xeval::AbstractVector) -> Ĥ
 
 Held-out plug-in estimate of the differential entropy of the fitted density `d`, scored at
 points `xeval` that did *not* enter the fit `d`:
@@ -1946,7 +1947,8 @@ Unlike the one-argument [`entropy`](@ref)`(d)`, which evaluates `ln Q̂` at the 
 nodes, this evaluates it at independent points and so does not reward collapsing the density
 onto the fit sample. It is the entropy term of [`negentropy`](@ref)`(d, xeval)`.
 """
-function entropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
+function entropy(d::AbstractDensityEstimate, xeval::AbstractVector)
+    T = eltype(d)
     M = length(xeval)
     M > 0 || throw(ArgumentError("need at least one evaluation point"))
     s = zero(T)
@@ -1976,7 +1978,7 @@ function _mean_var(xeval, ::Type{T}) where {T}
 end
 
 """
-    negentropy(d::DensityEstimate, xeval::AbstractVector) -> Ĵ
+    negentropy(d::AbstractDensityEstimate, xeval::AbstractVector) -> Ĵ
 
 Held-out negentropy of the fitted density `d`, scored at independent points `xeval`:
 
@@ -1989,7 +1991,8 @@ is itself a held-out expectation, so `Ĵ` is the mean held-out log-likelihood ra
 against its matched Gaussian. It is invariant under `xeval ↦ a·xeval + b` together with the
 `κ ↦ κ/|a|` rescaling of the fit (both terms shift by `ln|a|` and cancel).
 """
-function negentropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
+function negentropy(d::AbstractDensityEstimate, xeval::AbstractVector)
+    T = eltype(d)
     _, s² = _mean_var(xeval, T)
     return log(2 * T(π) * exp(one(T)) * s²) / 2 - entropy(d, xeval)
 end
