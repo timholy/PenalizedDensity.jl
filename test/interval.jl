@@ -546,15 +546,15 @@ end
 
     @testset "tie check and holdout" begin
         z = round.(randn(Xoshiro(2), 200); digits=1)
-        for f in (select_kappa, select_kappa_cv)
+        for f in (select_kappa, select_kappa_lscv)
             @test_throws ArgumentError f(z)
             @test_throws "lattice of spacing δ ≈ 0.1" f(z)
             @test_throws "resolution=0" f(z)
             @test 0 < f(z; resolution=0) < Inf
         end
         @test_throws "pass `resolution=δ`" select_kappa(z)
-        @test_throws "pass `resolution=δ` to `select_kappa`" select_kappa_cv(z)
-        @test_throws "no form for rounded (interval) data" select_kappa_cv(z; resolution=0.1)
+        @test_throws "pass `resolution=δ` to `select_kappa`" select_kappa_lscv(z)
+        @test_throws "no form for rounded (interval) data" select_kappa_lscv(z; resolution=0.1)
         @test_throws "resolution must be finite and nonnegative" select_kappa(z; resolution=-0.1)
         # Ties off a lattice: the message points to the bounds form.
         zt = [randn(Xoshiro(1), 100); fill(0.123, 5)]

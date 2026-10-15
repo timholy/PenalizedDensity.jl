@@ -1,5 +1,5 @@
 using PenalizedDensity
-using PenalizedDensity: select_kappa_cv, select_kappa_ms
+using PenalizedDensity: select_kappa_lscv, select_kappa_ms, klcv, lscv, action_sensitivity
 using DensityInterface: DensityInterface, DensityKind, HasDensity
 import Distributions, StatsBase
 using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
@@ -340,14 +340,53 @@ end
         end
     end
 
-    @testset "select_kappa_cv: cross-validated (MISE) scale" begin
+    @testset "score functions" begin
+        Random.seed!(12)
+        x = randn(300)
+        # Each selector returns the minimizer of its score.
+        for (sel, score) in ((select_kappa, klcv), (select_kappa_lscv, lscv),
+                             (select_kappa_ms, action_sensitivity))
+            κ = sel(x)
+            s = score(x, κ)
+            @test isfinite(s)
+            @test s <= score(x, 0.9κ) && s <= score(x, 1.1κ)
+        end
+        @test klcv(x, 2.0; support = (-Inf, Inf)) == klcv(x, 2.0)
+        @test isfinite(klcv(x, 2.0; support = (-10.0, 10.0)))
+        @test isfinite(lscv(x, 2.0; support = (-10.0, 10.0)))
+        @test klcv(x, 2.0; holdout = :observation) == klcv(x, 2.0)   # distinct values
+        # Float type of the data.
+        @test klcv(Float32.(x), 2) isa Float32
+        @test lscv(Float32.(x), 2) isa Float32
+        @test action_sensitivity(Float32.(x), 2) isa Float32
+        # Generic axes.
+        xo = OffsetArray(x, -50)
+        @test klcv(xo, 2.0) == klcv(x, 2.0)
+        @test lscv(xo, 2.0) == lscv(x, 2.0)
+        @test action_sensitivity(xo, 2.0) == action_sensitivity(x, 2.0)
+        # Rounded data: the `resolution` form is the interval form on the rounding intervals.
+        xr = round.(x; digits = 1)
+        @test klcv(xr, 3.0; resolution = 0.1) ≈ klcv(xr .- 0.05, xr .+ 0.05, 3.0)
+        @test_throws "repeat another value, as rounded data do" klcv(xr, 3.0)
+        @test isfinite(klcv(xr, 3.0; resolution = 0))
+        @test_throws "lscv has no form for rounded (interval) data" lscv(xr, 3.0; resolution = 0.1)
+        # Validation.
+        for score in (klcv, lscv, action_sensitivity)
+            @test_throws "κ must be finite and positive, got 0.0" score(x, 0.0)
+            @test_throws "κ must be finite and positive, got Inf" score(x, Inf)
+        end
+        @test_throws "κ must be finite and positive, got -1" klcv(xr .- 0.05, xr .+ 0.05, -1)
+        @test_throws "lies outside the support" klcv(x, 2.0; support = (0.0, 1.0))
+    end
+
+    @testset "select_kappa_lscv: cross-validated (MISE) scale" begin
         Random.seed!(11)
         x = randn(1500)
-        κ = select_kappa_cv(x)
+        κ = select_kappa_lscv(x)
         @test κ > 0
         # Golden-section refinement ⇒ independent of the bracketing grid.
-        κ10  = select_kappa_cv(x; kappas = exp.(range(log(0.3), log(40); length = 10)))
-        κ200 = select_kappa_cv(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
+        κ10  = select_kappa_lscv(x; kappas = exp.(range(log(0.3), log(40); length = 10)))
+        κ200 = select_kappa_lscv(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
@@ -414,7 +453,7 @@ end
         @test ise(κ) < ise(select_kappa_ms(x))
 
         # Generic indexing: OffsetArray input gives an identical result.
-        @test select_kappa_cv(OffsetArray(x, -750)) == κ
+        @test select_kappa_lscv(OffsetArray(x, -750)) == κ
     end
 
     @testset "select_kappa: likelihood (KL) scale" begin
@@ -470,7 +509,7 @@ end
         @test kl(κ) < kl(select_kappa_ms(x))
 
         # Tracks the least-squares (MISE) scale to leading order.
-        @test select_kappa(x) ≈ select_kappa_cv(x) rtol = 0.5
+        @test select_kappa(x) ≈ select_kappa_lscv(x) rtol = 0.5
 
         # Generic indexing: OffsetArray input gives an identical result.
         @test select_kappa(OffsetArray(x, -750)) == κ
@@ -1890,12 +1929,12 @@ end
         @test_throws ArgumentError kappa_interval([3.0, 3.0, 3.0])    # all coincident
         @test_throws "need at least two distinct points to select κ" kappa_interval([3.0, 3.0, 3.0])
 
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
-        @test_throws "kappas must be sorted and positive" select_kappa_cv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; kappas=[1.0, 2.0])   # need ≥ 3
-        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_cv([1.0, 2.0]; kappas=[1.0, 2.0])
-        @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
-        @test_throws "need at least two distinct points to select κ" select_kappa_cv([3.0])
+        @test_throws ArgumentError select_kappa_lscv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_kappa_lscv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_lscv([1.0, 2.0]; kappas=[1.0, 2.0])   # need ≥ 3
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_lscv([1.0, 2.0]; kappas=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_lscv([3.0])                        # need ≥ 2 distinct
+        @test_throws "need at least two distinct points to select κ" select_kappa_lscv([3.0])
 
         @test_throws ArgumentError select_kappa([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
         @test_throws "kappas must be sorted and positive" select_kappa([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
@@ -2154,7 +2193,7 @@ end
                 @test PenalizedDensity._lscv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._lscv(xs, w, κ0)
             end
             @test select_kappa(x) == select_kappa(x; support=(-Inf, Inf))
-            @test select_kappa_cv(x) == select_kappa_cv(x; support=(-Inf, Inf))
+            @test select_kappa_lscv(x) == select_kappa_lscv(x; support=(-Inf, Inf))
         end
 
         @testset "_int_quartic: boundary segment vs scale-matched quadrature" begin
@@ -2230,14 +2269,14 @@ end
                                         # unbounded selection, on the bounded fit's own score
         end
 
-        @testset "select_kappa / select_kappa_cv: input validation" begin
+        @testset "select_kappa / select_kappa_lscv: input validation" begin
             @test_throws DomainError select_kappa([0.2, 0.5, 0.8]; support=(0.5, 0.5))
             @test_throws "support must satisfy a < b" select_kappa([0.2, 0.5, 0.8]; support=(0.5, 0.5))
             @test_throws DomainError select_kappa([0.2, 0.5, 1.5]; support=(0.0, 1.0))
             @test_throws "lies outside the support" select_kappa([0.2, 0.5, 1.5]; support=(0.0, 1.0))
-            @test_throws DomainError select_kappa_cv([0.2, 0.5, 0.8]; support=(0.5, 0.5))
-            @test_throws DomainError select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
-            @test_throws "lies outside the support" select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+            @test_throws DomainError select_kappa_lscv([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa_lscv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa_lscv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
         end
 
         @testset "generic indexing: OffsetVector through select_kappa(; support)" begin
