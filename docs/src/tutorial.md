@@ -96,10 +96,10 @@ more than 1% of the observations repeat another value, they throw an `ArgumentEr
 you say what the repeats mean with the `resolution` keyword. For values rounded to a lattice of
 spacing `δ`, `select_kappa_kl(x; resolution = δ)` selects the scale for
 [`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
-rounding interval; `select_kappa_cv` has no interval form. `resolution = 0` declares the
-repeats to be exact points. On heavily tied exact points the cross-validation scores can
-favor over-resolved scales, and the two information-resolving selectors below are the safer
-choice.
+rounding interval; `select_kappa_cv` and [`select_support`](@ref) have no interval form.
+`resolution = 0` declares the repeats to be exact points. On heavily tied exact points the
+cross-validation scores can favor over-resolved scales, and the two information-resolving
+selectors below are the safer choice.
 
 The first information-resolving selector, [`kappa_interval`](@ref), returns a principled
 scale with a plausible range. Its basis is that the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa``
