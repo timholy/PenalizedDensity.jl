@@ -3373,6 +3373,7 @@ of the score. The settings `alphas`, `window`, `nse` and `pilot` are those of `a
 trade capture for speed.
 
 `support`, `rtol` and `resolution` work as for the constant-scale [`select_kappa`](@ref).
+There is no `holdout` keyword: every score, including the pilot's, uses `holdout = :location`.
 `support` is fixed across every candidate `α`/`c`, and both the pilot density and every
 candidate are fitted and cross-validated on it. With `resolution = δ > 0` the scale is selected
 for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, with the pilot an interval fit
