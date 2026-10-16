@@ -325,7 +325,7 @@ Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length
 
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=nothing) where {T}
-    ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights; stats)
+    ψ = _solve_amplitude(_roughness_operator(nodes, κ, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κ, κ, κ, lo, hi)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
@@ -333,13 +333,13 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=n
 end
 
 # Piecewise-constant scale with an optional natural boundary at `lo`/`hi`. The assembled
-# operator carries an arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from
+# operator carries an arbitrary overall factor κ̄ (see `_roughness_operator`), which cancels from
 # the normalized amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity
 # condition of the unscaled operator is Mψ = (1/λ) w ⊘ ψ, whose constant-κ specialization is the
 # scaling law `_fit(nodes, weights, κ, lo, hi)` above uses.
 function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T; stats=nothing) where {T}
     κ̄ = _reference_scale(κs, κL, κR)
-    ψ = _solve_amplitude(roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights; stats)
+    ψ = _solve_amplitude(_roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights; stats)
     Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
     ψ ./= sqrt(Z)
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
@@ -537,9 +537,16 @@ For the gap `hₖ = x[k+1] - x[k]`, the off-diagonal entry is `-csch(κ hₖ)`, 
 entry at each node sums `coth(κ hₖ)` over its adjacent gaps, plus `tanh(κ Δ)` for the
 distance `Δ` from an end node to its wall (`1` for an unbounded side).
 
-`x` must be 1-based, because `M[i, j]` couples `x[i]` and `x[j]`.
+`x` must be 1-based, because `M[i, j]` couples `x[i]` and `x[j]`. The arguments are promoted
+to a common floating-point type; an infinite `lo` or `hi` does not take part in the promotion,
+so `Float32` nodes and scale give a `Float32` operator.
 """
-function roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
+function roughness_operator(x::AbstractVector{<:Real}, κ::Real, lo::Real=-Inf, hi::Real=Inf)
+    T = float(promote_type(eltype(x), typeof(κ), _support_eltype(lo), _support_eltype(hi)))
+    return _roughness_operator(convert(AbstractVector{T}, x)::AbstractVector{T}, T(κ), T(lo), T(hi))
+end
+
+function _roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
     Base.require_one_based_indexing(x)
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
@@ -555,10 +562,6 @@ function roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<
     end
     return SymTridiagonal(d, e)     # M
 end
-
-# `roughness_operator` on the unbounded line.
-roughness_operator(x::AbstractVector{T}, κ::T) where {T<:AbstractFloat} =
-    roughness_operator(x, κ, T(-Inf), T(Inf))
 
 # tanh(u), overflow-free through e^{-2u} (accurate and finite up to u ≈ 1e300, well past where
 # cosh/sinh alone would overflow around u ≈ 710).
@@ -595,7 +598,7 @@ end
 # but it fixes the magnitude the Newton solve sees. Taking κ̄ to be the typical rate keeps the
 # entries O(1), and at a constant κ (where κ̄ = κ) reproduces `roughness_operator(x, κ, lo, hi)`
 # entry for entry.
-function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
+function _roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
     length(κs) == n - 1 ||
@@ -614,17 +617,13 @@ function roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::
     return SymTridiagonal(d, e)
 end
 
-# `roughness_operator` for a piecewise-constant scale on the unbounded line.
-roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T) where {T<:AbstractFloat} =
-    roughness_operator(x, κs, κL, κR, κ̄, T(-Inf), T(Inf))
-
 # M for a bare scale, whichever form it takes, with an optional natural boundary at `lo`/`hi`.
 # A constant κ is its own reference scale, so this reduces to `roughness_operator(x, κ, lo, hi)`
 # entry for entry; a per-interval κ is assembled in units of the geometric-mean rate, as the
 # fit does.
-_operator(x::Vector{T}, κ::T, κL::T, κR::T, lo::T, hi::T) where {T} = roughness_operator(x, κ, lo, hi)
+_operator(x::Vector{T}, κ::T, κL::T, κR::T, lo::T, hi::T) where {T} = _roughness_operator(x, κ, lo, hi)
 _operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T} =
-    roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
+    _roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
 
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
 function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}

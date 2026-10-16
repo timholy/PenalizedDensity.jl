@@ -2165,6 +2165,20 @@ end
               "ConvergenceError in the amplitude solve: Newton did not converge in 1 iterations"
     end
 
+    @testset "roughness_operator promotes its arguments" begin
+        ref = PenalizedDensity.roughness_operator([0.0, 1.0, 2.0], 1.0)
+        @test PenalizedDensity.roughness_operator(Float32[0, 1, 2], 1.0) == ref
+        @test PenalizedDensity.roughness_operator([0, 1, 2], 1) == ref
+        @test PenalizedDensity.roughness_operator(0:2, 1.0) == ref
+        # Infinite walls do not widen the type; a finite wall takes part in the promotion.
+        M32 = PenalizedDensity.roughness_operator(Float32[0, 1, 2], 1.0f0)
+        @test eltype(M32) == Float32 && M32 ≈ ref
+        @test eltype(PenalizedDensity.roughness_operator(Float32[0, 1, 2], 1.0f0, -1.0, Inf)) == Float64
+        @test PenalizedDensity.roughness_operator([0, 1, 2], 1, -1, 3) ==
+              PenalizedDensity.roughness_operator([0.0, 1.0, 2.0], 1.0, -1.0, 3.0)
+        @test_throws ArgumentError PenalizedDensity.roughness_operator(OffsetArray([0.0, 1.0], -1), 1.0)
+    end
+
     @testset "interoperability: DensityInterface, Distributions, StatsBase" begin
         x = [-1.3, -0.2, 0.4, 0.9, 2.1]
         fits = (DensityEstimate(x, 1.0),
