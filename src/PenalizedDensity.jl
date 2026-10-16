@@ -228,7 +228,7 @@ end
 _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
 function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
-    κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
+    _check_kappa(κ)
     T = float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
@@ -304,10 +304,6 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=n
     return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, lo, hi, λ)
 end
 
-# Fit from already-merged distinct nodes and their weights, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κ::T; stats=nothing) where {T} =
-    _fit(nodes, weights, κ, T(-Inf), T(Inf); stats)
-
 # Piecewise-constant scale with an optional natural boundary at `lo`/`hi`. The assembled
 # operator carries an arbitrary overall factor κ̄ (see `roughness_operator`), which cancels from
 # the normalized amplitude and leaves the multiplier λ = κ̄ Z well defined: the stationarity
@@ -321,11 +317,9 @@ function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR:
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
 end
 
-# Piecewise-constant scale, unbounded on both sides.
-_fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T; stats=nothing) where {T} =
-    _fit(nodes, weights, κs, κL, κR, T(-Inf), T(Inf); stats)
-
-# Reject scale values a fit cannot use.
+# Reject scale values a fit cannot use: a scalar κ, or a scale function's value κ(x).
+_check_kappa(κ) =
+    isfinite(κ) && κ > 0 ? κ : throw(ArgumentError("κ must be finite and positive, got $κ"))
 _check_kappa(κ, x) =
     isfinite(κ) && κ > 0 ? κ :
     throw(ArgumentError("the smoothing scale must be finite and positive, got κ($x) = $κ"))
@@ -460,7 +454,7 @@ function merge_samples(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(R))) where 
 end
 
 function _merge_samples(x::AbstractVector{R}, κ::Real, rtol::Real) where {R<:Real}
-    κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
+    _check_kappa(κ)
     T = float(promote_type(R, typeof(κ), typeof(rtol)))
     perm, xs = _sortperm_sample(x, T)
     nodeof = similar(perm)
@@ -606,11 +600,6 @@ _operator(x::Vector{T}, κ::T, κL::T, κR::T, lo::T, hi::T) where {T} = roughne
 _operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T} =
     roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
 
-# `_operator` on the unbounded line.
-_operator(x::Vector{T}, κ::T, κL::T, κR::T) where {T} = _operator(x, κ, κL, κR, T(-Inf), T(Inf))
-_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
-    _operator(x, κs, κL, κR, T(-Inf), T(Inf))
-
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
 function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
     s = zero(T)
@@ -670,7 +659,6 @@ SolveStats() = SolveStats(0, 0, :none, NaN, NaN)
 
 """
     _solve_amplitude(M, w)    -> ψ
-    _solve_amplitude(x, w, κ) -> ψ
 
 Minimize the strictly convex potential `F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ` over `ψ > 0`
 by a damped Newton iteration with an SPD tridiagonal Hessian. The minimizer solves
@@ -789,8 +777,6 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
     end
     return ψ
 end
-_solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:AbstractFloat} =
-    _solve_amplitude(roughness_operator(x, κ), w; kwargs...)
 
 # ∫ ψ² dx for the hyperbolic interpolant with exponential tails, as a tridiagonal quadratic
 # form evaluated at the nodal amplitudes. The scale κ is a scalar or one value per interval,
@@ -808,11 +794,6 @@ function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T)
     end
     return Z
 end
-
-# `_norm_sq` on the unbounded line.
-_norm_sq(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _norm_sq(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
-_norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _norm_sq(x, ψ, κ, κ, κ)
 
 # Z = ∫ψ² and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ, with an optional natural boundary at `lo`/`hi`: the
 # mass and the action of its Gram operator, from one pass over the per-interval
@@ -837,10 +818,6 @@ function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, h
     end
     return Z, Gψ
 end
-
-# `_norm_sq_gram` on the unbounded line.
-_norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _norm_sq_gram(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 
 # (μ, σ²) of the fitted density Q = ψ², i.e. ∫x Q dx / Z and ∫x² Q dx / Z - μ² with Z = ∫Q dx.
 # Interior cell k contributes `_cell_moments` in its local coordinate t = x - x[k] ∈ [0, h], and
@@ -1034,11 +1011,6 @@ function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi
     end
     return Q2
 end
-
-# `_int_quartic` on the unbounded line.
-_int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
-    _int_quartic(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
-_int_quartic(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _int_quartic(x, ψ, κ, κ, κ)
 
 # ∫ψ̂⁴ over a boundary segment of gap Δ: ψ₁⁴(3θ + 2sinh 2θ + sinh(4θ)/4)/(8κ cosh⁴θ) at θ = κΔ,
 # the unbounded tail's ψ₁⁴/(4κ) being its θ → ∞ limit. Rewritten in p = e^{-2θ}, cosh⁴θ =
@@ -2314,10 +2286,6 @@ function _node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T, lo:
     return (û₊ .* Â .+ û₋ .* B̂) ./ (2λ * Ĉ)
 end
 
-# `_node_alpha` on the unbounded line.
-_node_alpha(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, λ::T) where {T} =
-    _node_alpha(x, ψ, κ, κL, κR, λ, T(-Inf), T(Inf))
-
 # ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α, with an optional natural boundary at `lo`/`hi`. On each interval α
 # solves 𝒜α = ψ_cl/(2λ) at constant κ against a hyperbolic source, so it is the interpolant of
 # its own nodal values mₖ plus the resonant particular solution s·cosh(κs) that the source
@@ -2344,10 +2312,6 @@ function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, �
     end
     return acc
 end
-
-# `_int_psi_alpha` on the unbounded line.
-_int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T) where {T} =
-    _int_psi_alpha(x, ψ, m, κ, κL, κR, λ, T(-Inf), T(Inf))
 
 # ∫₀^Δ ψ(s)α(s) ds over a boundary segment (Neumann wall at s=0, node at s=Δ), or the unbounded
 # tail's closed form ψ₁m₁/(2κ) + ψ₁²/(16λκ) as Δ → ∞. On the segment ψ(s) = ψ₁cosh(κs)/cosh(θ)
@@ -2824,10 +2788,6 @@ function _deletion_step(h::T, w::T, c::T) where {T}
     return 2c / (1 + sqrt(max(disc, zero(disc))))
 end
 
-# `_loo_density` on the unbounded line.
-_loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
-    _loo_density(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
-
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ), with an optional
 # natural boundary at `lo`/`hi`: an unbiased estimate, up to the κ-independent ∫Q², of the
 # integrated squared error ∫(Q̂-Q)².
@@ -2840,11 +2800,6 @@ function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
     end
     return _int_quartic(nodes, ψ, κ, κL, κR, lo, hi) - 2 * cross / N
 end
-
-# `_lscv` on the unbounded line.
-_lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
-    _lscv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
-_lscv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _lscv(nodes, w, κ, κ, κ; kwargs...)
 
 # Kullback–Leibler cross-validation score, the mean negative leave-one-out log-likelihood
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
@@ -2859,11 +2814,6 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
     end
     return -s / sum(w)
 end
-
-# `_klcv` on the unbounded line.
-_klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
-    _klcv(nodes, w, κ, κL, κR, T(-Inf), T(Inf); kwargs...)
-_klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes, w, κ, κ, κ; kwargs...)
 
 """
     select_kappa_lscv(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
@@ -3056,10 +3006,7 @@ _score_at(scorefun, xs, r, slo, shi, κ; holdout::Symbol=:location) =
     scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout)
 
 # A scale passed to a score function, converted to the working type `T`.
-function _score_scale(κ::Real, ::Type{T}) where {T}
-    isfinite(κ) && κ > 0 || throw(ArgumentError("κ must be finite and positive, got $κ"))
-    return T(κ)
-end
+_score_scale(κ::Real, ::Type{T}) where {T} = T(_check_kappa(κ))
 
 function _check_kappa_grid(κs)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("kappas must be sorted and positive"))
@@ -3186,21 +3133,8 @@ Base.show(io::IO, k::AdaptiveScale) =
 # the resulting nodes, and cross-validate. A κ profile spanning many orders of magnitude can
 # drive the LDLᵀ factorization of the assembled tridiagonal to an exact zero pivot; that
 # candidate is unresolvable, which is what a non-finite score already means to the searches
-# here, so it reports NaN rather than aborting the whole selection.
-function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T) where {T}
-    nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
-    length(nodes) >= 2 || return T(NaN)
-    try
-        return scorefun(nodes, w, κs, κL, κR)
-    catch e
-        e isa ZeroPivotException && return T(NaN)
-        rethrow()
-    end
-end
-
-# `_score_kappa` with a fixed natural boundary at `lo`/`hi`, threaded to the 7-arg `scorefun`.
-# A distinct arity from the unbounded 4-arg method above (not a same-arity forwarder), so it
-# cannot collide the way a 5-arg `_klcv`/`_lscv` convenience wrapper would.
+# here, so it reports NaN rather than aborting the whole selection. `scorefun` takes the support
+# bounds `lo`/`hi` as its last two arguments; either may be infinite.
 function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T, lo::T, hi::T) where {T}
     nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
     length(nodes) >= 2 || return T(NaN)

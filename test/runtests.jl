@@ -27,6 +27,17 @@ function integrate(f, a, b; n=2_000_001)
     return (sum(ys) - (ys[1] + ys[end]) / 2) * step(xs)
 end
 
+# The private fit and score routines on the unbounded line, with a scalar κ or a per-interval
+# profile and its two tail rates.
+fit_unbounded(n, w, κ::Real) = PenalizedDensity._fit(n, w, κ, -Inf, Inf)
+fit_unbounded(n, w, κs::AbstractVector, κL, κR) = PenalizedDensity._fit(n, w, κs, κL, κR, -Inf, Inf)
+klcv_unbounded(n, w, κ::Real; kw...) = PenalizedDensity._klcv(n, w, κ, κ, κ, -Inf, Inf; kw...)
+klcv_unbounded(n, w, κs, κL, κR; kw...) = PenalizedDensity._klcv(n, w, κs, κL, κR, -Inf, Inf; kw...)
+lscv_unbounded(n, w, κ::Real; kw...) = PenalizedDensity._lscv(n, w, κ, κ, κ, -Inf, Inf; kw...)
+lscv_unbounded(n, w, κs, κL, κR; kw...) = PenalizedDensity._lscv(n, w, κs, κL, κR, -Inf, Inf; kw...)
+# ∫Q̂² of a fit, at its own scale and support.
+int_quartic(d) = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
+
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
 # field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
 # exact reference distribution must reproduce, at a constant or a varying scale alike, on ℝ or
@@ -192,7 +203,8 @@ end
         @test mo.nodes == m.nodes
         @test eltype(merge_samples(Float32[1, 0, 2], 1.0f0).nodes) == Float32
 
-        @test_throws "κ must be positive" merge_samples(x, 0.0)
+        @test_throws "κ must be finite and positive, got 0.0" merge_samples(x, 0.0)
+        @test_throws "κ must be finite and positive, got Inf" merge_samples(x, Inf)
         @test_throws "cannot merge zero points" merge_samples(Float64[], 1.0)
         @test_throws "rtol must be nonnegative" merge_samples(x, 1.0; rtol = -1.0)
         @test_throws "cannot be given as a vector" merge_samples(x, ones(length(x)))
@@ -293,7 +305,7 @@ end
     @testset "analytic dS/dln κ matches finite differences" begin
         Random.seed!(6)
         nodes, w = PenalizedDensity._merge_presorted(sort(randn(1000)), 0.0)
-        Sof(κ) = action(PenalizedDensity._fit(nodes, w, κ))
+        Sof(κ) = action(fit_unbounded(nodes, w, κ))
         for κ in (1.5, 5.0, 15.0)
             S, slope = PenalizedDensity._action_and_slope(nodes, w, κ)
             @test S ≈ Sof(κ)
@@ -404,7 +416,7 @@ end
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
         # near-coincident points (small θ) that defeat a naive csch⁴ form.
         d = DensityEstimate(x, 4.0)
-        ∫Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ)
+        ∫Q2 = int_quartic(d)
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
 
@@ -421,13 +433,13 @@ end
                     keep = [j for j in eachindex(nodes) if j != i]
                     n2 = nodes[keep]; w2 = weights[keep]
                 end
-                cross += weights[i] * PenalizedDensity._fit(collect(n2), collect(w2), κ)(nodes[i])
+                cross += weights[i] * fit_unbounded(collect(n2), collect(w2), κ)(nodes[i])
             end
-            di = PenalizedDensity._fit(copy(nodes), copy(weights), κ)
-            return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
+            di = fit_unbounded(copy(nodes), copy(weights), κ)
+            return int_quartic(di) - 2cross / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._lscv(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-4
+            @test lscv_unbounded(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-4
         end
 
         # The nonlinear step is exercised on the tied branch (wᵢ > 1) too: rounding to
@@ -437,23 +449,23 @@ end
         nt, wt = PenalizedDensity._merge_presorted(sort(round.(x ./ 0.05) .* 0.05), 1e-8)
         @test maximum(wt) > 5
         for κ0 in (1.5, 4.0)
-            @test PenalizedDensity._lscv(nt, wt, κ0; holdout=:observation) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
+            @test lscv_unbounded(nt, wt, κ0; holdout=:observation) ≈ lscv_refit(nt, wt, κ0) rtol = 1e-3
         end
         # The default leaves out every copy at a location; it matches the refit that drops the node.
         function lscv_refit_location(nodes, weights, κ)
             cross = 0.0
             for i in eachindex(nodes)
                 keep = [j for j in eachindex(nodes) if j != i]
-                cross += weights[i] * PenalizedDensity._fit(nodes[keep], weights[keep], κ)(nodes[i])
+                cross += weights[i] * fit_unbounded(nodes[keep], weights[keep], κ)(nodes[i])
             end
-            di = PenalizedDensity._fit(copy(nodes), copy(weights), κ)
-            return PenalizedDensity._int_quartic(di.x, di.ψ, di.κ) - 2cross / sum(weights)
+            di = fit_unbounded(copy(nodes), copy(weights), κ)
+            return int_quartic(di) - 2cross / sum(weights)
         end
         for κ0 in (1.5, 4.0)
-            @test PenalizedDensity._lscv(nt, wt, κ0) ≈ lscv_refit_location(nt, wt, κ0) rtol = 5e-3
+            @test lscv_unbounded(nt, wt, κ0) ≈ lscv_refit_location(nt, wt, κ0) rtol = 5e-3
         end
         # On distinct points the two holdouts are the same score.
-        @test PenalizedDensity._lscv(xs, w, 4.0) == PenalizedDensity._lscv(xs, w, 4.0; holdout=:observation)
+        @test lscv_unbounded(xs, w, 4.0) == lscv_unbounded(xs, w, 4.0; holdout=:observation)
 
         # MISE targeting: on smooth data the cross-validated scale is finer than the
         # minimum-sensitivity scale and gives a smaller integrated squared error.
@@ -488,12 +500,12 @@ end
             s = 0.0
             for i in eachindex(nodes)
                 keep = [j for j in eachindex(nodes) if j != i]
-                s += weights[i] * log(PenalizedDensity._fit(nodes[keep], weights[keep], κ)(nodes[i]))
+                s += weights[i] * log(fit_unbounded(nodes[keep], weights[keep], κ)(nodes[i]))
             end
             return -s / sum(weights)
         end
         for κ0 in (1.5, 4.0, 12.0)
-            @test PenalizedDensity._klcv(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 1e-3
+            @test klcv_unbounded(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 1e-3
         end
 
         # The nonlinear step's payoff is selection on high-leverage data: on a small, skewed
@@ -508,7 +520,7 @@ end
         κ_exact = gridh[argmin([klcv_refit(xh, wh, κ) for κ in gridh])]
         @test select_kappa(xh) ≈ κ_exact rtol = 0.2
         for κ0 in (0.5, 1.0)
-            @test PenalizedDensity._klcv(xh, wh, κ0) ≈ klcv_refit(xh, wh, κ0) rtol = 5e-3
+            @test klcv_unbounded(xh, wh, κ0) ≈ klcv_refit(xh, wh, κ0) rtol = 5e-3
         end
 
         # Divergence targeting: on smooth data the KL scale is finer than the minimum-sensitivity
@@ -944,16 +956,14 @@ end
             for κ0 in (1.5, 4.0, 12.0)
                 cn, cw = PenalizedDensity._merge_presorted(xs, cbrt(eps(Float64)) / κ0)
                 flat = fill(κ0, length(cn) - 1)
-                @test PenalizedDensity._klcv(cn, cw, flat, κ0, κ0) ≈
-                      PenalizedDensity._klcv(cn, cw, κ0) rtol=1e-11
-                @test PenalizedDensity._lscv(cn, cw, flat, κ0, κ0) ≈
-                      PenalizedDensity._lscv(cn, cw, κ0) rtol=1e-11
+                @test klcv_unbounded(cn, cw, flat, κ0, κ0) ≈ klcv_unbounded(cn, cw, κ0) rtol=1e-11
+                @test lscv_unbounded(cn, cw, flat, κ0, κ0) ≈ lscv_unbounded(cn, cw, κ0) rtol=1e-11
             end
 
             # ∫Q̂², the LSCV roughness term, against quadrature over the segments the varying
             # scale defines.
-            a = PenalizedDensity._fit(nodes, w, κs, κL, κR)
-            ∫Q2 = PenalizedDensity._int_quartic(a.x, a.ψ, a.κ, a.κL, a.κR)
+            a = fit_unbounded(nodes, w, κs, κL, κR)
+            ∫Q2 = int_quartic(a)
             num = quadgk(t -> a(t)^2, -Inf, first(a.x); rtol=1e-10)[1] +
                   quadgk(t -> a(t)^2, last(a.x), Inf; rtol=1e-10)[1] +
                   sum(quadgk(t -> a(t)^2, a.x[k], a.x[k+1]; rtol=1e-10)[1] for k in 1:length(a.x)-1)
@@ -967,11 +977,11 @@ end
                 keep = [j for j in eachindex(nodes) if j != i]
                 n2, w2 = nodes[keep], w[keep]
                 κs2, κL2, κR2 = PenalizedDensity._kappa_profile(n2, κfun, Float64)
-                PenalizedDensity._fit(n2, w2, κs2, κL2, κR2)(nodes[i])
+                fit_unbounded(n2, w2, κs2, κL2, κR2)(nodes[i])
             end
-            @test PenalizedDensity._klcv(nodes, w, κs, κL, κR) ≈
+            @test klcv_unbounded(nodes, w, κs, κL, κR) ≈
                   -sum(w .* log.(loo)) / W rtol=2e-2
-            @test PenalizedDensity._lscv(nodes, w, κs, κL, κR) ≈
+            @test lscv_unbounded(nodes, w, κs, κL, κR) ≈
                   ∫Q2 - 2 * sum(w .* loo) / W rtol=5e-3
         end
 
@@ -1017,8 +1027,8 @@ end
         # χ²₁: a divergent edge at 0, the regularity limit a constant scale cannot resolve.
         chisq1 = sort!(randn(Xoshiro(19), 3000).^2)
         rtol = cbrt(eps(Float64))
-        klcv_const(x, κ) = PenalizedDensity._klcv(PenalizedDensity._merge_presorted(x, rtol / κ)..., κ)
-        klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol)
+        klcv_const(x, κ) = klcv_unbounded(PenalizedDensity._merge_presorted(x, rtol / κ)..., κ)
+        klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol, -Inf, Inf)
 
         @testset "AdaptiveScale evaluates c·(p̂/ḡ)^α" begin
             κ0 = select_kappa(chisq1)
@@ -1204,12 +1214,12 @@ end
             # A κ profile spanning many orders of magnitude can drive the factorization to an
             # exact zero pivot. That candidate is unresolvable, not a failure of the search.
             zero_pivot(args...) = throw(ZeroPivotException(3))
-            @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol))
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol, -Inf, Inf))
             # Any other failure is a bug and must not be swallowed.
             other(args...) = throw(DomainError(1.0, "something else went wrong"))
-            @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol)
+            @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol, -Inf, Inf)
             # Too few nodes to fit: scored NaN before the scorefun is ever reached.
-            @test isnan(PenalizedDensity._score_kappa(zero_pivot, [1.0], _ -> 5.0, rtol))
+            @test isnan(PenalizedDensity._score_kappa(zero_pivot, [1.0], _ -> 5.0, rtol, -Inf, Inf))
         end
 
         @testset "input validation" begin
@@ -1227,8 +1237,8 @@ end
     @testset "adaptive κ: the window rule" begin
         PD = PenalizedDensity
         rtol = cbrt(eps(Float64))
-        klcv_scale(x, k) = PD._score_kappa(PD._klcv, x, k, rtol)
-        klcv_const(x, κ) = PD._klcv(PD._merge_presorted(x, rtol / κ)..., κ)
+        klcv_scale(x, k) = PD._score_kappa(PD._klcv, x, k, rtol, -Inf, Inf)
+        klcv_const(x, κ) = klcv_unbounded(PD._merge_presorted(x, rtol / κ)..., κ)
 
         @testset "window statistics match their definition" begin
             y = sort!(randn(Xoshiro(1), 500))
@@ -1553,9 +1563,9 @@ end
             ψy = amplitude(ds, y)
             αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
             mfd = [αfd[searchsortedfirst(y, xi)] for xi in x]
-            mex = PenalizedDensity._node_alpha(x, ψ, ds.κ, ds.κL, ds.κR, λ)
+            mex = PenalizedDensity._node_alpha(x, ψ, ds.κ, ds.κL, ds.κR, λ, ds.lo, ds.hi)
             (maximum(abs.(mex .- mfd) ./ abs.(mfd)),
-             abs(PenalizedDensity._int_psi_alpha(x, ψ, mex, ds.κ, ds.κL, ds.κR, λ) -
+             abs(PenalizedDensity._int_psi_alpha(x, ψ, mex, ds.κ, ds.κL, ds.κR, λ, ds.lo, ds.hi) -
                  sum(mass .* ψy .* αfd)) / sum(mass .* ψy .* αfd))
         end
         @test all(<(2e-4), errs[1]) && all(<(2e-5), errs[2])   # and 16× finer ⇒ 16× closer
@@ -1783,14 +1793,14 @@ end
         # finite differences that refit at perturbed node positions. Fits are built through
         # _fit on distinct nodes (no merging) so the perturbation stays within one cell.
         function L_of_nodes(xn, w, κ, ye, c)
-            dd = PenalizedDensity._fit(collect(float.(xn)), collect(float.(w)), float(κ))
+            dd = fit_unbounded(collect(float.(xn)), collect(float.(w)), float(κ))
             sum(cj * log(dd(y)) for (y, cj) in zip(ye, c))
         end
         Random.seed!(23)
         for κ in (0.3, 1.5, 8.0, 40.0)
             xn = sort(randn(7)) .* 1.3
             w = ones(7)
-            d = PenalizedDensity._fit(copy(xn), copy(w), Float64(κ))
+            d = fit_unbounded(copy(xn), copy(w), Float64(κ))
             # evaluation points span both tails and the interior, none at a node
             ye = Float64[minimum(xn) - 0.7, minimum(xn) - 0.1, -0.33, 0.07, 0.44, 0.9,
                          maximum(xn) + 0.15, maximum(xn) + 0.8]
@@ -1807,7 +1817,7 @@ end
 
         # Near-coincident node pair (θ ≈ 0.05) exercises the small-θ hyperbolic forms.
         xn = [-1.0, -0.02, 0.03, 1.0, 2.0]; w = ones(5); κ = 1.0
-        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        d = fit_unbounded(copy(xn), copy(w), κ)
         ye = Float64[-1.7, -0.4, 0.5, 1.4, 2.6]; c = fill(0.2, 5)
         an = logdensity_node_gradient(d, ye, c)
         h = 1e-7
@@ -1820,7 +1830,7 @@ end
 
         # Weighted multiplicities (w > 1) are handled like distinct points.
         xn = sort(randn(5)); w = [1.0, 3.0, 1.0, 2.0, 1.0]; κ = 1.2
-        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        d = fit_unbounded(copy(xn), copy(w), κ)
         ye = Float64[xn[1] - 0.5, -0.2, 0.3, xn[end] + 0.4]; c = [0.7, 1.1, 0.9, 1.3]
         an = logdensity_node_gradient(d, ye, c)
         h = 1e-6
@@ -1832,7 +1842,7 @@ end
         @test an ≈ fd rtol = 1e-4
 
         # Default weights are all ones (the plain sum of log densities).
-        d = PenalizedDensity._fit(sort(randn(6)), ones(6), 1.0)
+        d = fit_unbounded(sort(randn(6)), ones(6), 1.0)
         ye = [-0.5, 0.2, 0.8]
         @test logdensity_node_gradient(d, ye) ≈ logdensity_node_gradient(d, ye, ones(3))
 
@@ -1841,21 +1851,21 @@ end
         # -logdensity_node_gradient with uniform 1/M weights.
         Random.seed!(11)
         xn = sort(randn(6)); w = ones(6); κ = 1.7
-        d = PenalizedDensity._fit(copy(xn), copy(w), κ)
+        d = fit_unbounded(copy(xn), copy(w), κ)
         ye = Float64[-1.4, -0.3, 0.25, 0.9, 2.1]; M = length(ye)
         an = .-logdensity_node_gradient(d, ye, fill(1 / M, M))
         h = 1e-6
         fd = map(eachindex(xn)) do i
             xp = copy(xn); xp[i] += h
             xm = copy(xn); xm[i] -= h
-            (entropy(PenalizedDensity._fit(xp, copy(w), κ), ye) -
-             entropy(PenalizedDensity._fit(xm, copy(w), κ), ye)) / (2h)
+            (entropy(fit_unbounded(xp, copy(w), κ), ye) -
+             entropy(fit_unbounded(xm, copy(w), κ), ye)) / (2h)
         end
         @test an ≈ fd rtol = 1e-4
 
         # One adjoint solve regardless of batch size: allocations depend on the node count N,
         # not the evaluation count M.
-        xn = sort(randn(500)); w = ones(500); d = PenalizedDensity._fit(copy(xn), copy(w), 2.0)
+        xn = sort(randn(500)); w = ones(500); d = fit_unbounded(copy(xn), copy(w), 2.0)
         span(nb) = collect(range(minimum(xn) - 1, maximum(xn) + 1; length = nb))
         ye_small, ye_big = span(200), span(4000)
         c_small, c_big = fill(1 / 200, 200), fill(1 / 4000, 4000)
@@ -1958,9 +1968,11 @@ end
         @test_throws ArgumentError DensityEstimate(Float64[], 1.0)
         @test_throws "cannot fit a density to zero points" DensityEstimate(Float64[], 1.0)
         @test_throws ArgumentError DensityEstimate([1.0], 0.0)
-        @test_throws "κ must be positive" DensityEstimate([1.0], 0.0)
+        @test_throws "κ must be finite and positive, got 0.0" DensityEstimate([1.0], 0.0)
         @test_throws ArgumentError DensityEstimate([1.0], -1.0)
-        @test_throws "κ must be positive" DensityEstimate([1.0], -1.0)
+        @test_throws "κ must be finite and positive, got -1.0" DensityEstimate([1.0], -1.0)
+        @test_throws "κ must be finite and positive, got Inf" DensityEstimate([1.0, 2.0], Inf)
+        @test_throws "κ must be finite and positive, got NaN" DensityEstimate([1.0, 2.0], NaN)
         @test_throws ArgumentError DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws "rtol must be nonnegative" DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
@@ -2173,12 +2185,12 @@ end
         @test minimum(diff(d.x)) * d.κ < 1e-6
         x, ψ, κ = d.x, d.ψ, d.κ
         X, Ψ, K = big.(x), big.(ψ), big(κ)
-        Zb = PenalizedDensity._norm_sq(X, Ψ, K)
-        @test PenalizedDensity._norm_sq(x, ψ, κ) ≈ Zb rtol = 4eps()
-        @test PenalizedDensity._norm_sq_gram(x, ψ, κ, κ, κ)[1] ≈ Zb rtol = 4eps()
+        Zb = PenalizedDensity._norm_sq(X, Ψ, K, K, K, big(-Inf), big(Inf))
+        @test PenalizedDensity._norm_sq(x, ψ, κ, κ, κ, -Inf, Inf) ≈ Zb rtol = 4eps()
+        @test PenalizedDensity._norm_sq_gram(x, ψ, κ, κ, κ, -Inf, Inf)[1] ≈ Zb rtol = 4eps()
         @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[1] ≈ Zb rtol = 4eps()
         @test last(PenalizedDensity._node_cdf(d)) ≈ Zb rtol = 4eps()
-        @test PenalizedDensity._int_quartic(x, ψ, κ) ≈ PenalizedDensity._int_quartic(X, Ψ, K) rtol = 4eps()
+        @test int_quartic(d) ≈ PenalizedDensity._int_quartic(X, Ψ, K, K, K, big(-Inf), big(Inf)) rtol = 4eps()
         # κ-derivatives of the mass and of the roughness operator, on the same amplitudes.
         @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[2] ≈ PenalizedDensity._norm_sq_grad(X, Ψ, K)[2] rtol = 4eps()
         r, rb = PenalizedDensity._dM_dκ_mul(x, κ, ψ), PenalizedDensity._dM_dκ_mul(X, K, Ψ)
@@ -2279,11 +2291,6 @@ end
         @testset "unbounded regression" begin
             Random.seed!(51)
             x = randn(800)
-            xs = sort(x); w = ones(length(xs))
-            for κ0 in (1.2, 5.0, 15.0)
-                @test PenalizedDensity._klcv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._klcv(xs, w, κ0)
-                @test PenalizedDensity._lscv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._lscv(xs, w, κ0)
-            end
             @test select_kappa(x) == select_kappa(x; support=(-Inf, Inf))
             @test select_kappa_lscv(x) == select_kappa_lscv(x; support=(-Inf, Inf))
         end
