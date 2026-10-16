@@ -908,6 +908,37 @@ end
         @test ao(0.7) ≈ a(0.7)
     end
 
+    @testset "broadcasting treats a fit as a scalar" begin
+        x = [-1.5, 0.2, 0.2, 1.1, 3.4]
+        fits = (DensityEstimate(x, 1.1),
+                DensityEstimate(x, 1.1; support=(-2.0, 4.0)),
+                IntervalDensityEstimate(x .- 0.1, x .+ 0.1, 1.1))
+        xs = OffsetArray([-2.5, -0.5, 0.2, 0.9, 5.0], -3)
+        qs = OffsetArray([0.05, 0.3, 0.5, 0.95], 2)
+        ys = OffsetArray([-1.5, 0.0, 0.7], -1)
+        for d in fits
+            for f in (amplitude, logdensity, cdf, gaussianize, logdensity_eval_gradient)
+                b = f.(d, xs)
+                @test axes(b) == axes(xs)
+                @test isapprox(b, f(d, xs); nans=true)   # gradient is NaN past a wall
+            end
+            @test d.(xs) ≈ map(d, xs)
+            @test quantile.(d, qs) ≈ quantile(d, qs)
+            @test axes(quantile.(d, qs)) == axes(qs)
+            @test ungaussianize.(d, ys) ≈ ungaussianize(d, ys)
+            yl = gaussianize_logjacobian(d, xs)
+            bl = gaussianize_logjacobian.(d, xs)
+            @test axes(bl) == axes(xs)
+            @test first.(bl) ≈ yl.y
+            @test last.(bl) ≈ yl.logjac
+        end
+        ref = chisq_reference(DensityEstimate(randn(MersenneTwister(1), 40), 1.0))
+        zs = [0.5, 2.0, 8.0]
+        @test pvalue.(ref, zs) == [pvalue(ref, z) for z in zs]
+        @test chisq_ccdf.(ref, zs) == [chisq_ccdf(ref, z) for z in zs]
+        @test chisq_pdf.(ref, zs) == [chisq_pdf(ref, z) for z in zs]
+    end
+
     @testset "adaptive κ: a callable scale" begin
         x = sort!(randn(Xoshiro(7), 2000) .* 1.5)
 
