@@ -626,6 +626,12 @@ end
         @test @inferred(quantile(d32, 0.5f0)) isa Float32
         @test cdf(d32, 0.5f0) ≈ cdf(d64, 0.5) atol = 1e-5
         @test quantile(d32, 0.25f0) ≈ quantile(d64, 0.25) atol = 1e-4
+        # A Float64 argument is evaluated in the fit's type.
+        @test @inferred(cdf(d32, 0.5)) isa Float32
+        @test @inferred(quantile(d32, 0.25)) isa Float32
+        @test @inferred(gaussianize(d32, 0.5)) isa Float32
+        @test @inferred(ungaussianize(d32, 0.5)) isa Float32
+        @test @inferred(gaussianize_logjacobian(d32, 0.5)) isa NamedTuple{(:y, :logjac),Tuple{Float32,Float32}}
 
         # Generic indexing: array methods preserve the argument's axes.
         xo = OffsetArray([-0.5, 0.0, 0.5], -2)

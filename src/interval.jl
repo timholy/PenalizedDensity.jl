@@ -1599,39 +1599,6 @@ function _cell_mass(d::IntervalDensityEstimate{T}, c::Int) where {T}
     return n11 * (d.ψ[c]^2 + d.ψ[c+1]^2) + 2n12 * d.ψ[c] * d.ψ[c+1]
 end
 
-_left_end_mass(d::IntervalDensityEstimate) = _tail_mass(d.ψ[1], d.kL, d.x[1] - d.lo)
-_right_end_mass(d::IntervalDensityEstimate) = _tail_mass(d.ψ[end], d.kR, d.hi - d.x[end])
-
-# Node cumulatives F[i] = ∫_{lo}^{xᵢ} ψ² and the total mass.
-function _node_cdf(d::IntervalDensityEstimate{T}) where {T}
-    m = length(d.x)
-    F = Vector{T}(undef, m)
-    F[1] = _left_end_mass(d)
-    for c in 1:m-1
-        F[c+1] = F[c] + _cell_mass(d, c)
-    end
-    return F, F[m] + _right_end_mass(d)
-end
-
-# Node cumulatives from both ends, F[i] = ∫_{lo}^{xᵢ} ψ² and G[i] = ∫_{xᵢ}^{hi} ψ², and the
-# total mass. Each is accumulated from its own end, so both keep full relative precision; F and
-# the total equal those of `_node_cdf`.
-function _node_cumulatives(d::IntervalDensityEstimate{T}) where {T}
-    m = length(d.x)
-    mc = T[_cell_mass(d, c) for c in 1:m-1]
-    F = Vector{T}(undef, m)
-    F[1] = _left_end_mass(d)
-    for c in 1:m-1
-        F[c+1] = F[c] + mc[c]
-    end
-    G = Vector{T}(undef, m)
-    G[m] = _right_end_mass(d)
-    for c in m-1:-1:1
-        G[c] = G[c+1] + mc[c]
-    end
-    return F, G, F[m] + G[m]
-end
-
 # ∫ψ² over [x_c, x] (fromleft) or [x, x_{c+1}] on interior cell c, meant for the half of the cell
 # nearer the node integrated from. Hyperbolic cells use the exact antiderivative; trigonometric
 # ones Gauss–Legendre quadrature, which is exact to roundoff because ψ² there is a
@@ -1659,55 +1626,14 @@ _gauss16(::Type{T}) where {T} = gauss(T, 16)
 const _GAUSS16_F64 = gauss(Float64, 16)
 _gauss16(::Type{Float64}) = _GAUSS16_F64
 
-# Unnormalized cumulative mass ∫_{lo}^{x} ψ², integrated from the nearer end of its cell.
-function _cdf_mass(d::IntervalDensityEstimate{T}, F::Vector{T}, x::Real) where {T}
-    xs, ψ = d.x, d.ψ
-    m = length(xs)
-    _check_not_nan(x)
-    xT = T(x)
-    if xT <= xs[1]
-        isfinite(d.lo) || return ψ[1]^2 / (2d.kL) * exp(2d.kL * (xT - xs[1]))
-        xT <= d.lo && return zero(T)
-        v, u = d.kL * (xT - d.lo), d.kL * (xs[1] - d.lo)
-        return v <= u / 2 ? _boundary_mass_from_wall(ψ[1], d.kL, v, u) :
-                            F[1] - _boundary_mass_from_node(ψ[1], d.kL, v, u)
-    elseif xT >= xs[m]
-        isfinite(d.hi) || return F[m] + ψ[m]^2 / (2d.kR) * (-expm1(-2d.kR * (xT - xs[m])))
-        xT >= d.hi && return F[m] + _right_end_mass(d)
-        vp, u = d.kR * (d.hi - xT), d.kR * (d.hi - xs[m])
-        return vp >= u / 2 ? F[m] + _boundary_mass_from_node(ψ[m], d.kR, vp, u) :
-                             F[m] + _right_end_mass(d) - _boundary_mass_from_wall(ψ[m], d.kR, vp, u)
-    end
-    c = searchsortedlast(xs, xT)
-    return xT - xs[c] <= xs[c+1] - xT ? F[c] + _cell_partial_mass(d, c, xT, true) :
-                                        F[c+1] - _cell_partial_mass(d, c, xT, false)
-end
-
-# Unnormalized mass above x, ∫_x^{hi} ψ², integrated from the nearer end of its cell. It is
-# formed from G rather than as `total - _cdf_mass`, which would cancel where the mass above x
-# is small.
-function _ccdf_mass(d::IntervalDensityEstimate{T}, G::Vector{T}, x::Real) where {T}
-    xs, ψ = d.x, d.ψ
-    m = length(xs)
-    _check_not_nan(x)
-    xT = T(x)
-    if xT >= xs[m]
-        isfinite(d.hi) || return ψ[m]^2 / (2d.kR) * exp(-2d.kR * (xT - xs[m]))
-        xT >= d.hi && return zero(T)
-        vp, u = d.kR * (d.hi - xT), d.kR * (d.hi - xs[m])
-        return vp <= u / 2 ? _boundary_mass_from_wall(ψ[m], d.kR, vp, u) :
-                             G[m] - _boundary_mass_from_node(ψ[m], d.kR, vp, u)
-    elseif xT <= xs[1]
-        isfinite(d.lo) || return G[1] + ψ[1]^2 / (2d.kL) * (-expm1(2d.kL * (xT - xs[1])))
-        xT <= d.lo && return G[1] + _left_end_mass(d)
-        v, u = d.kL * (xT - d.lo), d.kL * (xs[1] - d.lo)
-        return v >= u / 2 ? G[1] + _boundary_mass_from_node(ψ[1], d.kL, v, u) :
-                            G[1] + _left_end_mass(d) - _boundary_mass_from_wall(ψ[1], d.kL, v, u)
-    end
-    c = searchsortedlast(xs, xT)
-    return xs[c+1] - xT <= xT - xs[c] ? G[c+1] + _cell_partial_mass(d, c, xT, false) :
-                                        G[c] - _cell_partial_mass(d, c, xT, true)
-end
+# Unnormalized mass below (`_cdf_mass_interior`) or above (`_ccdf_mass_interior`) x in interior
+# cell c, integrated from the nearer node so that its absolute error vanishes toward both nodes.
+_cdf_mass_interior(d::IntervalDensityEstimate{T}, F::Vector{T}, c::Int, x::T) where {T} =
+    x - d.x[c] <= d.x[c+1] - x ? F[c] + _cell_partial_mass(d, c, x, true) :
+                                 F[c+1] - _cell_partial_mass(d, c, x, false)
+_ccdf_mass_interior(d::IntervalDensityEstimate{T}, G::Vector{T}, c::Int, x::T) where {T} =
+    d.x[c+1] - x <= x - d.x[c] ? G[c+1] + _cell_partial_mass(d, c, x, false) :
+                                 G[c] - _cell_partial_mass(d, c, x, true)
 
 """
     cdf(d::IntervalDensityEstimate, x)
@@ -1715,14 +1641,7 @@ end
 Cumulative distribution function of the fitted density at a scalar or array `x`; exactly `0`
 and `1` at the support endpoints.
 """
-function cdf(d::IntervalDensityEstimate, x::Real)
-    F, total = _node_cdf(d)
-    return _cdf_mass(d, F, x) / total
-end
-function cdf(d::IntervalDensityEstimate, x::AbstractArray)
-    F, total = _node_cdf(d)
-    return map(xi -> _cdf_mass(d, F, xi) / total, x)
-end
+cdf(d::IntervalDensityEstimate, x)
 
 """
     quantile(d::IntervalDensityEstimate, q)
@@ -1730,47 +1649,7 @@ end
 Quantile function of the fitted density, the inverse of [`cdf`](@ref), for `q ∈ [0, 1]`
 (scalar or array); `q` outside `[0, 1]` throws a `DomainError`.
 """
-function Statistics.quantile(d::IntervalDensityEstimate, q::Real)
-    F, total = _node_cdf(d)
-    return _quantile(d, F, total, q)
-end
-function Statistics.quantile(d::IntervalDensityEstimate, q::AbstractArray)
-    F, total = _node_cdf(d)
-    return map(qi -> _quantile(d, F, total, qi), q)
-end
-
-# Safeguarded Newton for massfun(y) == target on [lo, hi], massfun increasing with slope d(y).
-function _invert_mass(d::IntervalDensityEstimate{T}, massfun, lo::T, hi::T, y::T, target::T) where {T}
-    for _ in 1:200
-        r = massfun(y) - target
-        r == 0 && return y
-        r < 0 ? (lo = y) : (hi = y)
-        ynew = y - r / _amplitude(d, y)^2
-        lo < ynew < hi || (ynew = (lo + hi) / 2)
-        ynew == y && return y
-        y = ynew
-    end
-    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
-end
-
-function _quantile(d::IntervalDensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
-    0 <= q <= 1 || throw(DomainError(q, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
-    xs, ψ = d.x, d.ψ
-    m = length(xs)
-    target = T(q) * total
-    if target <= F[1]
-        isfinite(d.lo) || return _left_tail_quantile(ψ[1], d.kL, xs[1], target)
-        y = F[1] > 0 ? d.lo + (target / F[1]) * (xs[1] - d.lo) : d.lo
-        return _invert_mass(d, t -> _cdf_mass(d, F, t), d.lo, xs[1], y, target)
-    elseif target >= F[m]
-        isfinite(d.hi) || return _right_tail_quantile(ψ[m], d.kR, xs[m], total, q)
-        y = total > F[m] ? xs[m] + (target - F[m]) / (total - F[m]) * (d.hi - xs[m]) : d.hi
-        return _invert_mass(d, t -> _cdf_mass(d, F, t), xs[m], d.hi, y, target)
-    end
-    c = searchsortedlast(F, target)
-    y = xs[c] + (target - F[c]) / (F[c+1] - F[c]) * (xs[c+1] - xs[c])
-    return _invert_mass(d, t -> _cdf_mass(d, F, t), xs[c], xs[c+1], y, target)
-end
+Statistics.quantile(d::IntervalDensityEstimate, q)
 
 # ---------------------------------------------------------------------------------------------
 # Entropy and action
