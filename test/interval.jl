@@ -163,6 +163,8 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test action(di) ≈ action(d) rtol = 1e-10
             @test entropy(di, xe) ≈ entropy(d, xe) rtol = 1e-10
             @test negentropy(di, xe) ≈ negentropy(d, xe) rtol = 1e-8
+            tin = filter(t -> support[1] <= t <= support[2], ts)
+            @test logdensity_eval_gradient(di, tin) ≈ logdensity_eval_gradient(d, tin) rtol = 1e-10
         end
     end
 
@@ -334,6 +336,39 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test @inferred(action(d32)) ≈ action(fits.rounded[1]) rtol = 1e-4
     end
 
+    @testset "evaluation-point log-density gradient" begin
+        x = randn(Xoshiro(7), 200)
+        xr = round.(x; digits=1)
+        a, b = extrema(x)
+        fits = (rounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1),
+                censored = IntervalDensityEstimate([x[1:150]; fill(1.0, 50)], [x[1:150]; fill(Inf, 50)], 2.0),
+                leftcens = IntervalDensityEstimate([fill(-Inf, 30); x[31:200]], [fill(-1.0, 30); x[31:200]], 2.0),
+                bounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1, support=(a - 0.3, b + 0.5)),
+                varying  = IntervalDensityEstimate(xr, t -> 1 + abs(t - 3) / 2; resolution=0.1),
+                wide     = IntervalDensityEstimate([-1.0, 0.0, 0.5, 2.0], [-1.0, 0.0, 0.5, 60.0], 1.5))
+        @test any(<(0), fits.rounded.k2)
+        h = 1e-6
+        for (name, d) in pairs(fits)
+            lo, hi = max(d.lo, d.x[1] - 3), min(d.hi, d.x[end] + 3)
+            for y in range(lo + 1e-3, hi - 1e-3; length=401)
+                minimum(abs.(y .- d.x)) < 1e-3 && continue
+                fd = (logdensity(d, y + h) - logdensity(d, y - h)) / (2h)
+                @test logdensity_eval_gradient(d, y) ≈ fd rtol = 1e-6 atol = 1e-6
+            end
+        end
+        # Deep in an unbounded tail ψ underflows, and the slope is exactly ±2k.
+        d = fits.censored
+        @test logdensity_eval_gradient(d, d.x[1] - 1000) == 2 * d.kL
+        @test logdensity_eval_gradient(d, d.x[end] + 1000) == -2 * d.kR
+        # At a finite wall the Neumann condition makes the slope zero; beyond it ln Q̂ ≡ -Inf.
+        d = fits.bounded
+        @test logdensity_eval_gradient(d, d.lo) == 0
+        @test logdensity_eval_gradient(d, d.hi) == 0
+        @test isnan(logdensity_eval_gradient(d, d.hi + 1))
+        d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
+        @test @inferred(logdensity_eval_gradient(d32, 0.25f0)) isa Float32
+    end
+
     @testset "lattice data (resolution)" begin
         x = round.(randn(Xoshiro(1), 1000); digits=1)
         d = IntervalDensityEstimate(x, 3.0; resolution=0.1)
@@ -384,6 +419,7 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test axes(cdf(d, q)) == axes(q)
         @test axes(quantile(d, q)) == axes(q)
         @test axes(logdensity(d, q)) == axes(q)
+        @test axes(logdensity_eval_gradient(d, q)) == axes(q)
         @test_throws DimensionMismatch IntervalDensityEstimate([0.0, 1.0], [1.0], 1.0)
     end
 

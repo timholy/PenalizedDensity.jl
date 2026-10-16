@@ -1708,6 +1708,9 @@ end
             # In the tails ψ ∝ e^{∓κ|·|}, so the slope is exactly ±2κ.
             @test logdensity_eval_gradient(d, nodes[1] - 3.0) ≈ 2κ
             @test logdensity_eval_gradient(d, nodes[end] + 3.0) ≈ -2κ
+            # Far enough out ψ underflows to zero, and the slope is still exactly ±2κ.
+            @test logdensity_eval_gradient(d, nodes[1] - 1000.0) == 2κ
+            @test logdensity_eval_gradient(d, nodes[end] + 1000.0) == -2κ
             # The array method maps the scalar one and keeps the argument's axes.
             ys = [-2.0, 0.0, 0.7, 3.5]
             @test logdensity_eval_gradient(d, ys) == [logdensity_eval_gradient(d, y) for y in ys]
@@ -1715,6 +1718,19 @@ end
             @test axes(logdensity_eval_gradient(d, yo)) == axes(yo)
             @test parent(logdensity_eval_gradient(d, yo)) == logdensity_eval_gradient(d, ys)
         end
+        # ψ underflows in the middle of a wide interval; with equal node amplitudes the slope
+        # at signed distance t from the midpoint is 2κ tanh(κt).
+        d = DensityEstimate([0.0, 2000.0], 1.0)
+        @test iszero(d(999.0))
+        @test logdensity_eval_gradient(d, 1000.0) == 0
+        @test logdensity_eval_gradient(d, 999.0) ≈ -2 * tanh(1.0)
+        @test logdensity_eval_gradient(d, 1001.0) ≈ 2 * tanh(1.0)
+        # At a finite wall the Neumann condition makes the slope zero; beyond it ln Q̂ ≡ -Inf.
+        d = DensityEstimate([0.2, 0.5, 0.6], 2.0; support=(0, 1))
+        @test logdensity_eval_gradient(d, 0.0) == 0
+        @test logdensity_eval_gradient(d, 1.0) == 0
+        @test logdensity_eval_gradient(d, 0.1) ≈ 2 * 2 * tanh(2 * 0.1)
+        @test isnan(logdensity_eval_gradient(d, 1.5))
     end
 
     @testset "node-position log-density gradient" begin
