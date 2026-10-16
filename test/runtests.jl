@@ -975,7 +975,7 @@ end
             @test first.(bl) ≈ yl.y
             @test last.(bl) ≈ yl.logjac
         end
-        ref = chisq_reference(DensityEstimate(randn(MersenneTwister(1), 40), 1.0))
+        ref = ChisqReference(DensityEstimate(randn(MersenneTwister(1), 40), 1.0))
         zs = [0.5, 2.0, 8.0]
         @test pvalue.(ref, zs) == [pvalue(ref, z) for z in zs]
         @test chisq_ccdf.(ref, zs) == [chisq_ccdf(ref, z) for z in zs]
@@ -1081,9 +1081,9 @@ end
         @testset "both χ² methods are defined at a varying scale" begin
             a = DensityEstimate(x, t -> 2.0 * exp(-t))
             @test chisq(a, a) == 0            # the statistic itself is scale-free
-            r = chisq_reference(a)
+            r = ChisqReference(a)
             @test r isa ChisqReference
-            @test expected_chisq(r) == r.mean > 0
+            @test mean(r) == r.mean > 0
             # :largeN is the Wald shape at the exact mean, so it too works at any scale.
             @test 0 ≤ chisq_ccdf(r, 1.0; method=:largeN) ≤ 1
             @test chisq_pdf(r, 1.0; method=:largeN) ≥ 0
@@ -1166,7 +1166,7 @@ end
             κu = select_kappa(u, Adaptive(; window=nothing))
             @test κu isa Real
             @test DensityEstimate(u, κu).κ isa Real
-            @test chisq_reference(DensityEstimate(u, κu)) isa ChisqReference
+            @test ChisqReference(DensityEstimate(u, κu)) isa ChisqReference
         end
 
         @testset "alphas and pilot are honored" begin
@@ -1493,8 +1493,8 @@ end
     @testset "goodness of fit: large-N (Eq. 26) reference" begin
         d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
         # :largeN is the Wald inverse-Gaussian(mean μ, shape μ²) at the exact mean μ = tr A.
-        r = chisq_reference(d)
-        μ = expected_chisq(r)
+        r = ChisqReference(d)
+        μ = mean(r)
         @test μ > 0
         # method=:largeN is the inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
@@ -1517,8 +1517,8 @@ end
 
     @testset "goodness of fit: exact reference distribution" begin
         # A single point: χ² is exactly a scaled χ²₁ (one generalized-χ² weight = the mean).
-        d1 = DensityEstimate([0.7], 1.5); r1 = chisq_reference(d1)
-        e1 = expected_chisq(r1)
+        d1 = DensityEstimate([0.7], 1.5); r1 = ChisqReference(d1)
+        e1 = mean(r1)
         @test chisq_ccdf(r1, e1) ≈ 0.3173105 rtol = 1e-3       # P(Z² ≥ 1)
         @test chisq_ccdf(r1, 4 * e1) ≈ 0.0455003 rtol = 1e-3   # P(Z² ≥ 4)
         @test chisq_ccdf(r1, 0.0) ≈ 1 atol = 1e-6
@@ -1526,20 +1526,20 @@ end
         # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
         Random.seed!(1)
         x = randn(150); d = DensityEstimate(x, select_kappa_ms(x))
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=7)
-        @test expected_chisq(r) ≈ mean(chis) rtol = 0.02
+        @test mean(r) ≈ mean(chis) rtol = 0.02
         for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end
         # The Wald shape at the exact mean tracks the exact tail closely.
         for frac in (0.8, 1.2, 1.6)
-            z = frac * expected_chisq(r)
+            z = frac * mean(r)
             @test chisq_ccdf(r, z; method=:largeN) ≈ chisq_ccdf(r, z) rtol = 0.1
         end
 
         # ccdf ∈ [0,1] and monotone; pdf ≥ 0, integrates to ~1, and is −d(ccdf)/dz.
-        μ = expected_chisq(r)
+        μ = mean(r)
         grid = range(0.05μ, 4μ; length=60)
         c = chisq_ccdf.(Ref(r), grid)
         @test all(0 .≤ c .≤ 1) && issorted(c; rev=true)
@@ -1560,11 +1560,22 @@ end
         @test pvalue === PenalizedDensity.StatsAPI.pvalue
         @test pvalue(r, chisq(d, Q)) == chisq_ccdf(r, chisq(d, Q); method=:exact)
         @test chisq_ccdf(r, μ) == chisq_ccdf(r, μ; method=:exact)
-        # The reference is built once with chisq_reference; nothing takes a fit in its place.
+        # pvalue passes its quadrature tolerances through to chisq_ccdf.
+        z = chisq(d, Q)
+        @test pvalue(r, z; rtol=1e-3, atol=1e-3) == chisq_ccdf(r, z; rtol=1e-3, atol=1e-3)
+        # The reference is built once with ChisqReference; nothing takes a fit in its place.
         @test !hasmethod(pvalue, Tuple{DensityEstimate,Any})
         @test !hasmethod(chisq_ccdf, Tuple{DensityEstimate,Real})
         @test !hasmethod(chisq_pdf, Tuple{DensityEstimate,Real})
-        @test !hasmethod(expected_chisq, Tuple{DensityEstimate})
+
+        # The inner constructor derives tg and the mean from (tri, g), and converts eltype.
+        @test mean(r) == PenalizedDensity._tridiag_invdiag(r.tri) - sum(abs2, r.g)
+        rr = ChisqReference{Float64}(r.tri, r.g)
+        @test rr.tg == r.tg && mean(rr) == mean(r)
+        r32 = ChisqReference{Float32}(d)
+        @test r32 isa ChisqReference{Float32}
+        @test mean(r32) ≈ μ rtol = 1e-5
+        @test_throws "but g has length" ChisqReference{Float64}(r.tri, r.g[1:end-1])
 
         # Method validation.
         @test_throws ArgumentError chisq_ccdf(r, 1.0; method=:bogus)
@@ -1579,8 +1590,8 @@ end
         @test sweep_allocated(piv, rhs, r, 0.7) == 0
 
         # Generic indexing: OffsetArray input gives an identical reference.
-        ro = chisq_reference(DensityEstimate(OffsetArray(x, -75), d.κ))
-        @test ro.tri.dv ≈ r.tri.dv && ro.g ≈ r.g && expected_chisq(ro) ≈ μ
+        ro = ChisqReference(DensityEstimate(OffsetArray(x, -75), d.κ))
+        @test ro.tri.dv ≈ r.tri.dv && ro.g ≈ r.g && mean(ro) ≈ μ
 
         # Green's identity, the reference's internal consistency check.
         @test green_identity(d) ≈ 1 rtol = 1e-5
@@ -1590,12 +1601,12 @@ end
         # A constant callable takes the piecewise path and lands on the scalar path's answer.
         xg = randn(Xoshiro(11), 500)
         κ = select_kappa(xg)
-        rs = chisq_reference(DensityEstimate(xg, κ))
-        rc = chisq_reference(DensityEstimate(xg, t -> κ))
+        rs = ChisqReference(DensityEstimate(xg, κ))
+        rc = ChisqReference(DensityEstimate(xg, t -> κ))
         @test rc.tri.dv ≈ rs.tri.dv rtol = 1e-10
         @test rc.g ≈ rs.g rtol = 1e-10
-        @test expected_chisq(rc) ≈ expected_chisq(rs) rtol = 1e-10
-        @test chisq_ccdf(rc, expected_chisq(rc)) ≈ chisq_ccdf(rs, expected_chisq(rs)) rtol = 1e-10
+        @test mean(rc) ≈ mean(rs) rtol = 1e-10
+        @test chisq_ccdf(rc, mean(rc)) ≈ chisq_ccdf(rs, mean(rs)) rtol = 1e-10
 
         # The decisive test: the exact law reproduces a direct Monte-Carlo of the fluctuation
         # field. A hard-edge family under the plug-in selector, whose realized rates span five
@@ -1604,9 +1615,9 @@ end
         xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
         da = DensityEstimate(xa, select_kappa(xa, Adaptive(; window=nothing)))
         @test maximum(da.κ) / minimum(da.κ) > 1e4
-        ra = chisq_reference(da)
+        ra = ChisqReference(da)
         chis = fieldmc_chisq(da; nsamp=40_000, seed=3)
-        @test expected_chisq(ra) ≈ mean(chis) rtol = 0.02
+        @test mean(ra) ≈ mean(chis) rtol = 0.02
         for z in quantile(chis, (0.3, 0.6, 0.9, 0.99))
             @test chisq_ccdf(ra, z) ≈ mean(>(z), chis) atol = 0.012
         end
@@ -1617,9 +1628,9 @@ end
         xw = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:400]
         dw = DensityEstimate(xw, select_kappa(xw, Adaptive()))
         @test dw.κ isa AbstractVector
-        rw = chisq_reference(dw)
+        rw = ChisqReference(dw)
         chw = fieldmc_chisq(dw; nsamp=40_000, seed=3)
-        @test expected_chisq(rw) ≈ mean(chw) rtol = 0.02
+        @test mean(rw) ≈ mean(chw) rtol = 0.02
         for z in quantile(chw, (0.3, 0.9, 0.99))
             @test chisq_ccdf(rw, z) ≈ mean(>(z), chw) atol = 0.012
         end
@@ -1627,9 +1638,9 @@ end
         # And a smooth family at small N, under a hand-chosen scale.
         xs = sort!(randn(Xoshiro(2), 60))
         ds = DensityEstimate(xs, t -> 2exp(-t / 2))
-        rsm = chisq_reference(ds)
+        rsm = ChisqReference(ds)
         chs = fieldmc_chisq(ds; nsamp=40_000, seed=3)
-        @test expected_chisq(rsm) ≈ mean(chs) rtol = 0.02
+        @test mean(rsm) ≈ mean(chs) rtol = 0.02
         for z in quantile(chs, (0.3, 0.9, 0.99))
             @test chisq_ccdf(rsm, z) ≈ mean(>(z), chs) atol = 0.012
         end
@@ -2129,7 +2140,7 @@ end
         @test gaussianize_logjacobian(db, 3.5).logjac == -Inf
 
         # The χ² reference: both methods treat z identically outside its support.
-        r = chisq_reference(fits[1])
+        r = ChisqReference(fits[1])
         for method in (:exact, :largeN)
             @test_throws DomainError chisq_ccdf(r, NaN; method)
             @test_throws "the χ² value must not be NaN" chisq_ccdf(r, NaN; method)
@@ -2373,9 +2384,9 @@ end
 
     @testset "chisq family runs on a bounded fit" begin
         d = DensityEstimate(sort(rand(Xoshiro(45), 50)), 10.0; support=(0.0, 1.0))
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         @test r isa ChisqReference
-        @test expected_chisq(r) == r.mean > 0
+        @test mean(r) == r.mean > 0
         @test 0 <= chisq_ccdf(r, 1.0) <= 1
         @test chisq_pdf(r, 1.0) >= 0
         @test 0 <= pvalue(r, chisq(d, t -> 1.0)) <= 1
@@ -2572,15 +2583,15 @@ end
         Random.seed!(60)
         x = randn(150)
         d = DensityEstimate(x, select_kappa_ms(x))
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         d2 = DensityEstimate(x, d.κ; support=(-Inf, Inf))
-        r2 = chisq_reference(d2)
+        r2 = ChisqReference(d2)
         @test r2.tri.dv == r.tri.dv && r2.tri.ev == r.tri.ev && r2.g == r.g && r2.mean == r.mean
 
         # A far wall (1e4 smoothing lengths out) reproduces the unbounded reference closely.
         far = 1e4 / d.κ
         dfar = DensityEstimate(x, d.κ; support=(minimum(x) - far, maximum(x) + far))
-        rfar = chisq_reference(dfar)
+        rfar = ChisqReference(dfar)
         @test maximum(abs.(rfar.tri.dv .- r.tri.dv) ./ abs.(r.tri.dv)) < 1e-10
         @test maximum(abs.(rfar.g .- r.g) ./ abs.(r.g)) < 1e-10
         @test abs(rfar.mean - r.mean) / r.mean < 1e-10
@@ -2647,9 +2658,9 @@ end
         Random.seed!(63)
         x = sort(rand(400) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, select_kappa(x; support=(0.0, 1.0)); support=(0.0, 1.0))
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=11)
-        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        @test mean(r) ≈ mean(chis) rtol = 0.01
         for z in quantile(chis, (0.3, 0.6, 0.9))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end
@@ -2660,9 +2671,9 @@ end
         Random.seed!(64)
         x = sort(-log.(1 .- rand(400)))
         d = DensityEstimate(x, select_kappa(x; support=(0.0, Inf)); support=(0.0, Inf))
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=12)
-        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        @test mean(r) ≈ mean(chis) rtol = 0.01
         for z in quantile(chis, (0.3, 0.6, 0.9))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end
@@ -2675,9 +2686,9 @@ end
         κ = select_kappa(x, Adaptive(; window=nothing); support=(0.0, Inf))
         d = DensityEstimate(x, κ; support=(0.0, Inf))
         @test maximum(d.κ) / minimum(d.κ) > 1e4
-        r = chisq_reference(d)
+        r = ChisqReference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=13)
-        @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
+        @test mean(r) ≈ mean(chis) rtol = 0.01
         for z in quantile(chis, (0.3, 0.6, 0.9))
             @test chisq_ccdf(r, z) ≈ mean(>(z), chis) atol = 0.012
         end

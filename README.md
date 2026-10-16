@@ -28,7 +28,7 @@ x = randn(500)                       # samples from an unknown distribution
 d = DensityEstimate(x, κ)            # callable: d(x) is the density Q(x)
 
 d(0.0)                               # density at a point
-ref = chisq_reference(d)             # reference law for goodness-of-fit tests
+ref = ChisqReference(d)              # reference law for goodness-of-fit tests
 pvalue(ref, chisq(d, x -> exp(-x^2/2)/√(2π)))   # test a model (here a standard normal)
 ```
 

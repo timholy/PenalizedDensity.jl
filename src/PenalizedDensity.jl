@@ -12,7 +12,7 @@ using StatsAPI: StatsAPI, nobs, pvalue
 
 export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support
 export Adaptive, AdaptiveScale, WindowScale, WindowRule
-export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
+export chisq, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile, mean, var, std, nobs
@@ -45,7 +45,7 @@ subtype supports:
 A fit acts as a scalar in broadcasting: `cdf.(d, xs)` equals `cdf(d, xs)`. The array methods
 are faster, because they assemble the node cumulatives once for all of `xs`.
 
-The goodness-of-fit statistic ([`chisq`](@ref), [`chisq_reference`](@ref)) and
+The goodness-of-fit statistic ([`chisq`](@ref), [`ChisqReference`](@ref)) and
 [`logdensity_node_gradient`](@ref) are defined for [`DensityEstimate`](@ref) only.
 
 Every subtype has the fields `d.x` (the sorted, distinct nodes), `d.ψ` (the normalized
@@ -178,7 +178,7 @@ that side, replacing its exponential tail with a `cosh` arc pinned flat at the w
 discontinuous or divergent edge (a "jump edge") is representable directly rather than
 approximated by a fast-decaying tail.
 
-The goodness-of-fit machinery ([`chisq_reference`](@ref) and everything built on it) supports a
+The goodness-of-fit machinery ([`ChisqReference`](@ref) and everything built on it) supports a
 varying `κ` exactly as it does a constant one, and a finite `support` exactly as it does the
 unbounded line.
 
@@ -2193,7 +2193,7 @@ summed over the data nodes `xᵢ` with multiplicities `wᵢ`, where `ψ_cl = √
 is the fitted amplitude. `Q` is any callable returning density values; it should be
 a normalized density (`∫Q dx = 1`). `chisq(d, d) == 0`. Small χ² means `Q` is close
 to the data in the (squared Hellinger) sense. For its significance, build the reference law
-once with [`chisq_reference`](@ref) and pass the statistic to [`pvalue`](@ref).
+once with [`ChisqReference`](@ref) and pass the statistic to [`pvalue`](@ref).
 
 Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
 """
@@ -2237,24 +2237,54 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 # eigenvalues are formed.
 
 """
-    ChisqReference
+    ChisqReference(d::DensityEstimate)
 
-Precomputed reference distribution of the goodness-of-fit statistic [`chisq`](@ref)
-for one fit (Holy 1997, Eqs. 16–18). The statistic is a quadratic form in the Gaussian
+Reference distribution of the goodness-of-fit statistic [`chisq`](@ref) for the fit `d`,
+following Holy 1997 (Eqs. 16–18). The statistic is a quadratic form in the Gaussian
 fluctuation field, so its law is a generalized chi-squared, evaluated here at finite `N`
-with no large-`N` limit; see [`chisq_reference`](@ref) for the approximation it rests on.
-This object stores the `O(N)` data — a symmetric tridiagonal matrix and a
-rank-one constraint vector — that its density and tail probabilities are computed from.
+with no large-`N` limit. Construction costs `O(N)`, and the object stores the `O(N)` data —
+a symmetric tridiagonal matrix and a rank-one constraint vector — that its density and tail
+probabilities are computed from.
 
-Build one with [`chisq_reference`](@ref) and reuse it across many evaluations of
-[`chisq_ccdf`](@ref), [`chisq_pdf`](@ref), and [`pvalue`](@ref); its exact mean is
-[`expected_chisq`](@ref)`(ref)`.
+Build one per fit and reuse it across many evaluations of [`pvalue`](@ref),
+[`chisq_ccdf`](@ref) and [`chisq_pdf`](@ref): one reference serves any number of trial
+densities tested against the fit. Its exact mean is [`mean`](@ref Statistics.mean)`(ref)`.
+A spatially varying `κ` and a finite `support` (see [`DensityEstimate`](@ref)) are both
+supported, and the law stays `O(N)` in either case.
+
+The law is exact for the Gaussian fluctuation field of the Laplace approximation about
+the fit, and it is evaluated at finite `N`. The functions that evaluate it take
+`method = :exact` (this finite-`N` law, the default) or `method = :largeN` (its large-`N`
+limit).
+
+It is not, by itself, a finite-sample frequentist null distribution for data drawn from
+the fitted density; it is a Bayesian measure of likelihood among distributions sharing
+the same roughness penalty. Its calibration as a frequentist null distribution need not
+be distribution-free.
+
+Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
+
+# Extended help
+
+With a spatially varying `κ` the nodal precision of the fluctuation field is `2λ` times the
+same tridiagonal operator the fit assembles, whatever the scale. With a finite `support` the
+fluctuation field's natural (Neumann) boundary condition makes `M̂` the Dirichlet-to-Neumann
+map of the boundary segments as well as the interior, and the same identity `G₀⁻¹ = 2λM̂` holds
+with `M̂` the bounded operator the fit already assembles.
 """
 struct ChisqReference{T<:AbstractFloat}
     tri::SymTridiagonal{T,Vector{T}}    # D^{-1/2} C₀⁻¹ D^{-1/2}; A = tri⁻¹ - g gᵀ
     g::Vector{T}                        # rank-one constraint direction, D^{1/2} b / √Vφ
     tg::Vector{T}                       # tri·g, the Imhof rank-one RHS (constant in u)
     mean::T                             # exact ⟨χ²⟩ = tr(A)
+
+    function ChisqReference{T}(tri, g) where {T<:AbstractFloat}
+        tri = convert(SymTridiagonal{T,Vector{T}}, tri)::SymTridiagonal{T,Vector{T}}
+        g = convert(Vector{T}, g)::Vector{T}
+        size(tri, 1) == length(g) ||
+            throw(DimensionMismatch("tri is $(size(tri, 1))×$(size(tri, 2)) but g has length $(length(g))"))
+        return new{T}(tri, g, tri * g, _tridiag_invdiag(tri) - sum(abs2, g))
+    end
 end
 
 Base.show(io::IO, r::ChisqReference) =
@@ -2392,37 +2422,9 @@ function _tridiag_invdiag(tri::SymTridiagonal{T}) where {T}
     return sum(inv(p[i] + q[i] - a[i]) for i in 1:n)
 end
 
-"""
-    chisq_reference(d::DensityEstimate) -> ChisqReference
+ChisqReference(d::DensityEstimate{T}) where {T} = ChisqReference{T}(d)
 
-Assemble the reference distribution of [`chisq`](@ref) for the fit `d`, following
-Holy 1997 (Eqs. 16–18). Costs `O(N)`; the result is the argument of
-[`pvalue`](@ref), [`chisq_ccdf`](@ref), [`chisq_pdf`](@ref) and [`expected_chisq`](@ref), so
-one reference serves any number of trial densities tested against the fit. A
-spatially varying `κ` and a finite `support` (see [`DensityEstimate`](@ref)) are both
-supported, and the law stays `O(N)` in either case.
-
-The law is exact for the Gaussian fluctuation field of the Laplace approximation about
-the fit, and it is evaluated at finite `N`. The functions that evaluate it take
-`method = :exact` (this finite-`N` law, the default) or `method = :largeN` (its large-`N`
-limit).
-
-It is not, by itself, a finite-sample frequentist null distribution for data drawn from
-the fitted density; it is a Bayesian measure of likelihood among distributions sharing
-the same roughness penalty. Its calibration as a frequentist null distribution need not
-be distribution-free.
-
-Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
-
-# Extended help
-
-With a spatially varying `κ` the nodal precision of the fluctuation field is `2λ` times the
-same tridiagonal operator the fit assembles, whatever the scale. With a finite `support` the
-fluctuation field's natural (Neumann) boundary condition makes `M̂` the Dirichlet-to-Neumann
-map of the boundary segments as well as the interior, and the same identity `G₀⁻¹ = 2λM̂` holds
-with `M̂` the bounded operator the fit already assembles.
-"""
-function chisq_reference(d::DensityEstimate{T}) where {T}
+function ChisqReference{T}(d::DensityEstimate) where {T}
     x, ψ, w, λ = d.x, d.ψ, d.w, d.λ
     κ, κL, κR, lo, hi = d.κ, d.κL, d.κR, d.lo, d.hi
     n = length(x)
@@ -2439,18 +2441,18 @@ function chisq_reference(d::DensityEstimate{T}) where {T}
     D = 2 .* S; sq = sqrt.(D)                          # D = 4wᵢ/ψᵢ²
     tri = SymTridiagonal(C0inv.dv ./ D, C0inv.ev ./ (sq[1:n-1] .* sq[2:n]))
     g = sq .* b ./ sqrt(Vφ)
-    return ChisqReference{T}(tri, g, tri * g, _tridiag_invdiag(tri) - sum(abs2, g))
+    return ChisqReference{T}(tri, g)
 end
 
 """
-    expected_chisq(ref::ChisqReference) -> ⟨χ²⟩
+    mean(ref::ChisqReference) -> ⟨χ²⟩
 
-Mean of the reference distribution of [`chisq`](@ref): the finite-`N` generalized-χ² law
-of the quadratic fluctuation approximation (Holy 1997, Eqs. 16–18), whose standing as a
-null distribution [`chisq_reference`](@ref) sets out. Defined at any scale, constant or
+Exact mean of the reference distribution of [`chisq`](@ref): the finite-`N` generalized-χ²
+law of the quadratic fluctuation approximation (Holy 1997, Eqs. 16–18), whose standing as a
+null distribution [`ChisqReference`](@ref) sets out. Defined at any scale, constant or
 spatially varying.
 """
-expected_chisq(r::ChisqReference) = r.mean
+Statistics.mean(r::ChisqReference) = r.mean
 
 # Scratch for one sweep of `_logΦ!`: pivots and RHS/solution, both length N. Allocated once
 # per tail-probability integral and reused across every integrand evaluation within it, which
@@ -2519,17 +2521,18 @@ function _check_chisq_args(z::Real, method::Symbol)
 end
 
 """
-    chisq_ccdf(ref::ChisqReference, z; method=:exact) -> P(χ² ≥ z)
+    chisq_ccdf(ref::ChisqReference, z; method=:exact, rtol, atol) -> P(χ² ≥ z)
 
 Upper-tail (survival) probability of the reference χ² distribution at `z`. Evaluated at an
 observed statistic it is a diagnostic significance; see [`pvalue`](@ref), and
-[`chisq_reference`](@ref) for the sense in which it is and is not a p-value.
+[`ChisqReference`](@ref) for the sense in which it is and is not a p-value.
 
 `method=:exact` (default) uses the finite-`N` generalized-χ² law of `ref` via Imhof
 inversion. `method=:largeN` uses the inverse-Gaussian (Wald) shape of the large-`N` limit
-(Eq. 26), parameterized by the mean [`expected_chisq`](@ref); it is a closed form, far
-cheaper per call, and, like the exact law, defined at every scale. The law is supported on
-`z > 0`: `z ≤ 0` gives `1`, `z = Inf` gives `0`, and `NaN` throws a `DomainError`.
+(Eq. 26), parameterized by the exact mean [`mean`](@ref Statistics.mean)`(ref)`; it is a
+closed form, far cheaper per call, and, like the exact law, defined at every scale. `rtol`
+and `atol` (default `sqrt(eps(T))`) are the tolerances of the `:exact` quadrature. The law is
+supported on `z > 0`: `z ≤ 0` gives `1`, `z = Inf` gives `0`, and `NaN` throws a `DomainError`.
 """
 function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
     _check_chisq_args(z, method)
@@ -2551,7 +2554,7 @@ _wald_pdf(μ::T, z::Real) where {T} =
     z > 0 ? μ / sqrt(2 * T(π) * T(z)^3) * exp(μ - T(z) / 2 - μ^2 / (2 * T(z))) : zero(T)
 
 """
-    chisq_pdf(ref::ChisqReference, z; method=:exact) -> P(z)
+    chisq_pdf(ref::ChisqReference, z; method=:exact, rtol, atol) -> P(z)
 
 Density of the reference χ² distribution at `z`; it is `0` for `z ≤ 0` and at `z = Inf`, and
 `NaN` throws a `DomainError`. `method=:exact` (default) is the finite-`N` generalized-χ² law
@@ -2560,7 +2563,8 @@ inverse-Gaussian (Wald) density of the large-`N` limit (Eq. 26),
 
     P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)],
 
-with `⟨χ²⟩ =` [`expected_chisq`](@ref) the exact mean: a closed form, defined at every scale.
+with `⟨χ²⟩ =` [`mean`](@ref Statistics.mean)`(ref)` the exact mean: a closed form, defined at
+every scale. `rtol` and `atol` are as in [`chisq_ccdf`](@ref).
 """
 function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
     _check_chisq_args(z, method)
@@ -2576,23 +2580,23 @@ function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sq
 end
 
 """
-    pvalue(ref::ChisqReference, χ²; method=:exact) -> p
+    pvalue(ref::ChisqReference, χ²; method=:exact, rtol, atol) -> p
 
 Significance of an observed goodness-of-fit statistic `χ² = `[`chisq`](@ref)`(d, Q)` for a
-trial density `Q`, where `ref = `[`chisq_reference`](@ref)`(d)`: the probability that the
-reference χ² distribution exceeds it, `chisq_ccdf(ref, χ²; method)`. The reference law is
+trial density `Q`, where `ref = `[`ChisqReference`](@ref)`(d)`: the probability that the
+reference χ² distribution exceeds it, `chisq_ccdf(ref, χ²; kwargs...)`. The reference law is
 that of the quadratic fluctuation approximation, so this is a diagnostic significance whose
-calibration is density-dependent; see [`chisq_reference`](@ref).
+calibration is density-dependent; see [`ChisqReference`](@ref).
 
-`method` is as in [`chisq_ccdf`](@ref). Extends `StatsAPI.pvalue`.
+The keywords are passed to [`chisq_ccdf`](@ref). Extends `StatsAPI.pvalue`.
 
 # Examples
 ```julia
-ref = chisq_reference(d)
+ref = ChisqReference(d)
 pvalue(ref, chisq(d, Q))
 ```
 """
-StatsAPI.pvalue(r::ChisqReference, χ²::Real; method::Symbol=:exact) = chisq_ccdf(r, χ²; method)
+StatsAPI.pvalue(r::ChisqReference, χ²::Real; kwargs...) = chisq_ccdf(r, χ²; kwargs...)
 
 # Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
 function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
