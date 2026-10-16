@@ -2159,9 +2159,26 @@ end
         x = sort(rand(30) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, 7.0; support=(0.0, 1.0))
         Zgram, Gψ = PenalizedDensity._norm_sq_gram(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
-        Z = PenalizedDensity._norm_sq(d.x, d.ψ, d.κ, d.lo, d.hi)
+        Z = PenalizedDensity._norm_sq(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
         @test Zgram ≈ Z rtol = 1e-13
         @test sum(d.ψ .* Gψ) ≈ Z rtol = 1e-13
+    end
+
+    @testset "interval masses are accurate for near-coincident nodes" begin
+        # Pairs 1e-6 apart give θ = κh near 1e-8, where the coth/csch coefficient forms lose
+        # about half the digits. Compare with the same computation in BigFloat.
+        xs = sort(randn(Xoshiro(5), 40))
+        xs = sort(vcat(xs, xs[1:2:end] .+ 1e-6 .* rand(Xoshiro(6), 20)))
+        d = DensityEstimate(xs, 5.0; rtol=0)
+        @test minimum(diff(d.x)) * d.κ < 1e-6
+        x, ψ, κ = d.x, d.ψ, d.κ
+        X, Ψ, K = big.(x), big.(ψ), big(κ)
+        Zb = PenalizedDensity._norm_sq(X, Ψ, K)
+        @test PenalizedDensity._norm_sq(x, ψ, κ) ≈ Zb rtol = 4eps()
+        @test PenalizedDensity._norm_sq_gram(x, ψ, κ, κ, κ)[1] ≈ Zb rtol = 4eps()
+        @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[1] ≈ Zb rtol = 4eps()
+        @test last(PenalizedDensity._node_cdf(d)) ≈ Zb rtol = 4eps()
+        @test PenalizedDensity._int_quartic(x, ψ, κ) ≈ PenalizedDensity._int_quartic(X, Ψ, K) rtol = 4eps()
     end
 
     @testset "mass" begin

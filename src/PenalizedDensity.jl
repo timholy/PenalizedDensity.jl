@@ -298,7 +298,7 @@ Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=nothing) where {T}
     ψ = _solve_amplitude(roughness_operator(nodes, κ, lo, hi), weights; stats)
-    Z = _norm_sq(nodes, ψ, κ, lo, hi)
+    Z = _norm_sq(nodes, ψ, κ, κ, κ, lo, hi)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
     return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, lo, hi, λ)
@@ -793,53 +793,30 @@ _solve_amplitude(x::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T<:Abstrac
     _solve_amplitude(roughness_operator(x, κ), w; kwargs...)
 
 # ∫ ψ² dx for the hyperbolic interpolant with exponential tails, as a tridiagonal quadratic
-# form evaluated at the nodal amplitudes, with an optional natural boundary at `lo`/`hi`. The
-# tail mass is `_tail_mass(ψ_edge, κ, Δ)` — ψ₁²/(2κ) as Δ → ∞ (an unbounded side), or
-# ψ₁²(tanh u + u·sech²u)/(2κ) at a finite gap.
-function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T, lo::T, hi::T) where {T}
+# form evaluated at the nodal amplitudes. The scale κ is a scalar or one value per interval,
+# and either side may have a natural boundary at `lo`/`hi`. The interpolant on interval k and
+# the tail decays are set by the rates themselves, not by the operator's overall factor, so
+# this is the physical mass whatever κ̄ the amplitude was solved in. Each tail is
+# `_tail_mass(ψ_edge, κ_edge, Δ)` — ψ_edge²/(2κ_edge) as Δ → ∞ (an unbounded side), or
+# ψ_edge²(tanh u + u·sech²u)/(2κ_edge) at a finite gap.
+function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     n = length(x)
-    Z = _tail_mass(ψ[1], κ, x[1] - lo) + _tail_mass(ψ[n], κ, hi - x[n])
+    Z = _tail_mass(ψ[1], κL, x[1] - lo) + _tail_mass(ψ[n], κR, hi - x[n])
     for k in 1:n-1
-        θ = κ * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        # Endpoint and cross contributions of ∫ψ² over the interval, written with
-        # coth/csch so they stay finite as θ → ∞ rather than overflowing via sinh.
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
-        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
+        κk = _kappa(κ, k)
+        Z += _interval_mass(ψ[k], ψ[k+1], κk * (x[k+1] - x[k])) / κk
     end
     return Z
 end
 
 # `_norm_sq` on the unbounded line.
-_norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _norm_sq(x, ψ, κ, T(-Inf), T(Inf))
-
-# ∫ ψ² dx for a piecewise-constant scale, with an optional natural boundary at `lo`/`hi`. The
-# interpolant on interval k and the tail decays are set by the rates themselves, not by the
-# operator's overall factor, so this is the physical mass whatever κ̄ the amplitude was solved
-# in. Each tail is `_tail_mass(ψ_edge, κ_edge, Δ)` — ψ_edge²/(2κ_edge) as Δ → ∞ (an unbounded
-# side), or the boundary-segment mass at a finite gap.
-function _norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T}
-    n = length(x)
-    Z = _tail_mass(ψ[1], κL, x[1] - lo) + _tail_mass(ψ[n], κR, hi - x[n])
-    for k in 1:n-1
-        κ = κs[k]
-        θ = κ * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
-        Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-    end
-    return Z
-end
-
-# `_norm_sq` for a piecewise-constant scale on the unbounded line.
-_norm_sq(x::Vector{T}, ψ::Vector{T}, κs::Vector{T}, κL::T, κR::T) where {T} =
-    _norm_sq(x, ψ, κs, κL, κR, T(-Inf), T(Inf))
+_norm_sq(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
+    _norm_sq(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
+_norm_sq(x::Vector{T}, ψ::Vector{T}, κ::T) where {T} = _norm_sq(x, ψ, κ, κ, κ)
 
 # Z = ∫ψ² and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ, with an optional natural boundary at `lo`/`hi`: the
-# mass and the action of its Gram operator, from one pass over the per-interval coth/csch
-# coefficients. The leave-one-out expansion needs both. Each tail decays at its own rate and
+# mass and the action of its Gram operator, from one pass over the per-interval
+# `_mass_coeffs`. The leave-one-out expansion needs both. Each tail decays at its own rate and
 # contributes `_tail_mass(ψ_edge, κ_edge, Δ)` to `Z`; `Gψᵢ = tail-mass(ψᵢ)/ψᵢ` at a boundary
 # node reduces to `ψᵢ/(2κ_edge)` as Δ → ∞ (an unbounded side) since the tail mass is homogeneous
 # degree 2 in ψᵢ.
@@ -853,10 +830,7 @@ function _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, h
     Gψ[n] += tr / ψ[n]
     for k in 1:n-1
         κk = _kappa(κ, k)
-        θ = κk * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κk)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κk)
+        fdiag, fcross = _mass_coeffs(κk * (x[k+1] - x[k])) ./ κk
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
         Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
         Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
@@ -1021,8 +995,7 @@ function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     Gψ[n] += t * ψ[n]
     for k in 1:n-1
         h = x[k+1] - x[k]; θ = κ * h; ct = coth(θ); cs = csch(θ)
-        fdiag  = (ct - θ * cs^2) / (2κ)
-        fcross = cs * (θ * ct - oneunit(T)) / (2κ)
+        fdiag, fcross = _mass_coeffs(θ) ./ κ
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
         dfdiag  = h * cs^2 * (θ * ct - oneunit(T)) / κ - (ct - θ * cs^2) / (2κ^2)
         dfcross = h * cs * (2ct - θ * (ct^2 + cs^2)) / (2κ) - cs * (θ * ct - oneunit(T)) / (2κ^2)
@@ -1052,14 +1025,12 @@ function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi
         κk = _kappa(κ, k)
         p, q = ψ[k], ψ[k+1]
         θ = κk * (x[k+1] - x[k])
-        ct, cs = coth(θ), csch(θ)
+        cs = csch(θ)
         Δ = q - p
         cm1 = 2 * sinh(θ / 2)^2                              # coshθ - 1
         boundary = κk * cs * (cm1 * (p^4 + q^4) + Δ^2 * (p^2 + p*q + q^2))  # [u³u']ₖ^{k+1}
         E = κk^2 * cs^2 * (Δ^2 - 2 * p * q * cm1)            # u'² - κ²u²
-        fdiag  = (ct - θ * cs^2) / (2κk)
-        fcross = cs * (θ * ct - one(T)) / (2κk)
-        Iseg = fdiag * (p^2 + q^2) + 2 * fcross * p * q      # ∫u² over the interval
+        Iseg = _interval_mass(p, q, θ) / κk                  # ∫u² over the interval
         Q2 += (boundary - 3 * E * Iseg) / (4κk^2)
     end
     return Q2
@@ -1332,20 +1303,22 @@ end
 # cosh(v) - 1, accurate for small v.
 _coshm(v) = 2 * sinh(v / 2)^2
 
-# κ ∫ ψ² dt over one full inter-node interval, from the per-interval closed forms (the
-# same integrals as _norm_sq); the physical mass is the returned value divided by κ.
-# For θ < 1 the coth/csch coefficient forms cancel catastrophically (relative error
-# ~eps/θ²); the _sinhm/_coshm forms are algebraically identical and cancellation-free.
-function _interval_mass(ψk::T, ψk1::T, θ::T) where {T}
+# The coefficients (fdiag, fcross) of κ ∫ ψ² dt = fdiag (ψₖ² + ψₖ₊₁²) + 2 fcross ψₖψₖ₊₁ over an
+# interval of width θ = κh; the physical coefficients are these divided by κ. The coth/csch
+# forms stay finite as θ → ∞ but cancel catastrophically for θ < 1 (relative error ~eps/θ²),
+# where the algebraically identical _sinhm/_coshm forms are used instead.
+function _mass_coeffs(θ::T) where {T}
     if θ < 1
         s2 = 2 * sinh(θ)^2
-        fdiag  = _sinhm(2θ) / (2 * s2)
-        fcross = (θ * _coshm(θ) - _sinhm(θ)) / s2
-    else
-        ct, cs = coth(θ), csch(θ)
-        fdiag  = (ct - θ * cs^2) / 2
-        fcross = cs * (θ * ct - oneunit(T)) / 2
+        return _sinhm(2θ) / (2 * s2), (θ * _coshm(θ) - _sinhm(θ)) / s2
     end
+    ct, cs = coth(θ), csch(θ)
+    return (ct - θ * cs^2) / 2, cs * (θ * ct - oneunit(T)) / 2
+end
+
+# κ ∫ ψ² dt over one full inter-node interval of width θ = κh.
+function _interval_mass(ψk::T, ψk1::T, θ::T) where {T}
+    fdiag, fcross = _mass_coeffs(θ)
     return fdiag * (ψk^2 + ψk1^2) + 2 * fcross * ψk * ψk1
 end
 
