@@ -1185,6 +1185,21 @@ end
             @test_throws "kept running off the search bracket" sel(c -> -log(c), 1.0)
         end
 
+        @testset "the fixed-grid κ search" begin
+            mog(score, κs) = PenalizedDensity._minimize_on_grid(score, κs, Float64)
+            κs = exp.(range(log(0.1), log(100); length=13))
+            @test mog(κ -> (log(κ) - log(3.0))^2, κs) ≈ 3.0 rtol=1e-6
+            # Non-finite scores are stepped over, never chosen, whichever sign they carry.
+            @test mog(κ -> κ < 1 ? NaN : (log(κ) - log(3.0))^2, κs) ≈ 3.0 rtol=1e-6
+            @test mog(κ -> κ > 10 ? -Inf : (log(κ) - log(3.0))^2, κs) ≈ 3.0 rtol=1e-6
+            # A grid with no finite score is an error, not a silently returned scale.
+            @test_throws PenalizedDensity.ConvergenceError mog(_ -> NaN, κs)
+            @test_throws "no κ in kappas" mog(_ -> Inf, κs)
+            # Reachable through the public API: ten coincident points and one other merge to two
+            # nodes, where no κ yields a finite leave-one-out score.
+            @test_throws "no κ in kappas" select_kappa(vcat(fill(0.0, 10), [100.0]); resolution=0)
+        end
+
         @testset "an unresolvable candidate scores NaN" begin
             # A κ profile spanning many orders of magnitude can drive the factorization to an
             # exact zero pivot. That candidate is unresolvable, not a failure of the search.

@@ -1243,11 +1243,7 @@ function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Rea
                            _support_eltype(a), _support_eltype(b)))
     r, slo, shi = T(rtol), T(a), T(b)
     lu, uu, counts = _tally_intervals(lower, upper, T)
-    function score(κ)
-        v = _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout)
-        return isfinite(v) ? v : typemax(T)
-    end
-    return _minimize_on_grid(score, kappas, T)
+    return _minimize_on_grid(κ -> _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout), kappas, T)
 end
 
 function klcv(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ::Real;

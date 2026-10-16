@@ -2574,6 +2574,22 @@ function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
     return (a + b) / 2
 end
 
+# `score(exp(l))` as a function of l = ln c, with non-finite values mapped to +∞
+# (`typemax(T)`) so that a search steps over scales it cannot resolve.
+_lnscore(score, ::Type{T}) where {T} = l -> (v = score(exp(l)); isfinite(v) ? v : typemax(T))
+
+# Evaluate `f` (from `_lnscore`) at every point of the ln-scale grid `lncs`, visiting the
+# points from last to first when `reverse` is set. Returns the scores and the index of the
+# smallest, or `nothing` in place of the index when no grid point is resolvable.
+function _grid_argmin(f, lncs, ::Type{T}; reverse::Bool=false) where {T}
+    scores = similar(lncs, T)
+    for j in (reverse ? Iterators.reverse(eachindex(lncs)) : eachindex(lncs))
+        scores[j] = f(lncs[j])
+    end
+    all(==(typemax(T)), scores) && return scores, nothing
+    return scores, argmin(scores)
+end
+
 # Geometric κ grid from coarse (≈ one blob over the data) to fine (≈ individual points),
 # scaled to the data's extent, wide enough to bracket the minimum-sensitivity scale.
 function _default_κs(x::AbstractVector{<:Real})
@@ -2987,14 +3003,13 @@ end
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
 # search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
 # nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
-# to a non-finite score; those are treated as +∞ so the search never selects a degenerate scale.
+# to a non-finite score, which `_minimize_on_grid` steps over.
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
                           support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false)
     _check_kappa_grid(κs)
     xs, r, slo, shi = _scoring_sample(x, rtol, support, checkties)
     T = eltype(xs)
-    score(κ) = (v = _score_at(scorefun, xs, r, slo, shi, κ; holdout); isfinite(v) ? v : typemax(T))
-    return _minimize_on_grid(score, κs, T)
+    return _minimize_on_grid(κ -> _score_at(scorefun, xs, r, slo, shi, κ; holdout), κs, T)
 end
 
 # The validated, sorted sample a constant-scale score is evaluated on, in the working float type
@@ -3026,13 +3041,17 @@ function _check_kappa_grid(κs)
     return nothing
 end
 
-# Bracket the minimum of `score(κ)` on the grid `κs`, then refine by golden section in ln κ.
+# Bracket the minimum of `score(κ)` on the fixed grid `κs`, then refine by golden section in
+# ln κ. Non-finite scores count as +∞; a grid with no finite score is an error.
 function _minimize_on_grid(score, κs, ::Type{T}) where {T}
+    f = _lnscore(score, T)
     lnκ = log.(T.(κs))
-    i = argmin(score.(exp.(lnκ)))
+    _, i = _grid_argmin(f, lnκ, T)
+    i === nothing && throw(ConvergenceError("the smoothing scale search",
+        "no κ in kappas (from $(first(κs)) to $(last(κs))) gives a finite score"))
     loκ = lnκ[max(i - 1, firstindex(lnκ))]
     hiκ = lnκ[min(i + 1, lastindex(lnκ))]
-    return exp(_golden_min(l -> score(exp(l)), loκ, hiκ))
+    return exp(_golden_min(f, loκ, hiκ))
 end
 
 # Fraction of repeated values above which the point-likelihood selectors refuse the sample.
@@ -3269,7 +3288,7 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
                           maxshifts::Int=_CSHIFTS, reverse::Bool=false, label::String="smoothing scale",
                           bounds::Union{Nothing,Tuple{Real,Real}}=nothing,
                           skip_unresolved::Bool=false) where {T}
-    f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
+    f = _lnscore(score, T)
     lnspan = log(T(span))
     lnbounds = bounds === nothing ? nothing : (log(T(bounds[1])), log(T(bounds[2])))
     for _ in 0:maxshifts
@@ -3285,15 +3304,11 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
             end
         end
         lncs = range(loln, hiln; length=ngrid)
-        scores = Vector{T}(undef, ngrid)
-        for j in (reverse ? (ngrid:-1:1) : (1:ngrid))
-            scores[j] = f(lncs[j])
-        end
-        if all(==(typemax(T)), scores)
+        scores, i = _grid_argmin(f, lncs, T; reverse)
+        if i === nothing
             skip_unresolved && return nothing
             throw(ConvergenceError("the $label search", "no resolvable $label anywhere in the search bracket around c = $c0"))
         end
-        i = argmin(scores)
         if i != firstindex(lncs) && i != lastindex(lncs)
             l = _golden_min(f, lncs[i-1], lncs[i+1]; iters)
             fl = f(l)
@@ -3622,18 +3637,14 @@ _select_kappa_at_support(xs::Vector{T}, rtol::T, lo::T, hi::T, κ0::T, κ_bounds
 # chase this reflection effect down to an arbitrarily tight, spurious gap on every sample,
 # hard-edge or smooth alike), only the outward direction is treated as informative.
 function _select_gap(score, spacing::T) where {T}
-    f(l) = (v = score(exp(l)); isfinite(v) ? v : typemax(T))
+    f = _lnscore(score, T)
     lo0 = log(spacing) + log(T(_GAP_LO_MULT))
     hi0 = log(spacing) + log(T(_GAP_HI_MULT))
     for _ in 0:_CSHIFTS
         lncs = range(lo0, hi0; length=_GAP_GRID)
-        scores = Vector{T}(undef, _GAP_GRID)
-        for j in _GAP_GRID:-1:1        # visit wide (large gap) to narrow (small gap)
-            scores[j] = f(lncs[j])
-        end
-        all(==(typemax(T)), scores) &&
+        _, i = _grid_argmin(f, lncs, T; reverse=true)    # visit wide (large gap) to narrow
+        i === nothing &&
             throw(ConvergenceError("the boundary-gap search", "no resolvable boundary gap anywhere in the search bracket above $(exp(lo0))"))
-        i = argmin(scores)
         i == firstindex(lncs) && return exp(lo0)     # hit the floor: accept it, don't recenter
         i == lastindex(lncs) || return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters=_GAP_ITERS))
         lo0, hi0 = hi0, hi0 + (hi0 - lo0)            # extend outward and search on
@@ -3758,6 +3769,9 @@ function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(elt
     T = float(promote_type(eltype(x), typeof(rtol)))
     xs = _sorted_sample(x, T)
     resolution === nothing && _check_ties(xs)
+    # Both boundary searches need a nonzero edge spacing. Checking it before any κ search
+    # reports coincident edge points as such, rather than as a κ grid with no finite score.
+    _edge_spacing(xs, :left); _edge_spacing(xs, :right)
     r = T(rtol)
     # The chained κ search never leaves the data-scaled range the full search draws from — see
     # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
