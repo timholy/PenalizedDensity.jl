@@ -1315,6 +1315,10 @@ a callable `κ(x)`, and a domain `(a, b)` outside of which the density is zero. 
 observation must lie within the support. Interval endpoints (and points) closer than
 `rtol / κ(x)` are merged.
 
+The fit's floating-point type `T` is the promotion of the observations, `κ`, `rtol`,
+`resolution` and any finite `support` bound. `IntervalDensityEstimate{T}(…)`, in either form,
+sets `T` instead and converts the observations and parameters to it.
+
 The estimate maximizes the penalized likelihood in which an interval observation contributes
 the log-probability of its interval rather than a log-density, so a density spike inside an
 interval earns nothing. Rounded data are therefore never pulled toward point masses at the
@@ -1359,7 +1363,7 @@ each cell between nodes), and `d.kL`, `d.kR` (the tails' decay rates) describe t
 curve. `d.κ` is the smoothing scale. `d.w` counts only the point observations, so the total
 count is [`nobs`](@ref)`(d)`.
 """
-struct IntervalDensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
+struct IntervalDensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: AbstractDensityEstimate
     x::Vector{T}        # sorted distinct nodes: interval endpoints and points
     w::Vector{T}        # point multiplicity at each node
     ψ::Vector{T}        # normalized amplitude at the nodes
@@ -1375,7 +1379,7 @@ struct IntervalDensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     λ::T                # normalization multiplier (diagnostic)
 
     function IntervalDensityEstimate{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups,
-                                          λ) where {T<:AbstractFloat,K}
+                                          λ) where {T<:AbstractFloat,K<:Union{T,Vector{T}}}
         m = length(x)
         length(w) == length(ψ) == m ||
             throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
@@ -1393,16 +1397,27 @@ struct IntervalDensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     end
 end
 
+IntervalDensityEstimate{T}(x, w, ψ, k2, kL, kR, κ::Real, κL, κR, lo, hi, groups, λ) where {T} =
+    IntervalDensityEstimate{T,T}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups, λ)
+IntervalDensityEstimate{T}(x, w, ψ, k2, kL, kR, κ::AbstractVector, κL, κR, lo, hi, groups, λ) where {T} =
+    IntervalDensityEstimate{T,Vector{T}}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups, λ)
+
 StatsAPI.nobs(d::IntervalDensityEstimate{T}) where {T} = sum(d.w) + sum(g -> g.r, d.groups; init=zero(T))
 
 function IntervalDensityEstimate(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ;
                                  support::Tuple{Real,Real}=(-Inf, Inf),
                                  rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                  stats=nothing)
+    a, b = _check_support_bounds(support)
+    T = _interval_eltype(promote_type(eltype(lower), eltype(upper)), κ, lower, upper, rtol, a, b)
+    return IntervalDensityEstimate{T}(lower, upper, κ; support, rtol, stats)
+end
+
+function IntervalDensityEstimate{T}(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ;
+                                    support::Tuple{Real,Real}=(-Inf, Inf), rtol::Real=cbrt(eps(T)),
+                                    stats=nothing) where {T<:AbstractFloat}
     _check_rtol(rtol)
     a, b = _check_support_bounds(support)
-    T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol), _kappa_eltype(κ, lower, upper),
-                           _support_eltype(a), _support_eltype(b)))
     κ isa Real && _check_kappa(κ)
     L = _interval_layout(lower, upper, κ, T(rtol), T(a), T(b))
     return _interval_fit(L, κ isa Real ? T(κ) : L.κs; stats)
@@ -1411,16 +1426,35 @@ end
 function IntervalDensityEstimate(x::AbstractVector{<:Real}, κ; resolution::Union{Real,Nothing}=nothing,
                                  support::Tuple{Real,Real}=(-Inf, Inf),
                                  rtol::Real=cbrt(eps(float(eltype(x)))), stats=nothing)
+    _check_resolution(resolution)
+    a, b = _check_support_bounds(support)
+    T = _interval_eltype(promote_type(eltype(x), typeof(resolution)), κ, x, x, rtol, a, b)
+    return IntervalDensityEstimate{T}(x, κ; resolution, support, rtol, stats)
+end
+
+function IntervalDensityEstimate{T}(x::AbstractVector{<:Real}, κ; resolution::Union{Real,Nothing}=nothing,
+                                    support::Tuple{Real,Real}=(-Inf, Inf), rtol::Real=cbrt(eps(T)),
+                                    stats=nothing) where {T<:AbstractFloat}
+    _check_resolution(resolution)
+    isempty(x) && throw(ArgumentError("cannot fit a density to zero observations"))
+    lower, upper = _lattice_bounds(x, T(resolution), support)
+    return IntervalDensityEstimate{T}(lower, upper, κ; support, rtol, stats)
+end
+
+function _check_resolution(resolution)
     resolution === nothing &&
         throw(ArgumentError("pass the lattice spacing as `resolution`, or give the bounds of each " *
                             "observation as `IntervalDensityEstimate(lower, upper, κ)`"))
     isfinite(resolution) && resolution > 0 ||
         throw(ArgumentError("resolution must be finite and positive, got $resolution"))
-    isempty(x) && throw(ArgumentError("cannot fit a density to zero observations"))
-    T = float(promote_type(eltype(x), typeof(resolution)))
-    lower, upper = _lattice_bounds(x, T(resolution), support)
-    return IntervalDensityEstimate(lower, upper, κ; support, rtol, stats)
+    return nothing
 end
+
+# The working float type of an interval fit: the promotion of the observations' type `R`, the
+# scale, tolerance and finite support bounds. A callable scale's precision is seen by sampling
+# it at the first finite bound.
+_interval_eltype(R, κ, lower, upper, rtol, a, b) =
+    float(promote_type(R, typeof(rtol), _kappa_eltype(κ, lower, upper), _support_eltype(a), _support_eltype(b)))
 
 # The rounding interval of each lattice value. Bounds are formed from integer lattice indices so
 # that adjacent intervals share their endpoint exactly.
@@ -1465,8 +1499,7 @@ function _interval_fit(L::_IntervalLayout{T}, κ; stats=nothing) where {T}
     k2 = T[L.κs[c]^2 * τcell(c) for c in 1:m-1]
     kL = L.κL * sqrt(τcell(0))
     kR = L.κR * sqrt(τcell(m))
-    return IntervalDensityEstimate{T,typeof(κ)}(y, L.w, ψ, k2, kL, kR, κ, L.κL, L.κR, L.lo, L.hi,
-                                                 L.groups, Z / 2)
+    return IntervalDensityEstimate{T}(y, L.w, ψ, k2, kL, kR, κ, L.κL, L.κR, L.lo, L.hi, L.groups, Z / 2)
 end
 
 Base.eltype(::Type{<:IntervalDensityEstimate{T}}) where {T} = T
