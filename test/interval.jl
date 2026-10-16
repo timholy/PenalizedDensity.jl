@@ -509,6 +509,28 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test IntervalDensityEstimate([0.0, 1.0], [1.0, 2.0], 1.0) isa IntervalDensityEstimate
     end
 
+    @testset "nobs and the inner constructor" begin
+        d = IntervalDensityEstimate([0.0, 0.5, 1.0, 1.0], [0.0, 0.5, Inf, Inf], 1.0)
+        @test nobs(d) === 4.0
+        x = round.([-1.23, -0.52, -0.48, 0.07, 0.11, 0.13, 0.66, 1.41]; digits=1)
+        @test nobs(IntervalDensityEstimate(x, 2.0; resolution=0.1)) == length(x)
+        xp = [0.0, 0.0, 0.3, 1.0]
+        @test nobs(IntervalDensityEstimate(xp, xp, 1.0)) == nobs(DensityEstimate(xp, 1.0)) == 4
+        @test nobs(IntervalDensityEstimate(Float32[0, 1], Float32[0.5, 2], 1.0f0)) isa Float32
+
+        f = Any[getfield(d, n) for n in fieldnames(typeof(d))]
+        IDE = typeof(d)
+        @test IDE(f...).ψ == d.ψ
+        bad = copy(f); bad[2] = d.w[1:end-1]
+        @test_throws "equal length" IDE(bad...)
+        bad = copy(f); bad[4] = [d.k2; 0.0]
+        @test_throws "one value per cell" IDE(bad...)
+        bad = copy(f); bad[7] = [1.0]
+        @test_throws "one rate per inter-node interval" IntervalDensityEstimate{Float64,Vector{Float64}}(bad...)
+        bad = copy(f); bad[12] = [PenalizedDensity._IntervalGroup{Float64}(0, length(d.x) + 1, 1.0)]
+        @test_throws "outside" IDE(bad...)
+    end
+
     @testset "show and the abstract supertype" begin
         d = IntervalDensityEstimate([0.0, 0.5, 1.0], [0.0, 0.5, Inf], 1.0)
         @test d isa AbstractDensityEstimate

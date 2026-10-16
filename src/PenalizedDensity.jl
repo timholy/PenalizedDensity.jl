@@ -8,14 +8,14 @@ using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
 using Random: Random, AbstractRNG, Repetition, SamplerSimple
 using Statistics: Statistics, mean, quantile, std, var
-using StatsAPI: StatsAPI, pvalue
+using StatsAPI: StatsAPI, nobs, pvalue
 
 export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support
 export Adaptive, AdaptiveScale, WindowScale, WindowRule
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
-export cdf, quantile, mean, var, std
+export cdf, quantile, mean, var, std, nobs
 export gaussianize, ungaussianize, gaussianize_logjacobian
 
 """
@@ -23,13 +23,26 @@ export gaussianize, ungaussianize, gaussianize_logjacobian
 
 Supertype of the fitted densities: [`DensityEstimate`](@ref) (point observations) and
 [`IntervalDensityEstimate`](@ref) (interval observations, optionally mixed with points). Every
-subtype is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
-[`logdensity`](@ref), [`cdf`](@ref), and [`quantile`](@ref Statistics.quantile).
-Evaluating any of these at `NaN` throws a `DomainError`.
+subtype supports:
 
-Every subtype also supports the support queries [`minimum`](@ref Base.minimum),
-`maximum` and `extrema`, and sampling by inversion through `rand`: `rand(d)`,
-`rand(rng, d, dims...)` and `rand!(rng, A, d)` draw from the fitted density.
+- evaluation: `d(x)` (the density), [`amplitude`](@ref), [`logdensity`](@ref),
+  [`logdensity_eval_gradient`](@ref), [`cdf`](@ref) and [`quantile`](@ref Statistics.quantile).
+  Evaluating any of these at `NaN` throws a `DomainError`;
+- the support queries [`minimum`](@ref Base.minimum), `maximum` and `extrema`;
+- sampling by inversion through `rand`: `rand(d)`, `rand(rng, d, dims...)` and
+  `rand!(rng, A, d)` draw from the fitted density;
+- the fit's moments [`mean`](@ref Statistics.mean), [`var`](@ref Statistics.var) and
+  [`std`](@ref Statistics.std), and the observation count [`nobs`](@ref);
+- [`entropy`](@ref), [`negentropy`](@ref) (in-sample and held-out) and [`action`](@ref);
+- the probit transform [`gaussianize`](@ref), its inverse [`ungaussianize`](@ref), and
+  [`gaussianize_logjacobian`](@ref).
+
+The goodness-of-fit statistic ([`chisq`](@ref), [`chisq_reference`](@ref)) and
+[`logdensity_node_gradient`](@ref) are defined for [`DensityEstimate`](@ref) only.
+
+Every subtype has the fields `d.x` (the sorted, distinct nodes), `d.ψ` (the normalized
+amplitude at the nodes) and `d.κ` (the smoothing scale: one number, or a vector with one rate
+per cell between consecutive nodes). Other fields are specific to each subtype.
 
 # Interoperability
 
@@ -269,6 +282,17 @@ end
 # unbounded fit is untouched.
 _show_support(d::DensityEstimate) =
     isinf(d.lo) && isinf(d.hi) ? "" : ", support=[$(d.lo), $(d.hi)]"
+"""
+    nobs(d::AbstractDensityEstimate) -> N
+
+The number of observations underlying the fit `d`, counting each point and each interval
+observation once (merged repeats count with their multiplicity). It has `d`'s element type.
+Extends `StatsAPI.nobs`.
+"""
+StatsAPI.nobs(::AbstractDensityEstimate)
+
+StatsAPI.nobs(d::DensityEstimate) = sum(d.w)
+
 Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length(d.x)) distinct nodes, $(sum(d.w)) total weight, $(_show_kappa(d)), λ=$(d.λ)$(_show_support(d))")
 
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
@@ -2045,6 +2069,9 @@ node sits on the log density's kink, where the gradient is one-sided. The return
 indexed like `d.x`; a caller that moved the nodes through some parameter contracts `g` with
 the node-position Jacobian to obtain the parameter gradient. See
 [`logdensity_eval_gradient`](@ref) for the sensitivity to the evaluation point instead.
+
+Defined for point data only: the nodes of an [`IntervalDensityEstimate`](@ref) are fixed
+interval endpoints, not movable sample points.
 """
 function logdensity_node_gradient(d::DensityEstimate{T,T}, yeval::AbstractVector,
                                   weights=nothing) where {T}
@@ -2122,6 +2149,8 @@ is the fitted amplitude. `Q` is any callable returning density values; it should
 a normalized density (`∫Q dx = 1`). `chisq(d, d) == 0`. Small χ² means `Q` is close
 to the data in the (squared Hellinger) sense. For its significance, build the reference law
 once with [`chisq_reference`](@ref) and pass the statistic to [`pvalue`](@ref).
+
+Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
 """
 function chisq(d::DensityEstimate{T}, Q) where {T}
     s = zero(T)
@@ -2344,6 +2373,8 @@ It is not, by itself, a finite-sample frequentist null distribution for data dra
 the fitted density; it is a Bayesian measure of likelihood among distributions sharing
 the same roughness penalty. Its calibration as a frequentist null distribution need not
 be distribution-free.
+
+Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
 
 # Extended help
 
@@ -2587,7 +2618,7 @@ This criterion resolves *information* and over-resolves smooth densities; to tar
 
 This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
 are derived for the unbounded line and do not generalize to a finite domain, so it always
-fits (and returns a scale for) the unbounded problem.
+fits (and returns a scale for) the unbounded problem. It also has no form for interval data.
 
 # Extended help
 
@@ -2609,7 +2640,8 @@ end
 The minimum-sensitivity score `s = |dS/d ln κ|` of the scale `κ` for data `x`, where `S` is the
 classical [`action`](@ref) of the unbounded fit [`DensityEstimate`](@ref)`(x, κ; rtol)`.
 [`select_kappa_ms`](@ref) returns the `κ` minimizing it; evaluating it over a range of `κ` shows
-how sharply that minimum is defined. The derivative is computed analytically.
+how sharply that minimum is defined. The derivative is computed analytically. Like
+`select_kappa_ms`, it takes point data only.
 """
 function action_sensitivity(x::AbstractVector{<:Real}, κ::Real; rtol::Real=cbrt(eps(float(eltype(x)))))
     xs, r = _sensitivity_sample(x, rtol)
@@ -2831,7 +2863,8 @@ end
 
 The least-squares cross-validation score of the constant scale `κ` for data `x`, the quantity
 [`select_kappa_lscv`](@ref) minimizes; the keywords mean what they do there. It is `NaN` when a
-leave-one-out density is undefined at `κ`.
+leave-one-out density is undefined at `κ`. Like `select_kappa_lscv`, it has no interval-data
+form.
 """
 function lscv(x::AbstractVector{<:Real}, κ::Real; support::Tuple{Real,Real}=(-Inf, Inf),
               rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,

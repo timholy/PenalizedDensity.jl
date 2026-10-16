@@ -108,6 +108,18 @@ end
         @test d(0.0) > d(2.0)                  # denser near the data
         @test all(≥(0), d.(range(-5, 5; length=101)))   # Q = ψ² ≥ 0
         @test startswith(sprint(show, d), "DensityEstimate with 3 distinct nodes, 4.0 total weight, κ=1.0, λ=2.8163")
+        @test nobs(d) === 4.0
+    end
+
+    @testset "inner constructor validates field shapes" begin
+        d = DensityEstimate([-1.0, 0.0, 0.5, 1.0], x -> 1 + x^2)
+        f = Any[getfield(d, n) for n in fieldnames(typeof(d))]
+        DE = typeof(d)
+        @test DE(f...).ψ == d.ψ
+        bad = copy(f); bad[2] = d.w[1:end-1]
+        @test_throws "equal length" DE(bad...)
+        bad = copy(f); bad[4] = [d.κ; 1.0]
+        @test_throws "one rate per inter-node interval" DE(bad...)
     end
 
     @testset "continuity at the nodes" begin

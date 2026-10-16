@@ -1337,10 +1337,11 @@ interval earns nothing. Rounded data are therefore never pulled toward point mas
 recorded values; the finest structure they can support is the histogram at the rounding
 increment.
 
-The result is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
-[`logdensity`](@ref), [`cdf`](@ref), [`quantile`](@ref Statistics.quantile), and the moments
-[`mean`](@ref Statistics.mean), [`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
-With point observations only, the fit equals `DensityEstimate(x, κ)`.
+The result is callable, `d(x)` giving the density, and supports every operation listed under
+[`AbstractDensityEstimate`](@ref): evaluation, sampling, moments, entropy and action, and the
+`gaussianize` family. The goodness-of-fit statistic [`chisq`](@ref) and
+[`logdensity_node_gradient`](@ref) are not defined for interval data. With point observations
+only, the fit equals `DensityEstimate(x, κ)`.
 
 # Examples
 ```jldoctest
@@ -1371,7 +1372,8 @@ points.
 
 The fields `d.x` (nodes), `d.ψ` (normalized amplitudes there), `d.k2` (the realized `k²` on
 each cell between nodes), and `d.kL`, `d.kR` (the tails' decay rates) describe the fitted
-curve.
+curve. `d.κ` is the smoothing scale. `d.w` counts only the point observations, so the total
+count is [`nobs`](@ref)`(d)`.
 """
 struct IntervalDensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     x::Vector{T}        # sorted distinct nodes: interval endpoints and points
@@ -1381,13 +1383,33 @@ struct IntervalDensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     kL::T               # decay rate of the left tail (its scale on a finite support)
     kR::T               # decay rate of the right tail
     κ::K                # smoothing scale: one number, or one per interior cell
-    κL::T
-    κR::T
-    lo::T
-    hi::T
-    groups::Vector{_IntervalGroup{T}}
+    κL::T               # smoothing scale of the left tail
+    κR::T               # smoothing scale of the right tail
+    lo::T               # left edge of the support; -Inf for an unbounded left tail
+    hi::T               # right edge of the support; +Inf for an unbounded right tail
+    groups::Vector{_IntervalGroup{T}}   # the distinct intervals, by cell range (private)
     λ::T                # normalization multiplier (diagnostic)
+
+    function IntervalDensityEstimate{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups,
+                                          λ) where {T<:AbstractFloat,K}
+        m = length(x)
+        length(w) == length(ψ) == m ||
+            throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
+                                    "got $m, $(length(w)), $(length(ψ))"))
+        length(k2) == m - 1 ||
+            throw(DimensionMismatch("k² needs one value per cell between nodes: " *
+                                    "got $(length(k2)) values for $m nodes"))
+        _check_interval_scale(κ, m)
+        for g in groups
+            0 <= g.first <= g.last <= m ||
+                throw(ArgumentError("interval group covers cells $(g.first):$(g.last), " *
+                                    "outside 0:$m (tails included) for $m nodes"))
+        end
+        return new{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups, λ)
+    end
 end
+
+StatsAPI.nobs(d::IntervalDensityEstimate{T}) where {T} = sum(d.w) + sum(g -> g.r, d.groups; init=zero(T))
 
 function IntervalDensityEstimate(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ;
                                  support::Tuple{Real,Real}=(-Inf, Inf),
@@ -1466,7 +1488,7 @@ end
 Base.eltype(::Type{<:IntervalDensityEstimate{T}}) where {T} = T
 
 function Base.show(io::IO, d::IntervalDensityEstimate)
-    nint = isempty(d.groups) ? 0 : sum(g -> g.r, d.groups)
+    nint = nobs(d) - sum(d.w)
     κstr = d.κ isa Real ? "κ=$(d.κ)" :
            "κ ∈ [$(min(d.κL, d.κR, minimum(d.κ; init=Inf))), $(max(d.κL, d.κR, maximum(d.κ; init=-Inf)))]"
     print(io, "IntervalDensityEstimate with $(length(d.x)) nodes, $(nint) interval and ",
