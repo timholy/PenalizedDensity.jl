@@ -97,7 +97,7 @@ function _check_support_bounds(support)
 end
 
 """
-    DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
+    DensityEstimate(x, κ; support=(-Inf, Inf), rtol=cbrt(eps(float(eltype(x)))))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -213,7 +213,7 @@ DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T}
     DensityEstimate{T,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 
 function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
-                         rtol::Real=cbrt(eps(R)), stats=nothing) where R<:Real
+                         rtol::Real=cbrt(eps(float(R))), stats=nothing) where R<:Real
     _check_rtol(rtol)
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
     lo, hi = _check_support_bounds(support)
@@ -417,7 +417,7 @@ function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}, nodeof=nothing) w
 end
 
 """
-    merge_samples(x, κ; rtol=cbrt(eps(eltype(x)))) -> (; nodes, weights, nodeindex)
+    merge_samples(x, κ; rtol=cbrt(eps(float(eltype(x))))) -> (; nodes, weights, nodeindex)
 
 Merge the sample `x` into the nodes and weights that `DensityEstimate(x, κ; rtol)` fits, and
 report which node each sample joined.
@@ -453,7 +453,7 @@ julia> m.nodeindex
  2
 ```
 """
-function merge_samples(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(R))) where {R<:Real}
+function merge_samples(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(float(R)))) where {R<:Real}
     _check_rtol(rtol)
     isempty(x) && throw(ArgumentError("cannot merge zero points"))
     return _merge_samples(x, κ, rtol)

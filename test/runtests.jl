@@ -908,6 +908,27 @@ end
         @test ao(0.7) ≈ a(0.7)
     end
 
+    @testset "integer data matches the same data as Float64" begin
+        xi = [-3, -1, 0, 0, 1, 2, 4, 7, 8, 12]
+        xf = float(xi)
+        d, df = DensityEstimate(xi, 0.5), DensityEstimate(xf, 0.5)
+        @test d.x == df.x && d.w == df.w && d.ψ == df.ψ
+        @test PenalizedDensity.merge_samples(xi, 0.5) == PenalizedDensity.merge_samples(xf, 0.5)
+        di, dif = IntervalDensityEstimate(xi, xi .+ 1, 0.5), IntervalDensityEstimate(xf, xf .+ 1, 0.5)
+        @test di.x == dif.x && di.ψ == dif.ψ
+        @test IntervalDensityEstimate(xi, 0.5; resolution=1).ψ == IntervalDensityEstimate(xf, 0.5; resolution=1).ψ
+        @test select_kappa(xi; resolution=0) == select_kappa(xf; resolution=0)
+        @test select_kappa(xi; resolution=1) == select_kappa(xf; resolution=1)
+        @test select_kappa(xi, xi .+ 1) == select_kappa(xf, xf .+ 1)
+        @test select_support(xi; resolution=0) == select_support(xf; resolution=0)
+        @test PenalizedDensity.klcv(xi, 0.5; resolution=0) == PenalizedDensity.klcv(xf, 0.5; resolution=0)
+        @test PenalizedDensity.klcv(xi, xi .+ 1, 0.5) == PenalizedDensity.klcv(xf, xf .+ 1, 0.5)
+        @test PenalizedDensity.lscv(xi, 0.5; resolution=0) == PenalizedDensity.lscv(xf, 0.5; resolution=0)
+        @test PenalizedDensity.select_kappa_lscv(xi; resolution=0) == PenalizedDensity.select_kappa_lscv(xf; resolution=0)
+        @test PenalizedDensity.select_kappa_ms(xi) == PenalizedDensity.select_kappa_ms(xf)
+        @test PenalizedDensity.action_sensitivity(xi, 0.5) == PenalizedDensity.action_sensitivity(xf, 0.5)
+    end
+
     @testset "broadcasting treats a fit as a scalar" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
         fits = (DensityEstimate(x, 1.1),
