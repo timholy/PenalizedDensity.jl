@@ -1308,6 +1308,20 @@ end
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
+            # Every call form validates and derives ln ḡ and the floor the same way.
+            D = typeof(p)
+            for make in ((c, α) -> AdaptiveScale(c, α, p), (c, α) -> AdaptiveScale{Float64}(c, α, p),
+                         (c, α) -> AdaptiveScale{Float64,D}(c, α, p))
+                @test_throws "exponent α must be positive" make(1.0, 0.0)
+                @test_throws "scale c must be positive" make(-1.0, 1.0)
+                k = make(3, 1 // 2)
+                @test k isa AdaptiveScale{Float64,D}
+                @test (k.c, k.α, k.loggbar, k.κmin) ==
+                      (3.0, 0.5, PenalizedDensity._log_geomean(p), 3e-6)
+            end
+            k32 = AdaptiveScale{Float32}(3.0, 0.5, p)
+            @test k32 isa AdaptiveScale{Float32} && k32.c === 3.0f0
+            @test_throws TypeError AdaptiveScale{Float64,Vector{Float64}}(3.0, 0.5, [1.0])
         end
     end
 
@@ -1353,6 +1367,9 @@ end
             @test sprint(show, k) == "WindowScale(c=2.0, γ=0.5) on a grid of 3 points"
             @test WindowScale(2.0f0, 0.5f0, Float32[0, 1], Float32[0, 1]) isa WindowScale{Float32}
             @test_throws "scale c must be positive" WindowScale(0.0, 1.0, [0.0, 1.0], [0.0, 0.0])
+            @test_throws "scale c must be positive" WindowScale{Float64}(0.0, 1.0, [0.0, 1.0], [0.0, 0.0])
+            k64 = WindowScale{Float64}(2, 1 // 2, [0, 1, 3], [1, -1, 0])
+            @test (k64.c, k64.γ, k64.x, k64.logb, k64.κmin) == (k.c, k.γ, k.x, k.logb, k.κmin)
             @test_throws "grid must be sorted" WindowScale(1.0, 1.0, [1.0, 0.0], [0.0, 0.0])
             @test_throws "must be finite" WindowScale(1.0, 1.0, [0.0, 1.0], [0.0, Inf])
             @test_throws DimensionMismatch WindowScale(1.0, 1.0, [0.0, 1.0], [0.0])

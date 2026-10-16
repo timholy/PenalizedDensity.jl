@@ -60,20 +60,20 @@ struct WindowScale{T<:AbstractFloat}
     logb::Vector{T}   # s on the grid
     κmin::T           # floor
 
-    function WindowScale{T}(c, γ, x, logb, κmin) where {T<:AbstractFloat}
+    function WindowScale{T}(c, γ, x, logb) where {T<:AbstractFloat}
+        c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
         axes(x) == axes(logb) ||
             throw(DimensionMismatch("the grid and its values must have the same axes, got $(axes(x)) and $(axes(logb))"))
         isempty(x) && throw(ArgumentError("the grid is empty"))
         issorted(x) || throw(ArgumentError("the grid must be sorted"))
         all(isfinite, logb) || throw(ArgumentError("the shape values must be finite"))
-        return new{T}(c, γ, collect(T, x), collect(T, logb), κmin)
+        return new{T}(c, γ, collect(T, x), collect(T, logb), T(_KAPPA_FLOOR) * T(c))
     end
 end
 
 function WindowScale(c::Real, γ::Real, x::AbstractVector{<:Real}, logb::AbstractVector{<:Real})
-    c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
     T = float(promote_type(typeof(c), typeof(γ), eltype(x), eltype(logb)))
-    return WindowScale{T}(c, γ, x, logb, T(_KAPPA_FLOOR) * T(c))
+    return WindowScale{T}(c, γ, x, logb)
 end
 
 function _window_shape_at(s::WindowScale, t::Real)
