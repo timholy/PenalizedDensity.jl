@@ -163,8 +163,12 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test action(di) ≈ action(d) rtol = 1e-10
             @test entropy(di, xe) ≈ entropy(d, xe) rtol = 1e-10
             @test negentropy(di, xe) ≈ negentropy(d, xe) rtol = 1e-8
-            tin = filter(t -> support[1] <= t <= support[2], ts)
+            tin = filter(t -> support[1] < t < support[2], ts)
             @test logdensity_eval_gradient(di, tin) ≈ logdensity_eval_gradient(d, tin) rtol = 1e-10
+            y = gaussianize(d, tin)
+            @test gaussianize(di, tin) ≈ y rtol = 1e-12
+            @test ungaussianize(di, y) ≈ ungaussianize(d, y) rtol = 1e-12
+            @test gaussianize_logjacobian(di, tin).logjac ≈ gaussianize_logjacobian(d, tin).logjac rtol = 1e-12
         end
     end
 
@@ -369,6 +373,67 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test @inferred(logdensity_eval_gradient(d32, 0.25f0)) isa Float32
     end
 
+    @testset "gaussianize, ungaussianize, gaussianize_logjacobian" begin
+        x = randn(Xoshiro(7), 200)
+        xr = round.(x; digits=1)
+        a, b = extrema(x)
+        fits = (rounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1),
+                censored = IntervalDensityEstimate([x[1:150]; fill(1.0, 50)], [x[1:150]; fill(Inf, 50)], 2.0),
+                leftcens = IntervalDensityEstimate([fill(-Inf, 30); x[31:200]], [fill(-1.0, 30); x[31:200]], 2.0),
+                bounded  = IntervalDensityEstimate(xr, 3.0; resolution=0.1, support=(a - 0.3, b + 0.5)),
+                varying  = IntervalDensityEstimate(xr, t -> 1 + abs(t - 3) / 2; resolution=0.1),
+                wide     = IntervalDensityEstimate([-1.0, 0.0, 0.5, 2.0], [-1.0, 0.0, 0.5, 60.0], 1.5))
+        h = 1e-6
+        for (name, d) in pairs(fits)
+            lo, hi = max(d.lo, d.x[1] - 3), min(d.hi, d.x[end] + 3)
+            ts = range(lo + 1e-3, hi - 1e-3; length=401)
+            y = gaussianize(d, ts)
+            @test issorted(y)
+            @test ungaussianize(d, y) ≈ ts rtol = 1e-12
+            @test Distributions.cdf.(Distributions.Normal(), y) ≈ cdf(d, ts) rtol = 1e-12
+            lj = gaussianize_logjacobian(d, ts)
+            @test lj.y == y
+            fd = log.((gaussianize(d, ts .+ h) .- gaussianize(d, ts .- h)) ./ (2h))
+            @test lj.logjac ≈ fd rtol = 1e-6
+            # Between the last two nodes the upper mass is assembled from the right.
+            total = quadgk(d, d.lo, d.x..., d.hi; rtol=1e-14)[1]
+            for t in range(d.x[end-1], d.x[end]; length=7)[2:end]
+                cc = quadgk(d, t, d.x[end], d.hi; rtol=1e-14)[1] / total
+                @test Distributions.ccdf(Distributions.Normal(), gaussianize(d, t)) ≈ cc rtol = 1e-12
+            end
+        end
+        # Deep in an unbounded tail F underflows, but y stays finite and inverts.
+        d = fits.censored
+        for t in (d.x[1] - 1000, d.x[end] + 1000)
+            y = gaussianize(d, t)
+            @test isfinite(y)
+            @test ungaussianize(d, y) ≈ t rtol = 1e-12
+        end
+        t = d.x[end] + 1000
+        lj = gaussianize_logjacobian(d, t)
+        @test lj.logjac ≈ logdensity(d, t) - Distributions.logpdf(Distributions.Normal(), lj.y) atol = 1e-9
+        # A finite wall maps to ∓Inf and back; within δ of it the mass beyond is ~Q̂(wall)·δ,
+        # still resolved to full relative precision.
+        d = fits.bounded
+        @test gaussianize(d, d.lo) == -Inf
+        @test gaussianize(d, d.hi) == Inf
+        @test gaussianize(d, d.hi + 1) == Inf
+        @test ungaussianize(d, -Inf) == d.lo
+        @test ungaussianize(d, Inf) == d.hi
+        @test gaussianize_logjacobian(d, d.hi + 1).logjac == -Inf
+        total = quadgk(d, d.lo, d.x..., d.hi; rtol=1e-14)[1]
+        for δ in (1e-4, 1e-8)
+            @test Distributions.ccdf(Distributions.Normal(), gaussianize(d, d.hi - δ)) ≈
+                  quadgk(d, d.hi - δ, d.hi)[1] / total rtol = 1e-12
+            @test Distributions.cdf(Distributions.Normal(), gaussianize(d, d.lo + δ)) ≈
+                  quadgk(d, d.lo, d.lo + δ)[1] / total rtol = 1e-12
+        end
+        d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
+        @test @inferred(gaussianize(d32, 0.25f0)) isa Float32
+        @test @inferred(ungaussianize(d32, 0.25f0)) isa Float32
+        @test gaussianize(d32, 0.25f0) ≈ gaussianize(fits.rounded, 0.25) rtol = 1e-4
+    end
+
     @testset "lattice data (resolution)" begin
         x = round.(randn(Xoshiro(1), 1000); digits=1)
         d = IntervalDensityEstimate(x, 3.0; resolution=0.1)
@@ -420,6 +485,9 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test axes(quantile(d, q)) == axes(q)
         @test axes(logdensity(d, q)) == axes(q)
         @test axes(logdensity_eval_gradient(d, q)) == axes(q)
+        @test axes(gaussianize(d, q)) == axes(q)
+        @test axes(ungaussianize(d, q)) == axes(q)
+        @test axes(gaussianize_logjacobian(d, q).logjac) == axes(q)
         @test_throws DimensionMismatch IntervalDensityEstimate([0.0, 1.0], [1.0], 1.0)
     end
 
