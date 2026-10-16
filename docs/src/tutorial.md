@@ -266,7 +266,8 @@ re-optimizes `κ` at every boundary candidate; see
 [`select_support`](@ref)'s docstring). The wall itself sits close to the data:
 
 ```@example bounded
-spacing = PenalizedDensity._edge_spacing(sort(x), :left)   # mean spacing of the 10 points nearest the edge
+xs = sort(x)
+spacing = (xs[10] - xs[1]) / 9      # mean spacing of the 10 points nearest the edge
 gap = minimum(x) - r.support[1]
 round(gap / spacing; digits=2)
 ```

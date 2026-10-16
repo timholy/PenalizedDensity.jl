@@ -17,6 +17,11 @@ export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile, mean, var, std, nobs
 export gaussianize, ungaussianize, gaussianize_logjacobian
+# `public` is a syntax error before Julia 1.11.
+if VERSION >= v"1.11"
+    eval(Expr(:public, :ConvergenceError, :SolveStats, :merge_samples, :roughness_operator,
+                       :select_kappa_lscv, :select_kappa_ms, :klcv, :lscv, :action_sensitivity))
+end
 
 """
     AbstractDensityEstimate
@@ -348,16 +353,14 @@ _reference_scale(κ::T, ::T, ::T) where {T} = κ
 _reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
     isempty(κs) ? sqrt(κL * κR) : exp(sum(log, κs) / length(κs))
 
-"""
-    _sorted_sample(x, T) -> xs::Vector{T}
-
-A sorted, one-based working copy of the sample `x`, whatever its axes. Every index the fit
-takes afterwards — into the sample, into a scale realized on it, into the merged nodes —
-is an index into this copy, and none of them escape, so the caller's axes have nothing to
-propagate to.
-
-A NaN in `x` throws an `ArgumentError`.
-"""
+# _sorted_sample(x, T) -> xs::Vector{T}
+#
+# A sorted, one-based working copy of the sample `x`, whatever its axes. Every index the fit
+# takes afterwards — into the sample, into a scale realized on it, into the merged nodes —
+# is an index into this copy, and none of them escape, so the caller's axes have nothing to
+# propagate to.
+#
+# A NaN in `x` throws an `ArgumentError`.
 function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
     xs = Vector{T}(undef, length(x))
     i = firstindex(xs)
@@ -627,7 +630,8 @@ end
     SolveStats()
 
 Mutable collector for diagnostics of the fixed-scale Newton solve. Pass one as the
-`stats` keyword to [`DensityEstimate`](@ref) to record how the solve behaved:
+`stats` keyword to [`DensityEstimate`](@ref) or [`IntervalDensityEstimate`](@ref) to record
+how the solve behaved:
 
 - `iterations`: the number of Newton steps taken (each a Hessian factorization that
   updated the amplitudes);
@@ -656,6 +660,12 @@ mutable struct SolveStats
     final_alpha::Float64
 end
 SolveStats() = SolveStats(0, 0, :none, NaN, NaN)
+
+function Base.show(io::IO, s::SolveStats)
+    s.reason === :none && return print(io, "SolveStats (no solve recorded)")
+    print(io, "SolveStats: ", s.iterations, " Newton steps, ", s.backtracks, " backtracks, stopped by :",
+          s.reason, " (final step ", s.final_step, ", α = ", s.final_alpha, ")")
+end
 
 # Stopping rule of the damped-Newton solvers, given the relative Newton correction `step` =
 # maxᵢ |Δᵢ|/xᵢ, its value `prevstep` at the previous iteration, and whether a step has been
@@ -689,22 +699,20 @@ function _positivity_cap(x::AbstractVector{T}, Δ::AbstractVector{T}) where {T}
     return α < one(T) ? α * oftype(α, 0.99) : α
 end
 
-"""
-    _solve_amplitude(M, w)    -> ψ
-
-Minimize the strictly convex potential `F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ` over `ψ > 0`
-by a damped Newton iteration with an SPD tridiagonal Hessian. The minimizer solves
-`Mψ = w ./ ψ`, i.e. the field equation at unit multiplier; the caller rescales it
-to impose normalization.
-
-Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
-along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
-Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
-roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
-tolerance. Reaching `maxiter` throws a [`ConvergenceError`](@ref).
-
-A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
-"""
+# _solve_amplitude(M, w) -> ψ
+#
+# Minimize the strictly convex potential `F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ` over `ψ > 0`
+# by a damped Newton iteration with an SPD tridiagonal Hessian. The minimizer solves
+# `Mψ = w ./ ψ`, i.e. the field equation at unit multiplier; the caller rescales it
+# to impose normalization.
+#
+# Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
+# along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
+# Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
+# roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
+# tolerance. Reaching `maxiter` throws a `ConvergenceError`.
+#
+# A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
 function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
                           stats::Union{Nothing,SolveStats}=nothing) where {T<:AbstractFloat}
     n = length(w)

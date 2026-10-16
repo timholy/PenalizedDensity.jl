@@ -274,6 +274,9 @@ end
         g = M * ψ .- w ./ ψ
         Δ = ldlt!(SymTridiagonal(M.dv .+ w ./ ψ .^ 2, copy(M.ev))) \ g
         @test maximum(abs.(Δ) ./ ψ) < 1e-9
+
+        @test sprint(show, PenalizedDensity.SolveStats()) == "SolveStats (no solve recorded)"
+        @test startswith(sprint(show, st2), "SolveStats: $(st2.iterations) Newton steps, $(st2.backtracks) backtracks, stopped by :$(st2.reason)")
     end
 
     @testset "scale equivariance" begin
@@ -2767,4 +2770,14 @@ end
     @test ExplicitImports.check_no_stale_explicit_imports(PenalizedDensity) === nothing
     @test ExplicitImports.check_all_explicit_imports_via_owners(PenalizedDensity) === nothing
     @test ExplicitImports.check_no_self_qualified_accesses(PenalizedDensity) === nothing
+end
+
+# Unexported names that are part of the API; `public` is visible from Julia 1.11 on.
+if VERSION >= v"1.11"
+    @testset "public API" begin
+        for n in (:ConvergenceError, :SolveStats, :merge_samples, :roughness_operator,
+                  :select_kappa_lscv, :select_kappa_ms, :klcv, :lscv, :action_sensitivity)
+            @test Base.ispublic(PenalizedDensity, n) && !Base.isexported(PenalizedDensity, n)
+        end
+    end
 end

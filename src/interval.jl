@@ -49,20 +49,18 @@ function _cell_series(z::T) where {T}
     return c, s, p, q, dp, dq
 end
 
-"""
-    _cell_coeffs(k2, h) -> (m11, m12, n11, n12, d11, d12)
-
-Coefficients of one interior cell of length `h` on which `u'' = k2 * u`, as functions of the
-endpoint values `v = (v₀, v₁)`:
-
-- `κ²·[uu']₀ʰ = vᵀ [m11 m12; m12 m11] v` (the boundary flux, times κ²);
-- `∫₀ʰ u² = vᵀ [n11 n12; n12 n11] v` (the cell mass);
-- `[d11 d12; d12 d11]`, the derivative of the mass matrix with respect to `k2`.
-
-The flux matrix's derivative with respect to `k2` is the mass matrix. `k2` may take either
-sign; the cell is admissible for `k2 * h² > -π²`. Every entry stays finite for large positive
-`k2 * h²`.
-"""
+# _cell_coeffs(k2, h) -> (m11, m12, n11, n12, d11, d12)
+#
+# Coefficients of one interior cell of length `h` on which `u'' = k2 * u`, as functions of the
+# endpoint values `v = (v₀, v₁)`:
+#
+# - `κ²·[uu']₀ʰ = vᵀ [m11 m12; m12 m11] v` (the boundary flux, times κ²);
+# - `∫₀ʰ u² = vᵀ [n11 n12; n12 n11] v` (the cell mass);
+# - `[d11 d12; d12 d11]`, the derivative of the mass matrix with respect to `k2`.
+#
+# The flux matrix's derivative with respect to `k2` is the mass matrix. `k2` may take either
+# sign; the cell is admissible for `k2 * h² > -π²`. Every entry stays finite for large positive
+# `k2 * h²`.
 function _cell_coeffs(k2::T, h::T) where {T}
     z = k2 * h^2
     if abs(z) <= 1
@@ -599,16 +597,14 @@ function _check_finite_eval(E::_PhiEval, L::_IntervalLayout, s)
         "density $(maximum(s)), beyond what the solve can represent; use a smaller κ"))
 end
 
-"""
-    _solve_interval(L; maxiter=200, stats=nothing) -> (s, E)
-
-Minimize the reduced objective Φ(s) over positive nodal densities by damped Newton with a
-banded Hessian and Armijo backtracking, stopping when the Newton correction reaches
-`eps(T)^(3/4)` relative to `s` or the floor roundoff imposes on it (`_newton_stop`, shared with
-`_solve_amplitude`). Returns the minimizer and the evaluation at it. Throws `_UnresolvableScale`
-if an accepted iterate has a non-finite gradient or Hessian, and a [`ConvergenceError`](@ref)
-on reaching `maxiter`.
-"""
+# _solve_interval(L; maxiter=200, stats=nothing) -> (s, E)
+#
+# Minimize the reduced objective Φ(s) over positive nodal densities by damped Newton with a
+# banded Hessian and Armijo backtracking, stopping when the Newton correction reaches
+# `eps(T)^(3/4)` relative to `s` or the floor roundoff imposes on it (`_newton_stop`, shared with
+# `_solve_amplitude`). Returns the minimizer and the evaluation at it. Throws `_UnresolvableScale`
+# if an accepted iterate has a non-finite gradient or Hessian, and a `ConvergenceError`
+# on reaching `maxiter`.
 function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing) where {T}
     m = length(L.y)
     bw = _bandwidth(L)
@@ -855,33 +851,31 @@ function _grad_Z(L::_IntervalLayout{T}, v::Vector{T}, gPs) where {T}
     return gZ
 end
 
-"""
-    _interval_loo(L; holdout=:location) -> (lp, ld)
-
-Held-out log-probabilities for interval data: `lp[j]` is `ln(P₋/Z₋)` for group `j` refitted
-with one of its observations deleted, and `ld[i]` the held-out log-density at node `i`
-(`NaN` where the node carries no point observation), with `holdout` choosing whether one point
-or the whole location is deleted, as for `_loo_density`. Entries are `NaN` where the
-deleted fit collapses (a non-positive held-out probability, density, or normalization).
-
-Both come from the full fit's Hessian without refitting. Each deletion is minimized over a
-local set of nodal amplitudes: those of the group losing the observation (or, for a point, of
-the groups occupying the cells beside it), widened by the groups occupying the adjacent cells.
-The terms of those groups and any point terms on those nodes are kept exact, with the
-multiplicity or point weight reduced; the rest of the problem enters through its quadratic
-model in the amplitudes, reduced onto the local nodes by the Schur complement `(K_ll)⁻¹ - A`
-(`K` the inverse Hessian in amplitudes, `A` the Hessian of the exact terms). The remaining
-nodes follow the quadratic model, which carries the normalization to first order. The exact
-terms matter where the smoothing length is well below the interval width: deleting an
-observation then reshapes the field across its own and the neighboring intervals. The
-quadratic model is taken in amplitudes because empty cells are exactly quadratic there. A
-point bordered only by empty cells uses the nonlinear step of the point-data score. Where a
-deletion leaves a stretch with no observations (a singleton interval, or a location deleted
-whole, bordered only by empty cells), the held-out value comes from the source-free
-stationarity there in the log domain, as in `_loo_terms`, so that it keeps its relative accuracy
-when it is of order e^{-2κ·gap}. Cost is `O(m·bw²)` for the band of the inverse plus a few
-small solves per group and per point beside an occupied cell.
-"""
+# _interval_loo(L; holdout=:location) -> (lp, ld)
+#
+# Held-out log-probabilities for interval data: `lp[j]` is `ln(P₋/Z₋)` for group `j` refitted
+# with one of its observations deleted, and `ld[i]` the held-out log-density at node `i`
+# (`NaN` where the node carries no point observation), with `holdout` choosing whether one point
+# or the whole location is deleted, as for `_loo_density`. Entries are `NaN` where the
+# deleted fit collapses (a non-positive held-out probability, density, or normalization).
+#
+# Both come from the full fit's Hessian without refitting. Each deletion is minimized over a
+# local set of nodal amplitudes: those of the group losing the observation (or, for a point, of
+# the groups occupying the cells beside it), widened by the groups occupying the adjacent cells.
+# The terms of those groups and any point terms on those nodes are kept exact, with the
+# multiplicity or point weight reduced; the rest of the problem enters through its quadratic
+# model in the amplitudes, reduced onto the local nodes by the Schur complement `(K_ll)⁻¹ - A`
+# (`K` the inverse Hessian in amplitudes, `A` the Hessian of the exact terms). The remaining
+# nodes follow the quadratic model, which carries the normalization to first order. The exact
+# terms matter where the smoothing length is well below the interval width: deleting an
+# observation then reshapes the field across its own and the neighboring intervals. The
+# quadratic model is taken in amplitudes because empty cells are exactly quadratic there. A
+# point bordered only by empty cells uses the nonlinear step of the point-data score. Where a
+# deletion leaves a stretch with no observations (a singleton interval, or a location deleted
+# whole, bordered only by empty cells), the held-out value comes from the source-free
+# stationarity there in the log domain, as in `_loo_terms`, so that it keeps its relative accuracy
+# when it is of order e^{-2κ·gap}. Cost is `O(m·bw²)` for the band of the inverse plus a few
+# small solves per group and per point beside an occupied cell.
 function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {T}
     holdout in (:location, :observation) ||
         throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
