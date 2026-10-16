@@ -111,6 +111,7 @@ end
 
 # S(k², x) = sinh(kx)/k, entire in k²; used where k² ≤ 0.
 _Sfun(k2::T, x::T) where {T} = x * _sfun(k2 * x^2)
+_Sfun(k2, x) = _Sfun(promote(k2, x)...)
 
 # ---------------------------------------------------------------------------------------------
 # Problem layout
@@ -1502,7 +1503,7 @@ _show_support(d::IntervalDensityEstimate) =
 # Evaluation
 
 # ψ on interior cell c at x ∈ [x_c, x_{c+1}].
-function _cell_amplitude(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T}
+function _cell_amplitude(d::IntervalDensityEstimate, c::Int, x::Real)
     x0, x1 = d.x[c], d.x[c+1]
     k2 = d.k2[c]
     if k2 > 0
@@ -1513,7 +1514,7 @@ function _cell_amplitude(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T}
     return (d.ψ[c] * _Sfun(k2, x1 - x) + d.ψ[c+1] * _Sfun(k2, x - x0)) / _Sfun(k2, x1 - x0)
 end
 
-function _cell_log_amplitude(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T}
+function _cell_log_amplitude(d::IntervalDensityEstimate, c::Int, x::Real)
     x0, x1 = d.x[c], d.x[c+1]
     k2 = d.k2[c]
     if k2 > 0
@@ -1525,39 +1526,40 @@ function _cell_log_amplitude(d::IntervalDensityEstimate{T}, c::Int, x::T) where 
            log(_Sfun(k2, x1 - x0))
 end
 
+# Computes in `promote_type(T, typeof(x))`, like the `DensityEstimate` methods.
 function _amplitude(d::IntervalDensityEstimate{T}, x::Real) where {T}
     _check_not_nan(x)
+    R = promote_type(T, typeof(x))
     xs = d.x
     m = length(xs)
-    xT = T(x)
-    if xT <= xs[1]
-        xT < d.lo && return zero(T)
-        return _left_tail_amplitude(d.ψ[1], d.kL, xT, xs[1], d.lo)
-    elseif xT >= xs[m]
-        xT > d.hi && return zero(T)
-        return _right_tail_amplitude(d.ψ[m], d.kR, xT, xs[m], d.hi)
+    if x <= xs[1]
+        x < d.lo && return zero(R)
+        return _left_tail_amplitude(d.ψ[1], d.kL, x, xs[1], d.lo)
+    elseif x >= xs[m]
+        x > d.hi && return zero(R)
+        return _right_tail_amplitude(d.ψ[m], d.kR, x, xs[m], d.hi)
     end
-    return _cell_amplitude(d, searchsortedlast(xs, xT), xT)
+    return _cell_amplitude(d, searchsortedlast(xs, x), x)
 end
 
 function _logdensity(d::IntervalDensityEstimate{T}, x::Real) where {T}
     _check_not_nan(x)
+    R = promote_type(T, typeof(x))
     xs = d.x
     m = length(xs)
-    xT = T(x)
-    if xT <= xs[1]
-        xT < d.lo && return T(-Inf)
-        return 2 * _log_left_tail_amplitude(d.ψ[1], d.kL, xT, xs[1], d.lo)
-    elseif xT >= xs[m]
-        xT > d.hi && return T(-Inf)
-        return 2 * _log_right_tail_amplitude(d.ψ[m], d.kR, xT, xs[m], d.hi)
+    if x <= xs[1]
+        x < d.lo && return R(-Inf)
+        return 2 * _log_left_tail_amplitude(d.ψ[1], d.kL, x, xs[1], d.lo)
+    elseif x >= xs[m]
+        x > d.hi && return R(-Inf)
+        return 2 * _log_right_tail_amplitude(d.ψ[m], d.kR, x, xs[m], d.hi)
     end
-    return 2 * _cell_log_amplitude(d, searchsortedlast(xs, xT), xT)
+    return 2 * _cell_log_amplitude(d, searchsortedlast(xs, x), x)
 end
 
 # ψ'(x)/ψ(x) on interior cell c. A cell with k² ≤ 0 has |k|h < π, so S is positive and
 # bounded across it and the direct ratio does not underflow.
-function _amplitude_slope(d::IntervalDensityEstimate{T}, c::Integer, x::T) where {T}
+function _amplitude_slope(d::IntervalDensityEstimate, c::Integer, x::Real)
     x0, x1 = d.x[c], d.x[c+1]
     k2 = d.k2[c]
     if k2 > 0

@@ -632,6 +632,18 @@ end
         @test @inferred(gaussianize(d32, 0.5)) isa Float32
         @test @inferred(ungaussianize(d32, 0.5)) isa Float32
         @test @inferred(gaussianize_logjacobian(d32, 0.5)) isa NamedTuple{(:y, :logjac),Tuple{Float32,Float32}}
+        # Pointwise evaluation promotes with the argument, including in a bounded boundary
+        # segment and outside the support.
+        d32b = DensityEstimate(Float32[0.2, 0.5, 1], 1.0f0; support=(0.0f0, Inf32))
+        for dd in (d32, d32b), t in (-2.0, 0.1, 0.5, 3.0)
+            @test @inferred(logdensity(dd, t)) isa Float64
+            @test @inferred(dd(t)) isa Float64
+            @test @inferred(amplitude(dd, t)) isa Float64
+            @test @inferred(logdensity_eval_gradient(dd, t)) isa Float64
+            @test @inferred(logdensity(dd, Float32(t))) isa Float32
+            @test @inferred(logdensity_eval_gradient(dd, Float32(t))) isa Float32
+            @test dd(t) ≈ dd(Float32(t)) rtol = 1e-5
+        end
 
         # Generic indexing: array methods preserve the argument's axes.
         xo = OffsetArray([-0.5, 0.0, 0.5], -2)
