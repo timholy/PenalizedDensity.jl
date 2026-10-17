@@ -2506,6 +2506,28 @@ end
         end
     end
 
+    @testset "boundary-segment inversion converges and round-trips" begin
+        # Steep boundary segments (κ·width up to ~25) carry little mass, most of it near the
+        # node: a partial mass formed as a difference of nearly equal masses there loses the
+        # precision the inversion needs.
+        ys = range(-8, 8; length=1601)
+        qs = [range(0, 1e-3; length=501); range(1 - 1e-3, 1; length=501)]
+        for seed in 1:3, N in (100, 500), κ in (3.0, 10.0), sup in ((-5.0, 5.0), (-4.0, 6.0))
+            x = clamp.(randn(Xoshiro(seed), N), sup[1] + 0.01, sup[2] - 0.01)
+            for d in (DensityEstimate(x, κ; support=sup),
+                      IntervalDensityEstimate(round.(x; digits=1), κ; resolution=0.1, support=sup),
+                      DensityEstimate(Float32.(x), Float32(κ); support=Float32.(sup)))
+                xs = ungaussianize.(d, ys)
+                @test issorted(xs) && all(t -> d.lo <= t <= d.hi, xs)
+                @test issorted(quantile.(d, qs))
+                # x → y → x across both boundary segments. (The y → x → y direction is
+                # limited near a wall by the spacing of floats in x, not by the inversion.)
+                xb = [range(d.lo, d.x[1]; length=201); range(d.x[end], d.hi; length=201)]
+                @test ungaussianize.(d, gaussianize.(d, xb)) ≈ xb atol = 200 * eps(eltype(d)(5))
+            end
+        end
+    end
+
     @testset "_boundary_mass_from_node stays cancellation-free as v → u" begin
         Random.seed!(55)
         for _ in 1:50
