@@ -1505,34 +1505,36 @@ end
 # Unnormalized cumulative mass at x within interval k (xs[k] ≤ x ≤ xs[k+1]). The partial
 # mass is integrated from the nearer node — subtracting from F[k+1] when x lies in the
 # right half — so its absolute error vanishes toward both nodes and the CDF stays
-# continuous and monotone through every node.
+# continuous and monotone through every node. The subtraction keeps full relative
+# precision only while its result is at least F[k+1]/2. Since the result is at least F[k],
+# that is guaranteed when F[k] ≥ F[k+1]/2; otherwise (a cell holding more mass than lies
+# below it, typically wide and steep next to a light node) a result below F[k+1]/2 is
+# recomputed as F[k] plus the integral from the left node across the whole of [xs[k], x].
 function _cdf_mass_interior(d::DensityEstimate, k::Int, x::Real)
     xs, ψ, F = d.x, d.ψ, d.F
     κ = _kappa(d, k)
     a = κ * (xs[k+1] - x)               # a, b ≥ 0 and a + b = θ
     b = κ * (x - xs[k])
     θ = a + b
-    if b <= θ / 2
-        return F[k] + _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
-    else
-        return F[k+1] - _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
-    end
+    b <= θ / 2 && return F[k] + _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
+    m = F[k+1] - _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
+    (2 * F[k] >= F[k+1] || 2 * m >= F[k+1]) && return m
+    return F[k] + _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
 end
 
 # Unnormalized mass above x within interval k (xs[k] ≤ x ≤ xs[k+1]): the complement-side
-# companion of _cdf_mass_interior, integrated from the nearer node so that its absolute
-# error vanishes toward both nodes. `d.G` holds the mass above each node (_node_cumulatives).
+# mirror of _cdf_mass_interior, with the same guard against cancellation in the subtraction
+# from G[k]. `d.G` holds the mass above each node (_node_cumulatives).
 function _ccdf_mass_interior(d::DensityEstimate, k::Int, x::Real)
     xs, ψ, G = d.x, d.ψ, d.G
     κ = _kappa(d, k)
     a = κ * (xs[k+1] - x)               # a, b ≥ 0 and a + b = θ
     b = κ * (x - xs[k])
     θ = a + b
-    if a <= θ / 2
-        return G[k+1] + _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
-    else
-        return G[k] - _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
-    end
+    a <= θ / 2 && return G[k+1] + _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
+    m = G[k] - _segmass(ψ[k], ψ[k+1], a, b, θ) / κ
+    (2 * G[k+1] >= G[k] || 2 * m >= G[k]) && return m
+    return G[k+1] + _segmass(ψ[k+1], ψ[k], b, a, θ) / κ
 end
 
 # Unnormalized mass above x, ∫_x^{hi} ψ² dt: the complement of `_cdf_mass`, with a boundary
@@ -1566,7 +1568,7 @@ function _ccdf_mass(d::AbstractDensityEstimate, xin::Real)
 end
 
 # ∫₀ʷ ψ̂(u)² du for the unit-coordinate interval field ψ̂(u) = (p sinh(θ-u) + q sinh(u))/sinh(θ),
-# with 0 ≤ w ≤ θ/2 and arem = θ - w; the physical mass over [x[k], x[k]+w/κ] is _segmass/κ.
+# with 0 ≤ w ≤ θ and arem = θ - w; the physical mass over [x[k], x[k]+w/κ] is _segmass/κ.
 # Two algebraically identical forms of the exact antiderivative:
 # - θ < 1: expanded per-power integrals ∫sinh²(θ-u), ∫sinh(θ-u)sinh(u), ∫sinh²(u), written
 #   through _sinhm/_coshm so the small-θ cancellation (relative error ~eps/θ² in the naive
@@ -1690,8 +1692,11 @@ function _invert_mass(d::AbstractDensityEstimate, massfun, lo::T, hi::T, y::T, t
         r == 0 && return y
         r < 0 ? (lo = y) : (hi = y)
         ynew = y - r / _amplitude(d, y)^2       # Newton: the CDF's derivative is ψ²
-        lo < ynew < hi || (ynew = (lo + hi) / 2)  # bisect when Newton leaves the bracket
+        # A Newton step that rounds to zero means y is converged. Test it before the bracket:
+        # y is itself an endpoint of the updated bracket, so the strict test would reject it.
         ynew == y && return y
+        lo < ynew < hi || (ynew = (lo + hi) / 2)  # bisect when Newton leaves the bracket
+        ynew == y && return y                     # the bracket has closed to adjacent floats
         y = ynew
     end
     throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
@@ -1699,11 +1704,11 @@ end
 
 # `cq` is the upper-tail probability 1 - q. Callers that know it more precisely than `1 - q`
 # (`_ungaussianize`, from ln(1 - Φ(y))) pass it; for q ≥ 1/2 the default is exact. The right
-# side is solved through it: the unbounded tail in closed form, and the boundary segment by
-# inverting the mass above y, `_ccdf_mass`, against the target cq·total. `_ccdf_mass` is
-# accumulated from the wall, so it keeps full relative precision where `total - _cdf_mass`
-# would cancel to the resolution of `total`. It is negated so that `_invert_mass` sees an
-# increasing function.
+# side is solved through it: the unbounded tail in closed form, and the boundary segment and
+# any interior cell with q > cq by inverting the mass above y (`_ccdf_mass`,
+# `_ccdf_mass_interior`) against the target cq·total. That mass is accumulated from the right,
+# so it keeps full relative precision where `total - _cdf_mass` would cancel to the
+# resolution of `total`. It is negated so that `_invert_mass` sees an increasing function.
 function _quantile(d::AbstractDensityEstimate, qin::Real, cqin::Real = 1 - qin)
     0 <= qin <= 1 || throw(DomainError(qin, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
     xs, ψ, F, G, total = d.x, d.ψ, d.F, d.G, d.total
@@ -1725,10 +1730,28 @@ function _quantile(d::AbstractDensityEstimate, qin::Real, cqin::Real = 1 - qin)
         y = G[n] > 0 ? d.hi - (ctarget / G[n]) * (d.hi - xs[n]) : d.hi
         return _invert_mass(d, t -> -_ccdf_mass(d, t), xs[n], d.hi, y, -ctarget)
     end
+    q <= cq ? _quantile_interior_lower(d, target) : _quantile_interior_upper(d, cq * total)
+end
+
+# The interior cases of `_quantile`, kept in separate functions so that each closure captures a
+# cell index that is assigned once (a reassigned captured variable is boxed).
+function _quantile_interior_lower(d::AbstractDensityEstimate, target)
+    xs, F = d.x, d.F
     k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
     lok, hik = xs[k], xs[k+1]
     y = lok + (target - F[k]) / (F[k+1] - F[k]) * (hik - lok)  # linear-in-mass start
     return _invert_mass(d, t -> _cdf_mass_interior(d, k, t), lok, hik, y, target)
+end
+
+# Upper half: solved against ctarget = cq·total through the mass above y, as for the right
+# segment.
+function _quantile_interior_upper(d::AbstractDensityEstimate, ctarget)
+    xs, G = d.x, d.G
+    # G[k] ≥ ctarget > G[k+1]
+    k = clamp(searchsortedlast(G, ctarget, Base.Order.Reverse), 1, length(xs) - 1)
+    lok, hik = xs[k], xs[k+1]
+    y = hik - (ctarget - G[k+1]) / (G[k] - G[k+1]) * (hik - lok)  # linear-in-mass start
+    return _invert_mass(d, t -> -_ccdf_mass_interior(d, k, t), lok, hik, y, -ctarget)
 end
 
 # ln Φ(t), through erfcx so it stays exact into the deep lower tail (Φ itself underflows

@@ -2528,6 +2528,46 @@ end
         end
     end
 
+    @testset "interior-cell masses keep relative precision" begin
+        # A heavy node, then a wide, steep cell, then a light far node: the mass beyond a point
+        # in the cell is a tiny fraction of the mass beyond the heavy node, so forming it as a
+        # difference from the heavy node's cumulative would cancel. The reference is the same
+        # fit evaluated in BigFloat.
+        bigfit(d::DensityEstimate) =
+            DensityEstimate{BigFloat}(big.(d.x), big.(d.w), big.(d.ψ), big(d.κ), big(d.κL),
+                                      big(d.κR), big(d.lo), big(d.hi), big(d.λ))
+        bigfit(d::IntervalDensityEstimate) =
+            IntervalDensityEstimate{BigFloat}(big.(d.x), big.(d.w), big.(d.ψ), big.(d.k2),
+                big(d.kL), big(d.kR), big(d.κ), big(d.κL), big(d.κR), big(d.lo), big(d.hi),
+                [PenalizedDensity._IntervalGroup{BigFloat}(g.first, g.last, big(g.r)) for g in d.groups],
+                big(d.λ))
+        cdfm, ccdfm = PenalizedDensity._cdf_mass, PenalizedDensity._ccdf_mass
+        for sgn in (1, -1), κ in (3.0, 10.0), interval in (false, true)
+            data = sgn .* vcat(0.3 .* randn(Xoshiro(2), 200), fill(1.0, 100_000), 5.0)
+            d = interval ? IntervalDensityEstimate(round.(data; digits=1), κ; resolution=0.1) :
+                           DensityEstimate(data, κ)
+            db = bigfit(d)
+            k = argmax(diff(d.x))           # the wide cell between the heavy and far nodes
+            xs = range(d.x[k], d.x[k+1]; length=102)[2:end-1]
+            # gaussianize feeds Φ⁻¹ the smaller tail mass; it must carry full relative precision.
+            for x in xs
+                mlo, mhi, mlob, mhib = cdfm(d, x), ccdfm(d, x), cdfm(db, big(x)), ccdfm(db, big(x))
+                m, mb = mlo <= mhi ? (mlo, mlob) : (mhi, mhib)
+                @test m ≈ mb rtol = 64 * eps()
+            end
+            # ungaussianize: the tail probability at the returned x matches the target to within
+            # what the float spacing of x allows.
+            ys = range(extrema(gaussianize.(d, xs))...; length=201)
+            xq = ungaussianize.(d, ys)
+            @test issorted(xq)
+            for (y, x) in zip(ys, xq)
+                p = exp(PenalizedDensity._logΦ(-abs(y)))
+                pb = (y <= 0 ? cdfm(db, big(x)) : ccdfm(db, big(x))) / db.total
+                @test abs(pb - p) <= 64 * eps() * p + 4 * d(x) * eps(x)
+            end
+        end
+    end
+
     @testset "_boundary_mass_from_node stays cancellation-free as v → u" begin
         Random.seed!(55)
         for _ in 1:50
