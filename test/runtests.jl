@@ -1291,6 +1291,43 @@ end
             # Reachable through the public API: ten coincident points and one other merge to two
             # nodes, where no κ yields a finite leave-one-out score.
             @test_throws "no κ in kappas" select_kappa(vcat(fill(0.0, 10), [100.0]); resolution=0)
+            # A minimum at either end of a given grid is an error.
+            @test_throws "the minimum is at the upper end of kappas (κ = 100.0" mog(κ -> (log(κ) - log(500.0))^2, κs)
+            @test_throws "the minimum is at the lower end of kappas (κ = 0.1" mog(κ -> (log(κ) - log(0.01))^2, κs)
+            # An extensible (default) grid grows past either end until the minimum is inside,
+            # and reports the range it searched.
+            sg(score; kw...) = PenalizedDensity._search_grid(score, κs, Float64; extend=true, kw...)
+            κ, κlo, κhi = sg(κ -> (log(κ) - log(500.0))^2)
+            @test κ ≈ 500 rtol=1e-6
+            @test κlo ≈ first(κs) && 500 < κhi < 1e5
+            κ, κlo, κhi = sg(κ -> (log(κ) - log(0.01))^2)
+            @test κ ≈ 0.01 rtol=1e-6
+            @test 1e-4 < κlo < 0.01 && κhi ≈ last(κs)
+            @test all(sg(κ -> (log(κ) - log(3.0))^2)[2:3] .≈ (first(κs), last(κs)))  # interior: no growth
+            # ... but not past κmax, where a minimum at the top is accepted.
+            κ, _, κhi = sg(κ -> (log(κ) - log(1e4))^2; κmax=300.0)
+            @test κhi ≈ 300 && 200 < κ <= 300
+            # ... and not without limit.
+            @test_throws "kept running off the default κ grid" sg(κ -> -log(κ))
+        end
+
+        @testset "edge minima through the selectors" begin
+            x = randn(Xoshiro(1), 200)
+            tiny = [0.01, 0.02, 0.03]
+            for sel in (select_kappa, select_kappa_lscv, select_kappa_sensitivity)
+                @test_throws PenalizedDensity.ConvergenceError sel(x; kappas=tiny)
+                @test_throws "the minimum is at the upper end of kappas (κ = 0.03)" sel(x; kappas=tiny)
+                @test_throws "at the lower end of kappas (κ = 100.0)" sel(x; kappas=[100.0, 200.0, 300.0])
+            end
+            @test_throws "at the upper end of kappas" select_support(x; kappas=tiny)
+            z = round.(x ./ 0.25) .* 0.25
+            @test_throws "at the upper end of kappas" select_kappa(z; resolution=0.25, kappas=tiny)
+            # A default grid extends: Cauchy data spread the default grid far below the bulk's scale.
+            xc = tan.(π .* (rand(Xoshiro(2), 1000) .- 0.5))
+            κs = PenalizedDensity._default_κs(xc)
+            κ = select_kappa_sensitivity(xc)
+            @test κ > last(κs)
+            @test κ ≈ select_kappa_sensitivity(xc; kappas=exp.(range(log(first(κs)), log(10last(κs)); length=60))) rtol=1e-4
         end
 
         @testset "an unresolvable candidate scores NaN" begin
