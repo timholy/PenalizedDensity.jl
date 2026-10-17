@@ -1307,7 +1307,8 @@ overlap (overlapping intervals throw an `ArgumentError`).
 
 The second form is for data recorded on a lattice of spacing `resolution` (rounded values):
 each `x[i]` stands for the interval `[x[i] - resolution/2, x[i] + resolution/2]`, clipped to the
-support. Every `x[i]` must lie on one lattice `x₀ + k·resolution` (within `resolution/1000`),
+support; a value whose interval does not overlap the interior of the support throws a
+`DomainError`. Every `x[i]` must lie on one lattice `x₀ + k·resolution` (within `resolution/1000`),
 or an `ArgumentError` names the first value that does not.
 
 `κ` and `support` have the same meaning as for [`DensityEstimate`](@ref): a positive number or
@@ -1463,8 +1464,9 @@ end
 _interval_eltype(R, κ, lower, upper, rtol, a, b) =
     float(promote_type(R, typeof(rtol), _kappa_eltype(κ, lower, upper), _support_eltype(a), _support_eltype(b)))
 
-# The rounding interval of each lattice value. Bounds are formed from integer lattice indices so
-# that adjacent intervals share their endpoint exactly.
+# The rounding interval of each lattice value, clipped to the support. Bounds are formed from
+# integer lattice indices so that adjacent intervals share their endpoint exactly. A cell that
+# straddles a wall is clipped; one that does not overlap the support's interior throws.
 function _lattice_bounds(x::AbstractVector, δ::T, support) where {T}
     _check_finite_observations(x, T)
     x0 = T(minimum(x))
@@ -1476,8 +1478,11 @@ function _lattice_bounds(x::AbstractVector, δ::T, support) where {T}
         k = round((xi - x0) / δ)
         abs(xi - (x0 + k * δ)) <= δ / 1000 ||
             throw(ArgumentError("value $xi is not on the lattice $x0 + k·$δ; check `resolution`"))
-        lower[i] = max(x0 + (k - T(1) / 2) * δ, T(lo))
-        upper[i] = min(x0 + (k + T(1) / 2) * δ, T(hi))
+        cl, cu = x0 + (k - T(1) / 2) * δ, x0 + (k + T(1) / 2) * δ
+        lower[i] = max(cl, T(lo))
+        upper[i] = min(cu, T(hi))
+        lower[i] < upper[i] ||
+            throw(DomainError(xi, "data point $xi (rounding cell [$cl, $cu]) lies outside the support [$lo, $hi]"))
     end
     return lower, upper
 end
