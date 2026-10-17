@@ -13,7 +13,7 @@ using Aqua
 using ExplicitImports
 
 # Bytes allocated by one `_logΦ!` sweep, measured behind a function barrier: called with
-# untyped arguments the sweep's `Tuple{Float64,Float64}` return is boxed at the call site,
+# untyped arguments the sweep's `ComplexF64` return is boxed at the call site,
 # which would be charged to the callee. The first call compiles.
 function sweep_allocated(piv, rhs, r, u)
     PenalizedDensity._logΦ!(piv, rhs, r, u)
@@ -1562,8 +1562,8 @@ end
         # A single point: χ² is exactly a scaled χ²₁ (one generalized-χ² weight = the mean).
         d1 = DensityEstimate([0.7], 1.5); r1 = ChisqReference(d1)
         e1 = mean(r1)
-        @test chisq_ccdf(r1, e1) ≈ 0.3173105 rtol = 1e-3       # P(Z² ≥ 1)
-        @test chisq_ccdf(r1, 4 * e1) ≈ 0.0455003 rtol = 1e-3   # P(Z² ≥ 4)
+        @test chisq_ccdf(r1, e1) ≈ 0.31731050786291404 rtol = 1e-8      # P(Z² ≥ 1)
+        @test chisq_ccdf(r1, 4 * e1) ≈ 0.04550026389635842 rtol = 1e-8  # P(Z² ≥ 4)
         @test chisq_ccdf(r1, 0.0) ≈ 1 atol = 1e-6
 
         # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
@@ -1590,6 +1590,22 @@ end
         @test all(≥(0), chisq_pdf.(Ref(r), grid))
         h = 1e-3
         @test -(chisq_ccdf(r, μ + h) - chisq_ccdf(r, μ - h)) / 2h ≈ chisq_pdf(r, μ) rtol = 1e-4
+        # A five-node fit with a small κ: the real-axis density integrand decays only
+        # algebraically, so the density must still match -d(ccdf)/dz, in the bulk and both tails.
+        x5 = -log.(rand(Xoshiro(5), 5))
+        r5 = ChisqReference(DensityEstimate(x5, 0.2select_kappa(x5); support=(minimum(x5) - 0.5, maximum(x5) + 0.5)))
+        μ5 = mean(r5)
+        for z in (0.1μ5, μ5, 2μ5, 6μ5)
+            h5 = 1e-4z
+            fd = -(chisq_ccdf(r5, z + h5; rtol=1e-10, atol=1e-12) - chisq_ccdf(r5, z - h5; rtol=1e-10, atol=1e-12)) / 2h5
+            @test chisq_pdf(r5, z) ≈ fd rtol = 1e-4 atol = 1e-8
+        end
+        # An unconverged inversion integral is an error, not a returned value.
+        @test_throws PenalizedDensity.ConvergenceError chisq_pdf(r5, 2μ5; rtol=0, atol=1e-300)
+        @test_throws "chisq_pdf: the inversion integral at z = " chisq_pdf(r5, 2μ5; rtol=0, atol=1e-300)
+        @test_throws "chisq_ccdf: the inversion integral at z = " chisq_ccdf(r5, 2μ5; rtol=0, atol=1e-300)
+        @test_throws "chisq_ccdf: the inversion integral at z = 2.0 did not converge (error estimate 0.001, tolerance 1.0e-5)" PenalizedDensity._check_quadrature("chisq_ccdf", 2.0, 0.5, 1e-3, 0.0, 1e-5)
+        @test PenalizedDensity._check_quadrature("chisq_ccdf", 2.0, 0.5, 1e-4, 0.0, 1e-5) === nothing
         # At the median the tail integral is ~0; evaluation must still terminate.
         a, b = 0.5μ, 2μ
         for _ in 1:60
@@ -1631,6 +1647,7 @@ end
         @test r.tg ≈ r.tri * r.g
         piv, rhs = PenalizedDensity._logΦ_scratch(r)
         @test sweep_allocated(piv, rhs, r, 0.7) == 0
+        @test sweep_allocated(piv, rhs, r, 0.7 * cis(0.3)) == 0
 
         # Generic indexing: OffsetArray input gives an identical reference.
         ro = ChisqReference(DensityEstimate(OffsetArray(x, -75), d.κ))

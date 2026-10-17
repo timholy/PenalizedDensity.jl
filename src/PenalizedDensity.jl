@@ -2477,27 +2477,31 @@ Statistics.mean(r::ChisqReference) = r.mean
 _logΦ_scratch(r::ChisqReference{T}) where {T} =
     (Vector{Complex{T}}(undef, length(r.g)), Vector{Complex{T}}(undef, length(r.g)))
 
-# (unwrapped arg, modulus) of Φ(u) = det(I + iuA), A = tri⁻¹ - g gᵀ. The determinant of
-# I+iu·tri⁻¹ is a ratio of tridiagonal determinants (continuant recurrence, accumulated in
-# log space so the phase unwraps past π); the rank-one term is one complex tridiagonal solve.
-# Both O(N) and, given the scratch buffers `piv`/`rhs` (length N), allocation-free.
+# log Φ(w), Φ(w) = det(I + iwA), A = tri⁻¹ - g gᵀ, for real or complex `w` with Re w ≥ 0: its
+# real part is ln|Φ| and its imaginary part the phase, unwrapped past π. The determinant of
+# I+iw·tri⁻¹ is a ratio of tridiagonal determinants (continuant recurrence, accumulated in
+# log space); the rank-one term is one complex tridiagonal solve. Both O(N) and, given the
+# scratch buffers `piv`/`rhs` (length N), allocation-free.
 #
-# The continuant pivots rrₖ of `tri + iuI` are exactly the Thomas pivots of that system, so a
+# The continuant pivots rrₖ of `tri + iwI` are exactly the Thomas pivots of that system, so a
 # single forward sweep computes the log-determinant and eliminates the RHS `tg = tri·g`; a
-# back-substitution then yields y = (tri+iuI)⁻¹ tg. `piv` holds the pivots for the back sweep,
-# `rhs` the eliminated RHS overwritten in place with y.
+# back-substitution then yields y = (tri+iwI)⁻¹ tg. `piv` holds the pivots for the back sweep,
+# `rhs` the eliminated RHS overwritten in place with y. For Re w > 0 every pivot has positive
+# imaginary part (Im rrₖ = Re w + βₖ₋₁² Im rrₖ₋₁/|rrₖ₋₁|²), so the sum of their principal logs
+# is continuous in w.
 function _logΦ!(piv::Vector{Complex{T}}, rhs::Vector{Complex{T}},
-                r::ChisqReference{T}, u::Real) where {T}
+                r::ChisqReference{T}, w::Number) where {T}
     a, β, tg = r.tri.dv, r.tri.ev, r.tg
     n = length(a)
+    iw = im * w
     r0 = complex(a[1])
-    rr = complex(a[1], u)                       # a[1] + iu
+    rr = a[1] + iw
     s = log(rr) - log(r0)
     piv[1] = rr
     rhs[1] = tg[1] / rr
     for k in 2:n
         r0 = a[k] - β[k-1]^2 / r0
-        rr = complex(a[k], u) - β[k-1]^2 / rr
+        rr = (a[k] + iw) - β[k-1]^2 / rr
         s += log(rr) - log(r0)
         piv[k] = rr
         rhs[k] = (tg[k] - β[k-1] * rhs[k-1]) / rr
@@ -2509,8 +2513,7 @@ function _logΦ!(piv::Vector{Complex{T}}, rhs::Vector{Complex{T}},
     for k in 1:n
         gy += r.g[k] * rhs[k]                     # g·y, with g real
     end
-    rank1 = 1 - complex(zero(T), u) * gy
-    return imag(s) + angle(rank1), exp(real(s)) * abs(rank1)
+    return s + log(1 - iw * gy)
 end
 
 # Inverse-Gaussian (Wald) survival at mean μ and shape μ²: the large-`N` shape of the
@@ -2548,7 +2551,8 @@ observed statistic it is a diagnostic significance; see [`pvalue`](@ref), and
 inversion. `method=:largeN` uses the inverse-Gaussian (Wald) shape of the large-`N` limit
 (Eq. 26), parameterized by the exact mean [`mean`](@ref Statistics.mean)`(ref)`; it is a
 closed form, far cheaper per call, and, like the exact law, defined at every scale. `rtol`
-and `atol` (default `sqrt(eps(T))`) are the tolerances of the `:exact` quadrature. The law is
+and `atol` (default `sqrt(eps(T))`) are the tolerances of the `:exact` quadrature, and a
+quadrature that does not reach them throws a `ConvergenceError`. The law is
 supported on `z > 0`: `z ≤ 0` gives `1`, `z = Inf` gives `0`, and `NaN` throws a `DomainError`.
 """
 function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
@@ -2558,12 +2562,41 @@ function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=s
     method === :largeN && return _wald_ccdf(r.mean, z)
     # atol is required: at the median of the law the integral is ~0, and a purely relative
     # tolerance would subdivide without end. It bounds the error in the probability by atol/π.
+    #
+    # Imhof: P = 1/2 - (1/π) ∫₀^∞ Im h(u)/u du with h(w) = Φ(w)^{-1/2} e^{izw/2}. Subtracting
+    # e^{-w/μ}, real on the real axis, makes (h(w) - e^{-w/μ})/w integrable at both ends and
+    # analytic for Re w > 0, so the integral is taken along the ray of `_imhof_ray` (see there).
     zT = T(z)
     piv, rhs = _logΦ_scratch(r)
-    f(u) = u == 0 ? (r.mean - zT) / 2 :
-        (θ = _logΦ!(piv, rhs, r, u); sin((θ[1] - zT * u) / 2) / (u * sqrt(θ[2])))
-    I, _ = quadgk(f, zero(T), T(Inf); rtol, atol)  # I ∈ [-π/2, π/2]
-    return clamp(one(T)/2 + I / T(π), zero(T), one(T))
+    eφ = _imhof_ray(r)
+    s = inv(r.mean)
+    f(t) = t == 0 ? imag(eφ * complex(s, (zT - r.mean) / 2)) :     # the limit t → 0
+        (w = t * eφ; imag(exp(zT * im * w / 2 - _logΦ!(piv, rhs, r, w) / 2) - exp(-s * w)) / t)
+    I, E = quadgk(f, zero(T), T(Inf); rtol, atol, maxevals=_IMHOF_MAXEVALS)
+    _check_quadrature("chisq_ccdf", zT, I, E, rtol, atol)
+    return clamp(one(T)/2 - I / T(π), zero(T), one(T))
+end
+
+# The direction e^{iφ} of the ray w = t·e^{iφ} along which the Imhof integrals are taken. On the
+# real axis their integrands oscillate at frequency z/2 and decay only algebraically, as slowly
+# as u^{-N/2} for small N. Φ vanishes only on the imaginary axis (at w = i/λ for the eigenvalues
+# λ of A), so the path can be rotated into Re w > 0, where e^{izw/2} decays like e^{-zt sin φ/2}.
+# Along the ray each eigenvalue's factor of |Φ|^{-1/2} can grow to cos(φ)^{-1/2}; cos φ ≥ e^{-2/N}
+# bounds their product, and with it the cancellation in the integral, by e.
+_imhof_ray(r::ChisqReference{T}) where {T} = cis(min(T(π) / 4, acos(exp(-T(2) / length(r.g)))))
+
+# How far quadgk's error estimate for an Imhof integral may exceed the requested tolerance
+# before the result is rejected; the estimate usually overstates the actual error. Along the
+# rotated path the integrals converge in about 10³ evaluations, so `_IMHOF_MAXEVALS` stops a
+# failing one early.
+const _QUAD_SLACK = 10
+const _IMHOF_MAXEVALS = 10^5
+
+function _check_quadrature(fname::String, z, I, E, rtol, atol)
+    tol = max(atol, rtol * abs(I))
+    E <= _QUAD_SLACK * tol && return nothing
+    throw(ConvergenceError(fname, "the inversion integral at z = $z did not converge (error " *
+                                  "estimate $E, tolerance $tol)"))
 end
 
 # Inverse-Gaussian (Wald) density, companion to `_wald_ccdf`.
@@ -2581,7 +2614,8 @@ inverse-Gaussian (Wald) density of the large-`N` limit (Eq. 26),
     P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)],
 
 with `⟨χ²⟩ =` [`mean`](@ref Statistics.mean)`(ref)` the exact mean: a closed form, defined at
-every scale. `rtol` and `atol` are as in [`chisq_ccdf`](@ref).
+every scale. `rtol` and `atol` are as in [`chisq_ccdf`](@ref), including the
+`ConvergenceError`.
 """
 function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
     _check_chisq_args(z, method)
@@ -2589,10 +2623,13 @@ function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sq
     method === :largeN && return _wald_pdf(r.mean, z)
     # atol floors the density: deep in the tail the true value underflows to ~0, and a purely
     # relative tolerance would otherwise subdivide the oscillatory integrand without end.
+    # The density is (1/2π) ∫₀^∞ Re[Φ(u)^{-1/2} e^{izu/2}] du, taken along `_imhof_ray`.
     zT = T(z)
     piv, rhs = _logΦ_scratch(r)
-    f(u) = (θ = _logΦ!(piv, rhs, r, u); cos((θ[1] - zT * u) / 2) / sqrt(θ[2]))
-    I, _ = quadgk(f, zero(T), T(Inf); rtol, atol, maxevals=10^4)
+    eφ = _imhof_ray(r)
+    f(t) = (w = t * eφ; real(exp(zT * im * w / 2 - _logΦ!(piv, rhs, r, w) / 2) * eφ))
+    I, E = quadgk(f, zero(T), T(Inf); rtol, atol, maxevals=_IMHOF_MAXEVALS)
+    _check_quadrature("chisq_pdf", zT, I, E, rtol, atol)
     return max(I / (2 * T(π)), zero(T))
 end
 
