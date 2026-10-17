@@ -1981,6 +1981,25 @@ end
         a_small = @allocated logdensity_node_gradient(d, ye_small, c_small)
         a_big = @allocated logdensity_node_gradient(d, ye_big, c_big)
         @test a_small == a_big
+
+        # Input checks.
+        d = fit_unbounded(sort(randn(6)), ones(6), 1.0)
+        ye = [-0.5, 0.2, 0.8]
+        @test_throws DimensionMismatch logdensity_node_gradient(d, ye, ones(2))
+        @test_throws "weights must have the axes of xeval" logdensity_node_gradient(d, ye, ones(4))
+        @test_throws "weights must have the axes of xeval" logdensity_node_gradient(d, ye, OffsetArray(ones(3), -1))
+        @test_throws DomainError logdensity_node_gradient(d, [-0.5, NaN, 0.8])
+        @test_throws "the evaluation point must not be NaN" logdensity_node_gradient(d, [-0.5, NaN, 0.8], ones(3))
+        xb = [-1.3, -0.2, 0.4, 0.9, 2.1]
+        @test_throws "supports only unbounded fits" logdensity_node_gradient(DensityEstimate(xb, 1.0; support=(-2.0, 3.0)), ye)
+        @test_throws "supports only a single-rate (scalar κ) fit" logdensity_node_gradient(DensityEstimate(xb, t -> 1 + t^2 / 4), ye)
+
+        # Offset axes: matching OffsetArray points and weights give the same gradient, indexed
+        # like d.x.
+        c = [0.7, 1.1, 0.9]
+        g = logdensity_node_gradient(d, ye, c)
+        @test logdensity_node_gradient(d, OffsetArray(ye, -2), OffsetArray(c, -2)) == g
+        @test logdensity_node_gradient(d, OffsetArray(ye, 5)) == logdensity_node_gradient(d, ye)
     end
 
     @testset "large κ stays finite (no sinh overflow)" begin

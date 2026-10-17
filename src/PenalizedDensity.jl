@@ -2108,7 +2108,8 @@ evaluation batch into a *single* extra tridiagonal solve. The cost is therefore 
 for `N` nodes and `M` evaluation points, not one solve per point.
 
 `weights` defaults to all ones (the plain sum `Σⱼ ln Q̂(xevalⱼ)`); pass `fill(1/M, M)` for the
-mean. `xeval` should be disjoint from the fit's nodes — an evaluation point coinciding with a
+mean. Given weights must have the axes of `xeval` (otherwise a `DimensionMismatch` is thrown),
+and a `NaN` in `xeval` throws a `DomainError`. `xeval` should be disjoint from the fit's nodes — an evaluation point coinciding with a
 node sits on the log density's kink, where the gradient is one-sided. The returned `g` is
 indexed like `d.x`; a caller that moved the nodes through some parameter contracts `g` with
 the node-position Jacobian to obtain the parameter gradient. See
@@ -2122,6 +2123,8 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
     (isinf(d.lo) && isinf(d.hi)) ||
         throw(ArgumentError("logdensity_node_gradient supports only unbounded fits; " *
                             "got support=[$(d.lo), $(d.hi)]"))
+    weights === nothing || axes(weights) == axes(xeval) ||
+        throw(DimensionMismatch("weights must have the axes of xeval: $(axes(weights)) vs $(axes(xeval))"))
     x, w, κ = d.x, d.w, d.κ
     n = length(x)
     Z = d.λ / d.κ                       # Z⋆ = ∫φ² for the unnormalized field φ = ψ√Z
@@ -2134,6 +2137,7 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
     C = zero(T)                         # Σ weightsⱼ, the coefficient of -ln Z in L
     wts = weights === nothing ? Iterators.repeated(one(T)) : weights
     for (yj, cj_) in zip(xeval, wts)
+        _check_not_nan(yj)
         cj = T(cj_)
         C += cj
         y = T(yj)
