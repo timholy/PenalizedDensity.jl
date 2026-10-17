@@ -253,6 +253,7 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         d = IntervalDensityEstimate(rounded_intervals(; support=(-1.625, 2.125))..., 3.0; support=(-1.625, 2.125))
         @test d(-2.0) == 0 && logdensity(d, 3.0) == -Inf
         @test_throws DomainError quantile(d, 1.5)
+        @test_throws "quantile is defined only for probabilities 0 ≤ q ≤ 1" quantile(d, 1.5)
         # Near q = 1 the right boundary segment is inverted through the mass above y.
         for q in (1 - 1e-12, 1 - 1e-10, 1 - 1e-8, 1 - 1e-4)
             @test cdf(d, quantile(d, q)) ≈ q atol = 4 * eps(1.0)
@@ -324,7 +325,7 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
                 N += g.r
             end
             @test entropy(d) ≈ -s / N rtol = 1e-12
-            @test PenalizedDensity._log_geomean(d) == -entropy(d)
+            @test PenalizedDensity._log_geomean(d) ≈ s / N rtol = 1e-12
             @test negentropy(d) ≈ log(2π * ℯ * var(d)) / 2 - entropy(d) rtol = 1e-12
             @test negentropy(d, xe) ≈ log(2π * ℯ * var(xe; corrected=false)) / 2 - entropy(d, xe) rtol = 1e-12
             @test entropy(d, xe) ≈ -mean(logdensity.(d, xe)) rtol = 1e-12
@@ -574,6 +575,22 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
                                                                [1.0, 2.0, 3.0, 0.9, 1.5, 2.5], 200.0)
         # Intervals may share an endpoint.
         @test IntervalDensityEstimate([0.0, 1.0], [1.0, 2.0], 1.0) isa IntervalDensityEstimate
+        # The bounds forms of the selector and score.
+        lower, upper = [0.0, 1.0, 2.0], [0.5, 1.5, 2.5]
+        msg = "lower and upper bounds must have the same axes"
+        @test_throws DimensionMismatch select_kappa(lower, upper[1:2])
+        @test_throws msg select_kappa(lower, upper[1:2])
+        @test_throws msg select_kappa(lower, OffsetArray(upper, -1))
+        @test_throws msg PenalizedDensity.klcv(lower, upper[1:2], 1.0)
+        @test_throws "kappas must be sorted and positive" select_kappa(lower, upper; kappas=[1.0, -1.0, 2.0])
+        # A lattice spacing must be finite.
+        z = [0.0, 0.1, 0.3, 0.4]
+        for δ in (Inf, NaN)
+            @test_throws "resolution must be finite and positive" IntervalDensityEstimate(z, 1.0; resolution=δ)
+            @test_throws "resolution must be finite and nonnegative" select_kappa(z; resolution=δ)
+            @test_throws "resolution must be finite and nonnegative" select_kappa(z, Adaptive(); resolution=δ)
+            @test_throws "resolution must be finite and nonnegative" PenalizedDensity.klcv(z, 1.0; resolution=δ)
+        end
     end
 
     @testset "nobs and the inner constructor" begin
@@ -903,7 +920,7 @@ end
         κo = select_kappa(OffsetArray(x, -3), Adaptive(; window=nothing, nse=0); resolution=0.1)
         @test (κo.c, κo.α) == (κ.c, κ.α)
         # resolution = 0: exact points, through the point path.
-        @test select_kappa(round.(randn(Xoshiro(2), 300); digits=2), Adaptive(); resolution=0) isa Union{Real,AdaptiveScale,WindowScale}
+        @test select_kappa(round.(randn(Xoshiro(2), 300); digits=2), Adaptive(); resolution=0) isa Float64
         # pilot receives the bounds.
         seen = Ref{Any}(nothing)
         spy(l, u) = (seen[] = (l, u); 3.0)
@@ -937,7 +954,8 @@ end
         κpw = select_kappa(x, Adaptive())
         κiw = select_kappa(x, x, Adaptive())
         @test typeof(κiw) == typeof(κpw)
-        κpw isa WindowScale && @test κiw.c ≈ κpw.c rtol = 1e-3
+        @test κpw isa WindowScale
+        @test κiw.c ≈ κpw.c rtol = 1e-3
     end
 
     @testset "per-observation held-out values and tallies" begin
@@ -988,13 +1006,21 @@ end
         x = randn(Xoshiro(7), 200)
         @test PenalizedDensity._log_geomean(IntervalDensityEstimate(x, x, 2.0)) ≈
               PenalizedDensity._log_geomean(DensityEstimate(x, 2.0)) rtol = 1e-10
-        # Intervals: ln ḡ is -entropy, each interval contributing the pilot's mean of ln p̂ over it.
+        # Intervals: each interval contributes the pilot's mean of ln p̂ over it, weighted by p̂.
+        function loggbar_quadrature(d, lower, upper)
+            s = sum(zip(lower, upper)) do (l, u)
+                l == u && return logdensity(d, l)
+                quadgk(t -> d(t) * logdensity(d, t), l, u; rtol=1e-12)[1] / quadgk(d, l, u; rtol=1e-12)[1]
+            end
+            return s / length(lower)
+        end
         lower, upper = [-1.0, -1.0, 0.0, 0.5], [0.0, 0.0, 0.5, 1.5]
         d = IntervalDensityEstimate(lower, upper, 1.5)
-        expect = -entropy(d)
-        @test PenalizedDensity._log_geomean(d) == expect
-        dc = IntervalDensityEstimate([-Inf, -1.0, 0.0, 0.5], [-1.0, 0.0, 0.5, Inf], 1.5)
-        @test PenalizedDensity._log_geomean(dc) == -entropy(dc)
+        expect = PenalizedDensity._log_geomean(d)
+        @test expect ≈ loggbar_quadrature(d, lower, upper) rtol = 1e-10
+        lc, uc = [-Inf, -1.0, 0.0, 0.5], [-1.0, 0.0, 0.5, Inf]
+        dc = IntervalDensityEstimate(lc, uc, 1.5)
+        @test PenalizedDensity._log_geomean(dc) ≈ loggbar_quadrature(dc, lc, uc) rtol = 1e-10
         κ = AdaptiveScale(2.0, 0.5, d)
         @test κ(0.25) ≈ 2.0 * exp(0.5 * (logdensity(d, 0.25) - expect))
         @test_throws "must be positive" AdaptiveScale(2.0, 0.0, d)
