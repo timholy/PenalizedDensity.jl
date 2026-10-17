@@ -559,6 +559,15 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test_throws "zero observations" IntervalDensityEstimate(Float64[], Float64[], 1.0)
         @test_throws "zero observations" IntervalDensityEstimate(Float64[], Float64[], t -> 1.0)
         @test_throws "κ must be finite and positive" IntervalDensityEstimate([0.0], [1.0], -1.0)
+        @test_throws "κ = 1.0e-50 is not a finite positive Float32" IntervalDensityEstimate{Float32}([0.0, 1.0], [0.5, 2.0], 1e-50)
+        @test_throws "κ = 1.0e-50 is not a finite positive Float32" IntervalDensityEstimate{Float32}([0.0, 0.1, 0.3], 1e-50; resolution=0.1)
+        # A vector scale gets the same explanation as for point data, in every form.
+        msg = "the smoothing scale cannot be given as a vector"
+        @test_throws ArgumentError IntervalDensityEstimate([0.0, 1.0], [0.5, 2.0], [1.0, 2.0])
+        @test_throws msg IntervalDensityEstimate([0.0, 1.0], [0.5, 2.0], [1.0, 2.0])
+        @test_throws msg IntervalDensityEstimate{Float64}([0.0, 1.0], [0.5, 2.0], [1.0, 2.0])
+        @test_throws msg IntervalDensityEstimate([0.0, 0.1, 0.3], [1.0, 2.0]; resolution=0.1)
+        @test_throws msg IntervalDensityEstimate{Float64}([0.0, 0.1, 0.3], [1.0, 2.0]; resolution=0.1)
         # A point near one edge of an occupied interval: at large κ the density at the far edge
         # underflows beyond what the solve can represent.
         @test_throws "use a smaller κ" IntervalDensityEstimate([0.0, 1.0, 2.0, 0.9, 1.5, 2.5],

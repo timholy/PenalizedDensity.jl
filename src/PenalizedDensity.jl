@@ -278,12 +278,12 @@ _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
 function _estimate(::Type{T}, x::AbstractVector{<:Real}, κ::Real, rtol::Real, a::Real, b::Real;
                    stats=nothing) where {T}
-    _check_kappa(κ)
+    κT = _kappa_in(T, κ)
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
-    nodes, weights = _merge_presorted(xs, T(rtol) / T(κ))
-    return _fit(nodes, weights, T(κ), lo, hi; stats)
+    nodes, weights = _merge_presorted(xs, T(rtol) / κT)
+    return _fit(nodes, weights, κT, lo, hi; stats)
 end
 
 # The nodes are not known until the data has been merged, and the merge tolerance is itself
@@ -370,6 +370,15 @@ _check_kappa(κ) =
 _check_kappa(κ, x) =
     isfinite(κ) && κ > 0 ? κ :
     throw(ArgumentError("the smoothing scale must be finite and positive, got κ($x) = $κ"))
+
+# A scalar κ converted to the working type `T`, where it must still be finite and positive.
+function _kappa_in(::Type{T}, κ::Real) where {T}
+    _check_kappa(κ)
+    κT = T(κ)
+    isfinite(κT) && κT > 0 ||
+        throw(ArgumentError("κ = $κ is not a finite positive $T (it converts to $κT)"))
+    return κT
+end
 
 # Evaluate a user-supplied scale function at one point.
 _checked_kappa(κfun, x, ::Type{T}) where {T} = _check_kappa(T(κfun(x)), x)
@@ -2054,12 +2063,16 @@ i.e. population) variance of `xeval`. The Gaussian reference thus uses the evalu
 own moments, not the fitted density's; with that choice `½ ln(2π e s²) = -(1/M) Σⱼ ln 𝒩(xevalⱼ)`
 is itself a held-out expectation, so `Ĵ` is the mean held-out log-likelihood ratio of the fit
 against its matched Gaussian. It is invariant under `xeval ↦ a·xeval + b` together with the
-`κ ↦ κ/|a|` rescaling of the fit (both terms shift by `ln|a|` and cancel).
+`κ ↦ κ/|a|` rescaling of the fit (both terms shift by `ln|a|` and cancel). `xeval` must
+contain at least two distinct points, or the Gaussian reference is undefined and an
+`ArgumentError` is thrown.
 """
 function negentropy(d::AbstractDensityEstimate, xeval::AbstractVector)
     T = eltype(d)
+    H = entropy(d, xeval)
     _, s² = _mean_var(xeval, T)
-    return log(2 * T(π) * exp(one(T)) * s²) / 2 - entropy(d, xeval)
+    s² > 0 || throw(ArgumentError("negentropy(d, xeval) needs at least two distinct evaluation points"))
+    return log(2 * T(π) * exp(one(T)) * s²) / 2 - H
 end
 
 """
@@ -3063,7 +3076,7 @@ _score_at(scorefun, xs, r, slo, shi, κ; holdout::Symbol=:location) =
     scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout)
 
 # A scale passed to a score function, converted to the working type `T`.
-_score_scale(κ::Real, ::Type{T}) where {T} = T(_check_kappa(κ))
+_score_scale(κ::Real, ::Type{T}) where {T} = _kappa_in(T, κ)
 
 function _check_kappa_grid(κs)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("kappas must be sorted and positive"))
