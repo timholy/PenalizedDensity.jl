@@ -20,6 +20,13 @@ function sweep_allocated(piv, rhs, r, u)
     return @allocated PenalizedDensity._logΦ!(piv, rhs, r, u)
 end
 
+# Bytes allocated by one pointwise evaluation `f(d, t)`, behind a function barrier for the
+# same reason. The first call compiles.
+function eval_allocated(f, d, t)
+    f(d, t)
+    return @allocated f(d, t)
+end
+
 # Trapezoidal integral of a callable over a wide, fine grid.
 function integrate(f, a, b; n=2_000_001)
     xs = range(a, b; length=n)
@@ -62,7 +69,7 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
         append!(y, range(bnds[k], bnds[k+1]; length=npts + 1)[1:end-1])
     end
     push!(y, last(bnds)); m = length(y); δ = diff(y)
-    ψc = amplitude(d, y)
+    ψc = amplitude.(d, y)
     gid = [searchsortedfirst(y, xi) for xi in x]
     cell = [searchsortedlast(bnds, (y[j] + y[j+1]) / 2) - 1 for j in 1:m-1]
     mass = [(j > 1 ? δ[j-1] : 0.0) / 2 + (j < m ? δ[j] : 0.0) / 2 for j in 1:m]
@@ -124,9 +131,13 @@ end
 
     @testset "inner constructor validates field shapes" begin
         d = DensityEstimate([-1.0, 0.0, 0.5, 1.0], x -> 1 + x^2)
-        f = Any[getfield(d, n) for n in fieldnames(typeof(d))]
+        # The stored node cumulatives (the last three fields) are assembled, not passed.
+        f = Any[getfield(d, n) for n in fieldnames(typeof(d))[1:end-3]]
         DE = typeof(d)
-        @test DE(f...).ψ == d.ψ
+        d2 = DE(f...)
+        @test d2.ψ == d.ψ
+        @test d2.F == d.F && d2.G == d.G && d2.total == d.total
+        @test d.F == PenalizedDensity._node_cumulatives(d)[1]
         bad = copy(f); bad[2] = d.w[1:end-1]
         @test_throws "equal length" DE(bad...)
         bad = copy(f); bad[4] = [d.κ; 1.0]
@@ -545,7 +556,7 @@ end
     @testset "amplitude² == density" begin
         d = DensityEstimate([-2.0, 0.5, 3.0], 0.9)
         g = range(-4, 5; length=25)
-        @test amplitude(d, collect(g)) .^ 2 ≈ d.(g)
+        @test amplitude.(d, collect(g)) .^ 2 ≈ d.(g)
     end
 
     @testset "cdf and quantile" begin
@@ -595,8 +606,8 @@ end
             end
             # Monotone: nondecreasing cdf on a fine grid, nondecreasing quantiles.
             g = collect(range(lo - 10 / κ, hi + 10 / κ; length = 2001))
-            @test issorted(cdf(d, g))
-            @test issorted(quantile(d, collect(0.0:0.0005:1.0)))
+            @test issorted(cdf.(d, g))
+            @test issorted(quantile.(d, collect(0.0:0.0005:1.0)))
             # Continuity across the nodes.
             for xk in d.x
                 @test cdf(d, prevfloat(xk)) ≈ cdf(d, xk) atol = 32eps()
@@ -607,7 +618,7 @@ end
         # An isolated far node (θ = κ·Δx = 240): every branch stays finite and the
         # probability round trip survives the numerically flat valley.
         di = DensityEstimate([0.0, 1.0, 2.0, 50.0], 5.0)
-        @test all(isfinite, quantile(di, collect(0.001:0.001:0.999)))
+        @test all(isfinite, quantile.(di, collect(0.001:0.001:0.999)))
         for q in (1e-9, 0.01, 0.3, 0.7, 0.99, 1 - 1e-9)
             @test cdf(di, quantile(di, q)) ≈ q rtol = 1e-12
         end
@@ -659,14 +670,6 @@ end
             @test @inferred(logdensity_eval_gradient(dd, Float32(t))) isa Float32
             @test dd(t) ≈ dd(Float32(t)) rtol = 1e-5
         end
-
-        # Generic indexing: array methods preserve the argument's axes.
-        xo = OffsetArray([-0.5, 0.0, 0.5], -2)
-        @test axes(cdf(d64, xo)) == axes(xo)
-        @test parent(cdf(d64, xo)) == cdf(d64, [-0.5, 0.0, 0.5])
-        qo = OffsetArray([0.1, 0.5, 0.9], 7)
-        @test axes(quantile(d64, qo)) == axes(qo)
-        @test parent(quantile(d64, qo)) == quantile(d64, [0.1, 0.5, 0.9])
     end
 
     @testset "gaussianize: transport, inverse, and log-Jacobian" begin
@@ -727,7 +730,7 @@ end
             end
             # Monotone on a fine grid spanning both tails.
             g = collect(range(lo - 10 / κ, hi + 10 / κ; length = 2001))
-            @test issorted(gaussianize(d, g))
+            @test issorted(gaussianize.(d, g))
             # Derivative against central finite differences, interior and tails.
             for t in vcat(collect(range(lo - 3 / κ, hi + 3 / κ; length = 41)),
                           lo - 50 / κ, hi + 50 / κ)
@@ -758,24 +761,24 @@ end
         xtr = randn(1000)
         df = DensityEstimate(xtr, select_kappa(xtr))
         u = rand(5000)
-        y = gaussianize(df, quantile(df, u))
+        y = gaussianize.(df, quantile.(df, u))
         m = mean(y); v = var(y)
         @test abs(m) < 0.05 && abs(v - 1) < 0.07
         counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
         @test sum((counts .- 500) .^ 2 ./ 500) < 30     # χ²₉; multinomial noise only
         # Fresh draws from the underlying truth Gaussianize approximately (fit error).
-        yfresh = gaussianize(df, randn(5000))
+        yfresh = gaussianize.(df, randn(5000))
         @test abs(mean(yfresh)) < 0.1 && abs(var(yfresh) - 1) < 0.15
 
         # ungaussianize(d, Z) with Z ~ N(0,1) samples the fit: compare tail masses.
         z = randn(5000)
-        xs = ungaussianize(df, z)
+        xs = ungaussianize.(df, z)
         @test mean(xs .< quantile(df, 0.25)) ≈ 0.25 atol = 0.03
 
         # An isolated far node (θ = κ·Δx = 240): every branch stays finite, monotone,
         # and invertible across the numerically flat valley.
         di = DensityEstimate([0.0, 1.0, 2.0, 50.0], 5.0)
-        yi = gaussianize(di, collect(range(-3.0, 53.0; length = 501)))
+        yi = gaussianize.(di, collect(range(-3.0, 53.0; length = 501)))
         @test all(isfinite, yi) && issorted(yi)
         for y in (-40.0, -5.0, 0.0, 5.0, 40.0)
             @test gaussianize(di, ungaussianize(di, y)) ≈ y atol = 1e-11
@@ -806,17 +809,6 @@ end
         y32 = gaussianize(d32, -30.0f0)
         @test y32 isa Float32 && isfinite(y32)
         @test ungaussianize(d32, y32) ≈ -30.0f0 rtol = 1e-6
-
-        # Generic indexing: array methods preserve the argument's axes.
-        xo = OffsetArray([-0.5, 0.0, 0.5], -2)
-        @test axes(gaussianize(d64, xo)) == axes(xo)
-        @test parent(gaussianize(d64, xo)) == gaussianize(d64, [-0.5, 0.0, 0.5])
-        yo = OffsetArray([-1.0, 0.0, 1.0], 7)
-        @test axes(ungaussianize(d64, yo)) == axes(yo)
-        @test parent(ungaussianize(d64, yo)) == ungaussianize(d64, [-1.0, 0.0, 1.0])
-        ljo = gaussianize_logjacobian(d64, xo)
-        @test axes(ljo.y) == axes(xo) && axes(ljo.logjac) == axes(xo)
-        @test parent(ljo.y) == gaussianize(d64, [-0.5, 0.0, 0.5])
     end
 
     @testset "gaussianize: bounded support and per-interval κ" begin
@@ -860,7 +852,7 @@ end
                     @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-7
                 end
                 # Monotone across the support.
-                @test issorted(gaussianize(d, collect(range(lo, hi; length = 1001))))
+                @test issorted(gaussianize.(d, collect(range(lo, hi; length = 1001))))
             end
         end
 
@@ -880,15 +872,10 @@ end
         Random.seed!(303)
         u = rand(4000)
         du = DensityEstimate(u, select_kappa(u); support = (0.0, 1.0))
-        y = gaussianize(du, u)
+        y = gaussianize.(du, u)
         @test abs(mean(y)) < 0.05 && abs(var(y) - 1) < 0.07
         counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
         @test sum((counts .- 400) .^ 2 ./ 400) < 30     # χ²₉; multinomial noise only
-
-        # Generic indexing on a bounded fit: array methods preserve axes.
-        xo = OffsetArray([0.2, 0.5, 0.8], -2)
-        @test axes(gaussianize(du, xo)) == axes(xo)
-        @test parent(gaussianize(du, xo)) == gaussianize(du, [0.2, 0.5, 0.8])
     end
 
     @testset "generic indexing: OffsetArray input" begin
@@ -960,26 +947,44 @@ end
         qs = OffsetArray([0.05, 0.3, 0.5, 0.95], 2)
         ys = OffsetArray([-1.5, 0.0, 0.7], -1)
         for d in fits
-            for f in (amplitude, logdensity, cdf, gaussianize, logdensity_eval_gradient)
+            for f in (amplitude, logdensity, cdf, gaussianize, gaussianize_logjacobian,
+                      logdensity_eval_gradient)
                 b = f.(d, xs)
                 @test axes(b) == axes(xs)
-                @test isapprox(b, f(d, xs); nans=true)   # gradient is NaN past a wall
+                @test isequal(b, map(x -> f(d, x), xs))   # gradient is NaN past a wall
             end
             @test d.(xs) ≈ map(d, xs)
-            @test quantile.(d, qs) ≈ quantile(d, qs)
             @test axes(quantile.(d, qs)) == axes(qs)
-            @test ungaussianize.(d, ys) ≈ ungaussianize(d, ys)
-            yl = gaussianize_logjacobian(d, xs)
+            @test quantile.(d, qs) == map(q -> quantile(d, q), qs)
+            @test axes(ungaussianize.(d, ys)) == axes(ys)
+            @test ungaussianize.(d, ys) == map(y -> ungaussianize(d, y), ys)
             bl = gaussianize_logjacobian.(d, xs)
-            @test axes(bl) == axes(xs)
-            @test first.(bl) ≈ yl.y
-            @test last.(bl) ≈ yl.logjac
+            @test first.(bl) == gaussianize.(d, xs)
+            # Elementwise evaluation is by broadcasting; there are no array methods.
+            @test_throws MethodError cdf(d, xs)
         end
         ref = ChisqReference(DensityEstimate(randn(MersenneTwister(1), 40), 1.0))
         zs = [0.5, 2.0, 8.0]
         @test pvalue.(ref, zs) == [pvalue(ref, z) for z in zs]
         @test chisq_ccdf.(ref, zs) == [chisq_ccdf(ref, z) for z in zs]
         @test chisq_pdf.(ref, zs) == [chisq_pdf(ref, z) for z in zs]
+    end
+
+    @testset "pointwise evaluation reads the stored node cumulatives" begin
+        x = randn(MersenneTwister(3), 2000)
+        fits = (DensityEstimate(x, 3.0),
+                DensityEstimate(x, 3.0; support=(-6.0, 6.0)),
+                DensityEstimate(x, t -> 2 + t^2),
+                IntervalDensityEstimate(round.(x; digits=1), 3.0; resolution=0.1))
+        for d in fits
+            F, G, total = PenalizedDensity._node_cumulatives(d)
+            @test d.F == F && d.G == G && d.total == total
+            # No per-call O(length(d.x)) assembly: each evaluation allocates nothing.
+            for (f, t) in ((cdf, 0.3), (quantile, 0.3), (gaussianize, 0.3),
+                           (ungaussianize, 0.3), (gaussianize_logjacobian, 0.3))
+                @test eval_allocated(f, d, t) == 0
+            end
+        end
     end
 
     @testset "adaptive κ: a callable scale" begin
@@ -998,8 +1003,8 @@ end
                 @test a.λ ≈ d.λ rtol=1e-9
                 ts = range(-6, 6; length=101)
                 @test a.(ts) ≈ d.(ts) rtol=1e-9
-                @test cdf(a, ts) ≈ cdf(d, ts) rtol=1e-8
-                @test quantile(a, 0.01:0.01:0.99) ≈ quantile(d, 0.01:0.01:0.99) rtol=1e-8
+                @test cdf.(a, ts) ≈ cdf.(d, ts) rtol=1e-8
+                @test quantile.(a, 0.01:0.01:0.99) ≈ quantile.(d, 0.01:0.01:0.99) rtol=1e-8
                 @test action(a) ≈ action(d) rtol=1e-8
             end
         end
@@ -1020,7 +1025,7 @@ end
             @test amplitude(a, 0.3)^2 == a(0.3)
             # cdf and quantile still invert each other on a varying scale.
             qs = 0.001:0.017:0.999
-            @test cdf(a, quantile(a, collect(qs))) ≈ qs atol=1e-12
+            @test cdf.(a, quantile.(a, collect(qs))) ≈ qs atol=1e-12
         end
 
         @testset "cross-validation on a varying scale" begin
@@ -1665,7 +1670,7 @@ end
             for j in 1:m-1
                 c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
             end
-            ψy = amplitude(ds, y)
+            ψy = amplitude.(ds, y)
             αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
             mfd = [αfd[searchsortedfirst(y, xi)] for xi in x]
             mex = PenalizedDensity._node_alpha(x, ψ, ds.κ, ds.κL, ds.κR, λ, ds.lo, ds.hi)
@@ -1799,7 +1804,7 @@ end
             ys = rand(Xoshiro(3), d, 20_000)
             @test ys == rand(Xoshiro(3), d, 20_000)
             @test all(y -> d.lo <= y <= d.hi, ys)
-            u = sort!(cdf(d, ys))
+            u = sort!(cdf.(d, ys))
             @test maximum(abs.(u .- (1:length(u)) ./ length(u))) < 0.015   # KS distance
             @test mean(ys) ≈ mean(d) atol = 4 * std(d) / sqrt(length(ys))
         end
@@ -1874,12 +1879,6 @@ end
             # Far enough out ψ underflows to zero, and the slope is still exactly ±2κ.
             @test logdensity_eval_gradient(d, nodes[1] - 1000.0) == 2κ
             @test logdensity_eval_gradient(d, nodes[end] + 1000.0) == -2κ
-            # The array method maps the scalar one and keeps the argument's axes.
-            ys = [-2.0, 0.0, 0.7, 3.5]
-            @test logdensity_eval_gradient(d, ys) == [logdensity_eval_gradient(d, y) for y in ys]
-            yo = OffsetArray(ys, -3)
-            @test axes(logdensity_eval_gradient(d, yo)) == axes(yo)
-            @test parent(logdensity_eval_gradient(d, yo)) == logdensity_eval_gradient(d, ys)
         end
         # ψ underflows in the middle of a wide interval; with equal node amplitudes the slope
         # at signed distance t from the midpoint is 2κ tanh(κt).
@@ -1991,7 +1990,7 @@ end
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test isfinite(d.λ) && d.λ > 0
         @test isfinite(action(d))
-        @test all(isfinite, amplitude(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
+        @test all(isfinite, amplitude.(d, range(-4, 4; length = 200)))  # incl. inter-point gaps
     end
 
     @testset "log-density stays finite where the density underflows" begin
@@ -2019,7 +2018,7 @@ end
 
         # Where the density has not underflowed the two routes must agree.
         near = sort(d.x[1] .- [0.5, 2.0, 5.0])
-        @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude(d, near))
+        @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude.(d, near))
     end
 
     @testset "log-density stays finite inside a wide gap" begin
@@ -2030,7 +2029,7 @@ end
         d = DensityEstimate(xs, κ)
         mid = [-750.0, -500.0, -250.0, 250.0, 500.0, 750.0]
         @test all(t -> amplitude(d, t) == 0, mid)
-        @test all(isfinite, logdensity(d, mid))
+        @test all(isfinite, logdensity.(d, mid))
 
         # Deep inside the gap each arc is a pure exponential decay from its own node,
         # ψ ≈ ψ_k e^{-κ(x - x_k)} + ψ_{k+1} e^{-κ(x_{k+1} - x)}, which pins the value
@@ -2048,20 +2047,11 @@ end
 
         # Agrees with the amplitude wherever the amplitude has not underflowed.
         ts = collect(range(d.x[1] - 3, d.x[end] + 3; length = 500))
-        @test logdensity(d, ts) ≈ 2 .* log.(amplitude(d, ts))
-        @test logdensity(d, ts[17]) == logdensity(d, ts)[17]      # scalar matches array
+        @test logdensity.(d, ts) ≈ 2 .* log.(amplitude.(d, ts))
 
         # The scalar path and the sorted-batch sweep are two routes to one quantity.
         far = sort(vcat(ts, d.x[1] .- [1e4, 1500.0], d.x[end] .+ [1500.0, 1e4]))
-        @test logdensity(d, far) == PenalizedDensity._logdensity_sorted(d, far)
-
-        # Array shape and axes are preserved; matches `map` over the same points.
-        m = reshape(ts[1:12], 3, 4)
-        @test size(logdensity(d, m)) == (3, 4)
-        @test logdensity(d, m) == map(t -> logdensity(d, t), m)
-        to = OffsetArray(ts[1:20], -7)
-        @test axes(logdensity(d, to)) == axes(to)
-        @test logdensity(d, to) == OffsetArray(logdensity(d, ts[1:20]), -7)
+        @test logdensity.(d, far) == PenalizedDensity._logdensity_sorted(d, far)
 
         # Outside a finite support the density is exactly zero, so ln Q = -Inf.
         db = DensityEstimate(clamp.(randn(150), -1.9, 1.9), 1.2; support = (-2.0, 2.0))
@@ -2069,7 +2059,7 @@ end
         @test logdensity(db, 2.5) == -Inf
         @test isfinite(logdensity(db, 0.0))
         # The bounded tails run through `logcosh` and stay finite to the boundary.
-        @test all(isfinite, logdensity(db, range(-2, 2; length = 200)))
+        @test all(isfinite, logdensity.(db, range(-2, 2; length = 200)))
     end
 
     @testset "input validation" begin
@@ -2123,14 +2113,11 @@ end
             @test_throws "the evaluation point must not be NaN" amplitude(d, NaN)
             @test_throws "the evaluation point must not be NaN" logdensity(d, NaN)
             @test_throws "the evaluation point must not be NaN" cdf(d, NaN)
-            @test_throws "the evaluation point must not be NaN" logdensity(d, [0.0, NaN])
-            @test_throws "the evaluation point must not be NaN" cdf(d, [0.0, NaN])
             @test d(-Inf) == 0 && logdensity(d, -Inf) == -Inf
             @test cdf(d, -Inf) == 0 && cdf(d, Inf) == 1
         end
         for d in fits[1:3]
             @test_throws "the evaluation point must not be NaN" gaussianize(d, NaN)
-            @test_throws "the evaluation point must not be NaN" gaussianize(d, [0.0, NaN])
             @test_throws "the evaluation point must not be NaN" ungaussianize(d, NaN)
             @test_throws "the evaluation point must not be NaN" gaussianize_logjacobian(d, NaN)
             @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
@@ -2311,7 +2298,7 @@ end
         @test PenalizedDensity._norm_sq(x, ψ, κ, κ, κ, -Inf, Inf) ≈ Zb rtol = 4eps()
         @test PenalizedDensity._norm_sq_gram(x, ψ, κ, κ, κ, -Inf, Inf)[1] ≈ Zb rtol = 4eps()
         @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[1] ≈ Zb rtol = 4eps()
-        @test last(PenalizedDensity._node_cdf(d)) ≈ Zb rtol = 4eps()
+        @test d.total ≈ Zb rtol = 4eps()
         @test int_quartic(d) ≈ PenalizedDensity._int_quartic(X, Ψ, K, K, K, big(-Inf), big(Inf)) rtol = 4eps()
         # κ-derivatives of the mass and of the roughness operator, on the same amplitudes.
         @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[2] ≈ PenalizedDensity._norm_sq_grad(X, Ψ, K)[2] rtol = 4eps()
@@ -2374,7 +2361,7 @@ end
         @test quantile(d, 0.0) == 0.0
         @test quantile(d, 1.0) == 1.0
         g = collect(range(-0.05, 1.05; length=3000))
-        @test issorted(cdf(d, g))
+        @test issorted(cdf.(d, g))
     end
 
     @testset "evaluation is exactly zero outside the support" begin
@@ -2657,7 +2644,7 @@ end
             for j in 1:m-1
                 c = 1 / (κ(cell[j])^2 * δ[j]); p[j] += c; p[j+1] += c; q[j] = -c
             end
-            ψy = amplitude(d, y)
+            ψy = amplitude.(d, y)
             αfd = SymTridiagonal(p, q) \ (mass .* ψy ./ 2λ)
             mfd = [αfd[searchsortedfirst(y, xi)] for xi in xn]
             mex = PenalizedDensity._node_alpha(xn, ψ, d.κ, d.κL, d.κR, λ, d.lo, d.hi)

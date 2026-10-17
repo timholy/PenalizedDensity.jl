@@ -1377,6 +1377,9 @@ struct IntervalDensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: Abstra
     hi::T               # right edge of the support; +Inf for an unbounded right tail
     groups::Vector{_IntervalGroup{T}}   # the distinct intervals, by cell range (private)
     λ::T                # normalization multiplier (diagnostic)
+    F::Vector{T}        # mass below each node (see `_node_cumulatives`)
+    G::Vector{T}        # mass above each node
+    total::T            # total mass, F[end] + G[end]
 
     function IntervalDensityEstimate{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups,
                                           λ) where {T<:AbstractFloat,K<:Union{T,Vector{T}}}
@@ -1393,7 +1396,11 @@ struct IntervalDensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: Abstra
                 throw(ArgumentError("interval group covers cells $(g.first):$(g.last), " *
                                     "outside 0:$m (tails included) for $m nodes"))
         end
-        return new{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups, λ)
+        # As for `DensityEstimate`: the tables are assembled from the other fields.
+        d = new{T,K}(x, w, ψ, k2, kL, kR, κ, κL, κR, lo, hi, groups, λ, T[], T[], T(NaN))
+        F, G, total = _node_cumulatives(d)
+        return new{T,K}(d.x, d.w, d.ψ, d.k2, d.kL, d.kR, d.κ, d.κL, d.κR, d.lo, d.hi, d.groups,
+                        d.λ, F, G, total)
     end
 end
 
@@ -1591,20 +1598,18 @@ end
 """
     amplitude(d::IntervalDensityEstimate, x)
 
-Evaluate the amplitude `ψ(x)`, so that `d(x) == ψ(x)^2`, at a scalar or array `x`. Zero
-outside a finite support.
+Evaluate the amplitude `ψ(x)`, so that `d(x) == ψ(x)^2`, at real `x`. Zero outside a finite
+support.
 """
 amplitude(d::IntervalDensityEstimate, x::Real) = _amplitude(d, x)
-amplitude(d::IntervalDensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
 """
     logdensity(d::IntervalDensityEstimate, x)
 
-Evaluate `ln Q̂(x)` at a scalar or array `x` without underflow in the tails; `-Inf` outside a
-finite support.
+Evaluate `ln Q̂(x)` at real `x` without underflow in the tails; `-Inf` outside a finite
+support.
 """
 logdensity(d::IntervalDensityEstimate, x::Real) = _logdensity(d, x)
-logdensity(d::IntervalDensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi), x)
 
 (d::IntervalDensityEstimate)(x::Real) = _amplitude(d, x)^2
 
@@ -1646,33 +1651,33 @@ _gauss16(::Type{Float64}) = _GAUSS16_F64
 
 # Unnormalized mass below (`_cdf_mass_interior`) or above (`_ccdf_mass_interior`) x in interior
 # cell c, integrated from the nearer node so that its absolute error vanishes toward both nodes.
-_cdf_mass_interior(d::IntervalDensityEstimate{T}, F::Vector{T}, c::Int, x::T) where {T} =
-    x - d.x[c] <= d.x[c+1] - x ? F[c] + _cell_partial_mass(d, c, x, true) :
-                                 F[c+1] - _cell_partial_mass(d, c, x, false)
-_ccdf_mass_interior(d::IntervalDensityEstimate{T}, G::Vector{T}, c::Int, x::T) where {T} =
-    d.x[c+1] - x <= x - d.x[c] ? G[c+1] + _cell_partial_mass(d, c, x, false) :
-                                 G[c] - _cell_partial_mass(d, c, x, true)
+_cdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T} =
+    x - d.x[c] <= d.x[c+1] - x ? d.F[c] + _cell_partial_mass(d, c, x, true) :
+                                 d.F[c+1] - _cell_partial_mass(d, c, x, false)
+_ccdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T} =
+    d.x[c+1] - x <= x - d.x[c] ? d.G[c+1] + _cell_partial_mass(d, c, x, false) :
+                                 d.G[c] - _cell_partial_mass(d, c, x, true)
 
 """
     cdf(d::IntervalDensityEstimate, x)
 
-Cumulative distribution function of the fitted density at a scalar or array `x`; exactly `0`
-and `1` at the support endpoints.
+Cumulative distribution function of the fitted density at real `x`; exactly `0` and `1` at the
+support endpoints.
 """
 cdf(d::IntervalDensityEstimate, x)
 
 """
     quantile(d::IntervalDensityEstimate, q)
 
-Quantile function of the fitted density, the inverse of [`cdf`](@ref), for `q ∈ [0, 1]`
-(scalar or array); `q` outside `[0, 1]` throws a `DomainError`.
+Quantile function of the fitted density, the inverse of [`cdf`](@ref), for `q ∈ [0, 1]`;
+`q` outside `[0, 1]` throws a `DomainError`.
 """
 Statistics.quantile(d::IntervalDensityEstimate, q)
 
 # ---------------------------------------------------------------------------------------------
 # Entropy and action
 
-# Fitted mass of a group's cells (0 and m are the tails), unnormalized like `_node_cdf`.
+# Fitted mass of a group's cells (0 and m are the tails), unnormalized like `d.F`.
 function _fitted_group_mass(d::IntervalDensityEstimate{T}, g::_IntervalGroup) where {T}
     m = length(d.x)
     P = zero(T)
@@ -1754,7 +1759,7 @@ probability of `Bⱼ`, and `N = Σ wᵢ + Σ rⱼ`. At the fit the roughness ter
 `∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the action to this form.
 """
 function action(d::IntervalDensityEstimate{T}) where {T}
-    _, total = _node_cdf(d)
+    total = d.total
     S = -d.λ
     for i in eachindex(d.x, d.w)
         d.w[i] == 0 && continue
