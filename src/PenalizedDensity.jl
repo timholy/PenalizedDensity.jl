@@ -89,8 +89,14 @@ Base.showerror(io::IO, e::ConvergenceError) = print(io, "ConvergenceError in ", 
 
 # The evaluators order `x` against the nodes, and NaN has no place in that order.
 _check_not_nan(x) = isnan(x) ? throw(DomainError(x, "the evaluation point must not be NaN")) : nothing
-_check_no_nan_observations(x) =
-    any(isnan, x) ? throw(ArgumentError("observations must not be NaN")) : nothing
+# Point observations must be finite in the working type `T`: only interval bounds may be
+# infinite (censoring).
+function _check_finite_observations(x, ::Type{T}) where {T}
+    i = findfirst(xi -> !isfinite(T(xi)), x)
+    i === nothing && return nothing
+    xi = x[i]
+    throw(ArgumentError(isfinite(xi) ? "observation $xi overflows $T" : "observations must be finite, got $xi"))
+end
 
 _check_rtol(rtol) = rtol >= 0 ? nothing : throw(ArgumentError("rtol must be nonnegative, got $rtol"))
 
@@ -120,7 +126,8 @@ instead, converting the data and parameters to it: `DensityEstimate{Float32}(x, 
 `-Inf`/`Inf` for a one-sided or fully unbounded fit (the default). The density `Q` is exactly
 zero outside `[a, b]`, [`cdf`](@ref) reaches exactly `0` at `a` and `1` at `b`, and every data
 point must lie in `[a, b]` (checked at fit time; a violation, or `a ≥ b`, throws a
-`DomainError`).
+`DomainError`). Data points must be finite even when the support is infinite: a NaN or ±Inf in
+`x`, or a value that overflows `T`, throws an `ArgumentError`.
 
 Repeated points, and points closer than `rtol / κ(x)` (i.e. within a fraction `rtol` of
 the local smoothing length), are merged into one node carrying the count as its integer
@@ -395,15 +402,15 @@ _reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
 # is an index into this copy, and none of them escape, so the caller's axes have nothing to
 # propagate to.
 #
-# A NaN in `x` throws an `ArgumentError`.
+# A value of `x` that is not finite in `T` throws an `ArgumentError`.
 function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
+    _check_finite_observations(x, T)
     xs = Vector{T}(undef, length(x))
     i = firstindex(xs)
     for xi in x                     # iterate, rather than index, to stay axis-agnostic
         xs[i] = xi
         i += 1
     end
-    _check_no_nan_observations(xs)
     return sort!(xs)
 end
 
@@ -468,7 +475,7 @@ weight equal to the number of samples in the run.
   whose values set the node's position.
 
 `nodes` and `weights` have the float type that `DensityEstimate(x, κ; rtol)` uses on the
-unbounded line. A NaN in `x` throws an `ArgumentError`.
+unbounded line. A NaN or ±Inf in `x` throws an `ArgumentError`.
 
 # Examples
 ```jldoctest
@@ -512,9 +519,9 @@ end
 
 # `_sorted_sample` together with the permutation that sorts `x`: `xs[i] == x[perm[i]]`.
 function _sortperm_sample(x::AbstractVector, ::Type{T}) where {T}
+    _check_finite_observations(x, T)
     perm = sortperm(x)
     xs = T[x[p] for p in perm]
-    _check_no_nan_observations(xs)
     return perm, xs
 end
 
@@ -2628,8 +2635,8 @@ end
 # scaled to the data's extent, wide enough to bracket the minimum-sensitivity scale.
 function _default_κs(x::AbstractVector{<:Real})
     isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
-    _check_no_nan_observations(x)
     T = float(eltype(x))
+    _check_finite_observations(x, T)
     lo, hi = extrema(x)
     span = T(hi) - T(lo)
     span > 0 || throw(ArgumentError("need at least two distinct points to select κ"))

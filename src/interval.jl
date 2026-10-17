@@ -1466,7 +1466,7 @@ _interval_eltype(R, κ, lower, upper, rtol, a, b) =
 # The rounding interval of each lattice value. Bounds are formed from integer lattice indices so
 # that adjacent intervals share their endpoint exactly.
 function _lattice_bounds(x::AbstractVector, δ::T, support) where {T}
-    _check_no_nan_observations(x)
+    _check_finite_observations(x, T)
     x0 = T(minimum(x))
     lo, hi = support
     lower = similar(x, T)
