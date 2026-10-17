@@ -2076,13 +2076,13 @@ function negentropy(d::AbstractDensityEstimate, xeval::AbstractVector)
 end
 
 """
-    logdensity_eval_gradient(d::AbstractDensityEstimate, y) -> ∂ln Q̂(y)/∂y
+    logdensity_eval_gradient(d::AbstractDensityEstimate, x) -> ∂ln Q̂(x)/∂x
 
 Derivative of the log fitted density with respect to the evaluation coordinate,
 
-    ∂ ln Q̂(y) / ∂y = 2 ψ'(y) / ψ(y),
+    ∂ ln Q̂(x) / ∂x = 2 ψ'(x) / ψ(x),
 
-in closed form on the cell enclosing `y`, so the cost is `O(1)` per point with no linear
+in closed form on the cell enclosing `x`, so the cost is `O(1)` per point with no linear
 solve. The ratio is formed without evaluating `ψ`, so it stays finite where the density
 underflows: on an unbounded tail with decay rate `k` it is exactly `±2k`. Outside a finite
 support, where `ln Q̂ ≡ -Inf`, the result is `NaN`. See [`logdensity_node_gradient`](@ref)
@@ -2090,33 +2090,33 @@ for the sensitivity to the node positions instead. The log density has a kink at
 `d.x[k]` (`ψ'` jumps there), so at a node the value returned is the one-sided derivative
 approaching from within the enclosing interval.
 
-`y` may be a scalar or an array; the array method returns an array with the axes of `y`.
+`x` may be a scalar or an array; the array method returns an array with the axes of `x`.
 """
-function logdensity_eval_gradient(d::AbstractDensityEstimate, y::Real)
-    _check_not_nan(y)
-    R = promote_type(eltype(d), typeof(y))
+function logdensity_eval_gradient(d::AbstractDensityEstimate, x::Real)
+    _check_not_nan(x)
+    R = promote_type(eltype(d), typeof(x))
     xs = d.x
     n = length(xs)
     κL, κR = _tail_rates(d)
-    if y <= xs[1]
-        y < d.lo && return R(NaN)
-        return 2 * _left_tail_slope(κL, y, d.lo)
-    elseif y >= xs[n]
-        y > d.hi && return R(NaN)
-        return 2 * _right_tail_slope(κR, y, d.hi)
+    if x <= xs[1]
+        x < d.lo && return R(NaN)
+        return 2 * _left_tail_slope(κL, x, d.lo)
+    elseif x >= xs[n]
+        x > d.hi && return R(NaN)
+        return 2 * _right_tail_slope(κR, x, d.hi)
     end
-    return 2 * _amplitude_slope(d, searchsortedlast(xs, y), y)
+    return 2 * _amplitude_slope(d, searchsortedlast(xs, x), x)
 end
-logdensity_eval_gradient(d::AbstractDensityEstimate, y::AbstractArray) =
-    map(yi -> logdensity_eval_gradient(d, yi), y)
+logdensity_eval_gradient(d::AbstractDensityEstimate, x::AbstractArray) =
+    map(xi -> logdensity_eval_gradient(d, xi), x)
 
 """
-    logdensity_node_gradient(d::DensityEstimate, yeval::AbstractVector, weights=nothing) -> g
+    logdensity_node_gradient(d::DensityEstimate, xeval::AbstractVector, weights=nothing) -> g
 
 Gradient, with respect to the node positions `d.x`, of the weighted sum of log densities at
-the held-out points `yeval`:
+the held-out points `xeval`:
 
-    g[i] = ∂/∂x_i  Σⱼ weightsⱼ · ln Q̂(yevalⱼ),
+    g[i] = ∂/∂x_i  Σⱼ weightsⱼ · ln Q̂(xevalⱼ),
 
 computed by the implicit-function adjoint of the fit. Moving a node perturbs the fitted
 amplitude everywhere through the field equation `M ψ = w ⊘ ψ`; differentiating it reuses the
@@ -2124,8 +2124,8 @@ fit's factored Hessian `∇²F = M + diag(wᵢ/ψᵢ²)`, and the adjoint aggreg
 evaluation batch into a *single* extra tridiagonal solve. The cost is therefore `O(N + M)`
 for `N` nodes and `M` evaluation points, not one solve per point.
 
-`weights` defaults to all ones (the plain sum `Σⱼ ln Q̂(yevalⱼ)`); pass `fill(1/M, M)` for the
-mean. `yeval` should be disjoint from the fit's nodes — an evaluation point coinciding with a
+`weights` defaults to all ones (the plain sum `Σⱼ ln Q̂(xevalⱼ)`); pass `fill(1/M, M)` for the
+mean. `xeval` should be disjoint from the fit's nodes — an evaluation point coinciding with a
 node sits on the log density's kink, where the gradient is one-sided. The returned `g` is
 indexed like `d.x`; a caller that moved the nodes through some parameter contracts `g` with
 the node-position Jacobian to obtain the parameter gradient. See
@@ -2134,7 +2134,7 @@ the node-position Jacobian to obtain the parameter gradient. See
 Defined for point data only: the nodes of an [`IntervalDensityEstimate`](@ref) are fixed
 interval endpoints, not movable sample points.
 """
-function logdensity_node_gradient(d::DensityEstimate{T,T}, yeval::AbstractVector,
+function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector,
                                   weights=nothing) where {T}
     (isinf(d.lo) && isinf(d.hi)) ||
         throw(ArgumentError("logdensity_node_gradient supports only unbounded fits; " *
@@ -2150,7 +2150,7 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, yeval::AbstractVector
     g = zeros(T, n)                     # explicit ∂L/∂xᵢ at fixed φ accumulates here
     C = zero(T)                         # Σ weightsⱼ, the coefficient of -ln Z in L
     wts = weights === nothing ? Iterators.repeated(one(T)) : weights
-    for (yj, cj_) in zip(yeval, wts)
+    for (yj, cj_) in zip(xeval, wts)
         cj = T(cj_)
         C += cj
         y = T(yj)
