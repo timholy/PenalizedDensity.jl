@@ -3901,6 +3901,46 @@ function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(elt
     return (; κ, support=(lo, hi))
 end
 
+# Fits and χ² references are scalars under broadcasting but not collections, so passing one
+# where a collection is expected, or passing an array where these functions take one point,
+# ends in a MethodError. The hint points to broadcasting.
+_isdist(@nospecialize(T)) = T <: AbstractDensityEstimate || T <: ChisqReference
+
+function _broadcast_hint(io::IO, exc::MethodError, argtypes, kwargs)
+    f = exc.f
+    if f === length || f === iterate
+        T = findfirst(_isdist, argtypes)
+        T === nothing && return nothing
+        if argtypes[T] <: ChisqReference
+            print(io, "\nA ChisqReference is a single distribution, not a collection of values; ",
+                  "`mean(ref)` is its only summary statistic. To evaluate it at each element ",
+                  "of an array `zs`, broadcast, e.g., `chisq_ccdf.(ref, zs)`.")
+        else
+            print(io, "\nA fitted density is a single distribution, not a collection of values. ",
+                  "To evaluate it at each element of an array `ps`, broadcast, e.g., ",
+                  "`quantile.(d, ps)`.")
+        end
+        return nothing
+    end
+    # One array argument where a method takes a single point: f(d, xs), or d(xs) for a fit.
+    callee = typeof(f)
+    _isdist(callee) || any(_isdist, argtypes) || return nothing
+    i = findfirst(T -> T <: AbstractArray, argtypes)
+    i === nothing && return nothing
+    pointtypes = Base.setindex(Tuple(argtypes), Real, i)
+    hasmethod(f, pointtypes) || return nothing
+    name = _isdist(callee) ? "d" : string(nameof(f))
+    args = join((j == i ? "xs" : _isdist(T) ? (T <: ChisqReference ? "ref" : "d") : "…"
+                 for (j, T) in pairs(argtypes)), ", ")
+    print(io, "\n`$name` evaluates one point at a time; to evaluate at each element of an ",
+          "array `xs`, broadcast: `$name.($args)`.")
+    return nothing
+end
+
+function __init__()
+    Base.Experimental.register_error_hint(_broadcast_hint, MethodError)
+end
+
 include("interval.jl")
 
 end # module

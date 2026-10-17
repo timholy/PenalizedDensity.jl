@@ -961,14 +961,28 @@ end
             @test ungaussianize.(d, ys) == map(y -> ungaussianize(d, y), ys)
             bl = gaussianize_logjacobian.(d, xs)
             @test first.(bl) == gaussianize.(d, xs)
-            # Elementwise evaluation is by broadcasting; there are no array methods.
+            # Elementwise evaluation is by broadcasting; there are no array methods, and the
+            # MethodError hint says so.
             @test_throws MethodError cdf(d, xs)
+            @test_throws "broadcast: `cdf.(d, xs)`" cdf(d, xs)
+            @test_throws "broadcast: `logdensity.(d, xs)`" logdensity(d, xs)
+            @test_throws "broadcast: `d.(xs)`" d(xs)
+            @test_throws "`quantile.(d, ps)`" quantile(d, qs)
+            @test_throws "not a collection" collect(d)
         end
         ref = ChisqReference(DensityEstimate(randn(MersenneTwister(1), 40), 1.0))
         zs = [0.5, 2.0, 8.0]
         @test pvalue.(ref, zs) == [pvalue(ref, z) for z in zs]
         @test chisq_ccdf.(ref, zs) == [chisq_ccdf(ref, z) for z in zs]
         @test chisq_pdf.(ref, zs) == [chisq_pdf(ref, z) for z in zs]
+        @test_throws "broadcast: `pvalue.(ref, xs)`" pvalue(ref, zs)
+        @test_throws "`mean(ref)` is its only summary statistic" std(ref)
+        # The hint is silent for MethodErrors that broadcasting would not fix.
+        d = fits[1]
+        msg(f) = try f(); "" catch e; sprint(showerror, e) end
+        @test !occursin("broadcast", msg(() -> entropy(d, [1.0 2.0])))
+        @test !occursin("broadcast", msg(() -> negentropy(d, "x")))
+        @test !occursin("collection", msg(() -> length(1 + 2im, 3)))
     end
 
     @testset "pointwise evaluation reads the stored node cumulatives" begin
