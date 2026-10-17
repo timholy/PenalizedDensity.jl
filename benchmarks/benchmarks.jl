@@ -160,7 +160,7 @@ end
 # alongside the oracle κ that minimises L1 on a scan — the best the estimator can do at any
 # fixed scale. The selector whose error sits closest to the oracle wins.
 const SELECTORS = [
-    ("select_kappa_ms (min-sensitivity)", x -> PenalizedDensity.select_kappa_ms(x; rtol = 1e-3)),
+    ("select_kappa_sensitivity (min-sensitivity)", x -> PenalizedDensity.select_kappa_sensitivity(x; rtol = 1e-3)),
     ("select_kappa_lscv (LSCV/MISE)",    x -> PenalizedDensity.select_kappa_lscv(x; rtol = 1e-3)),
     ("select_kappa (KL)",           x -> select_kappa(x; rtol = 1e-3)),
 ]
