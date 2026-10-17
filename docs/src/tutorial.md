@@ -9,7 +9,7 @@ candidate models against the data.
 
 ## A worked example
 
-Consider a mixture of two Gaussians with equal weight, a narrow one (``\sigma=0.4``) centered at ``x=-2`` and a broad one (``\sigma=1.2``) at ``x=3``. First let's draw some samples from this distribution:
+Consider an equal-weight mixture of two Gaussians, a narrow one (``\sigma=0.4``) centered at ``x=-2`` and a broad one (``\sigma=1.2``) at ``x=3``. First draw some samples from this distribution:
 
 ```@example tutorial
 using Random
@@ -24,7 +24,7 @@ xs = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 nothing # hide
 ```
 
-To construct an estimate of the density from the points `xs`, we first select a *smoothing length scale* and then construct the density:
+To estimate the density from the points `xs`, first select a smoothing scale and then fit:
 
 ```@example tutorial
 using PenalizedDensity
@@ -34,9 +34,9 @@ d = DensityEstimate(xs, κ)              # fit at the recommended scale
 nothing # hide
 ```
 
-`κ` determines the amount of smoothing: the amplitude of the density estimate will decay over a length scale `1/κ`.
-`d` is a callable density: `d(x)` returns the estimated density at a single point `x`.
-Let's plot this estimate against the true density:
+`κ` determines the amount of smoothing: away from the data, the amplitude of the estimate
+decays over a length `1/κ`. `d(x)` returns the estimated density at a single point `x`.
+Plotting the estimate against the true density:
 
 ```julia
 using CairoMakie                              # for plotting
@@ -48,11 +48,10 @@ axislegend()
 
 ![Two-Gaussian mixture recovered with a single κ](assets/mixture_example.png)
 
-A single scale resolves both the narrow and the broad component. Note that **`κ` is a resolution scale, not a
-component width.** Its reciprocal ``1/\kappa`` is smaller than either
-component's ``\sigma``, so the estimator resolves features of any larger width,
-which is set by the underlying distribution and the data obtained by sampling
-from it.
+A single scale resolves both the narrow and the broad component. `κ` sets the resolution
+rather than the width of any component: ``1/\kappa`` is smaller than either component's
+``\sigma``, so the estimate resolves features of any larger width, and those widths come
+from the data.
 
 ## Choosing the smoothing scale
 
@@ -66,10 +65,10 @@ The recommended selector is [`select_kappa`](@ref), which minimizes a likelihood
 Its score is the leave-one-out log-likelihood ``-\tfrac1N\sum_i \ln \hat
 Q_{-i}(x_i)``, where ``\hat Q_{-i}(x_i)`` is an estimate at the point ``x_i``
 formed from all points *except* ``x_i`` itself. This score is an estimate of
-``\mathrm{KL}(Q \,\|\, \hat Q_\kappa)`` up to a constant; it is the criterion
-native to the estimator, whose action is itself a log-likelihood. It is evaluated
-analytically: each leave-one-out density comes from a one-step expansion of the fit, so no
-point-by-point refitting is needed. The selected scale grows like ``N^{1/5}``.
+``\mathrm{KL}(Q \,\|\, \hat Q_\kappa)`` up to a constant, and is the natural criterion for
+this estimator, whose action is itself a log-likelihood. Each leave-one-out density comes
+from a one-step expansion of the fit, so no refitting is needed. The selected scale grows
+like ``N^{1/5}``.
 
 The score assumes a *continuous* underlying density, in which no two observations coincide.
 If more than 1% of the observations repeat another value, `select_kappa` throws an
@@ -82,9 +81,9 @@ does not reward spikes at the repeated values.
 
 ## Comparing selection criteria
 
-`select_kappa` is the package's selection criterion. The alternatives below are `public` but
-not exported. They exist so you can compare criteria on your own data. Each comes as a selector
-and, where it minimizes a score, as a function that evaluates that score at a given ``\kappa``:
+`select_kappa` is the default criterion. The alternatives below are `public` but not exported,
+and are provided for comparing criteria on your own data. Each comes as a selector together
+with a function that evaluates its score at a given ``\kappa``:
 
 | criterion | selector | score at `κ` |
 |:--|:--|:--|
@@ -110,33 +109,33 @@ squared error (MISE):
 ```
 
 To leading order it selects the same ``\kappa \propto N^{1/5}`` as `select_kappa`. Across a
-range of test densities `select_kappa` tracks the error-optimal scale more closely (see
-`benchmarks/`), and it is cheaper, because it needs no ``\int \hat Q^2`` term. LSCV has no
-interval form, so rounded data should go to `select_kappa` with `resolution`.
+range of test densities, `select_kappa` tracks the error-optimal scale more closely (see
+`benchmarks/`) and is cheaper, because it needs no ``\int \hat Q^2`` term. LSCV has no
+interval form, so for rounded data use `select_kappa` with `resolution`.
 
-[`select_kappa_sensitivity`](@ref) resolves *information* in the data rather than minimizing
+[`select_kappa_sensitivity`](@ref) targets the *information* in the data rather than the
 error. It returns the point of *minimum sensitivity*, where [`action_sensitivity`](@ref)
-``= |dS/d\ln\kappa|`` is smallest. The derivative is computed analytically, so the result is
-free of the noise that finite-differencing the action curve would introduce.
+``= |dS/d\ln\kappa|`` is smallest. The derivative is computed analytically, so the result has
+none of the noise that finite differences of the action would introduce.
 
 ```@example tutorial
 κ_ms = select_kappa_sensitivity(xs)
 ```
 
-On smooth densities minimum sensitivity over-resolves: its scale grows faster with ``N`` than
-the error-optimal ``N^{1/5}``, which is why `select_kappa` is the default. It takes no `support`,
+On smooth densities, minimum sensitivity over-resolves: its scale grows faster with ``N`` than
+the error-optimal ``N^{1/5}``. It takes no `support`,
 because the entropy asymptotics it relies on are derived for the unbounded line.
 
 ## Letting the scale vary across the data
 
-Every selector above returns one ``\kappa`` for the whole line, and a single scale has to
-compromise: fine enough to resolve the peaks, coarse enough to stay quiet in the tails.
-On a smooth density that compromise costs little. But when the density is *irregular* — a
-divergent or discontinuous edge, a kink, a heavy tail — a constant ``\kappa`` is limited not
-by noise but by the density's own shape, and no choice of it is good everywhere.
+Every selector above returns one ``\kappa`` for the whole line, and a single scale is a
+compromise: fine enough to resolve the peaks, coarse enough to avoid noise in the tails.
+On a smooth density the compromise costs little. When the density is irregular, with a
+divergent or discontinuous edge, a kink, or a heavy tail, no constant ``\kappa`` is good
+everywhere.
 
-[`select_kappa`](@ref)`(x, Adaptive())` lifts the compromise by letting the scale vary with ``x``:
-``\kappa(x)`` large where the data resolve fine detail, small where they do not.
+[`select_kappa`](@ref)`(x, Adaptive())` lets the scale vary with ``x``: ``\kappa(x)`` is large
+where the data resolve fine detail and small where they do not.
 
 As an example, take a ``\chi^2_1`` sample, whose density diverges as ``x^{-1/2}`` at the origin:
 
@@ -150,24 +149,24 @@ z = randn(4000) .^ 2                  # χ²₁: the density diverges at x = 0
 κ_var = select_kappa(z, Adaptive())   # a scale that varies with x
 ```
 
-The adaptive selector returns a callable ``\kappa(x)`` — here a [`WindowScale`](@ref), explained
-below — which [`DensityEstimate`](@ref) takes exactly where a number would go:
+The adaptive selector returns a callable ``\kappa(x)`` (here a [`WindowScale`](@ref), described
+below), which [`DensityEstimate`](@ref) accepts in place of a number:
 
 ```@example adaptive
 d_const = DensityEstimate(z, κ_const)
 d_var = DensityEstimate(z, κ_var)
 ```
 
-Below, the left panel shows true underlying density (dashed) and the two estimates `d_const` and `d_var`;
-the right panel shows how `κ_const` and `κ_var` depend on position.
+In the figure below, the left panel shows the true density (dashed) and the two estimates
+`d_const` and `d_var`; the right panel shows `κ_const` and `κ_var` as functions of position.
 
 ![A varying κ against a divergent edge](assets/adaptive_kappa.png)
 
 The estimate with constant `κ` departs from the power law below ``x \approx 3\times 10^{-2}``;
-the adaptive one tracks it to about hundredfold-smaller `x` (typically, fewer than one hundred
-points land within `[0, 1e-3]`). The payoff is measurable on held-out data — the mean
-log-likelihood of a fresh sample, whose gap is the reduction in KL divergence, in nats per
-sample:
+the adaptive one follows it to about hundredfold-smaller `x` (typically fewer than one hundred
+points fall within `[0, 1e-3]`). The improvement can be measured on held-out data: the
+difference in mean log-likelihood of a fresh sample estimates the reduction in KL divergence,
+in nats per sample:
 
 ```@example adaptive
 ztest = randn(4000) .^ 2
@@ -178,9 +177,9 @@ loglik(d) = mean(logdensity.(d, ztest))
  gain = round(loglik(d_var) - loglik(d_const); digits = 3))
 ```
 
-Concretely, how is ``\kappa(x)`` determined? Two families of scales compete with the constant
-one, all on the *same* leave-one-out KL score that [`select_kappa`](@ref) minimizes,
-generalized to a varying scale and still evaluated in closed form and in ``O(N)``.
+Two families of varying scales compete with the constant one. All are compared by the
+leave-one-out KL score that [`select_kappa`](@ref) minimizes, generalized to a varying scale
+and still evaluated in closed form in ``O(N)``.
 
 The first is a *plug-in* of the variable-bandwidth kind; Abramson's square-root law,
 [*Ann. Statist.* **10**, 1217 (1982)](https://doi.org/10.1214/aos/1176345986), is the
@@ -190,14 +189,14 @@ the geometric mean of ``\hat p`` over the sample), an [`AdaptiveScale`](@ref); b
 exponent ``\alpha`` are chosen by the score. This family can only refine the scale where the
 density is high.
 
-The second, the *window rule*, asks instead how far one can look around ``x`` before the
-sample shows structure: ``\hat h(x)`` is the smallest half-width at which the points in
+The second, the *window rule*, asks how far from ``x`` the sample extends before it shows
+structure: ``\hat h(x)`` is the smallest half-width at which the points in
 ``[x - \hat h, x + \hat h]`` show a slope or a curvature (their first or second moment departs
 from that of a uniform spread by a set number of standard deviations), and
 ``\kappa(x) = c\,(1/\hat h(x))^{\gamma}`` with ``\gamma`` fixed and ``c`` chosen by the score.
-It refines the scale wherever the density changes on a short length scale, whatever its height
-— at a divergent edge, as here, but also at a narrow bump beside a broad mode, where the power
-family has nothing to work with:
+It refines the scale wherever the density changes over a short distance, regardless of its
+height: at a divergent edge, as here, and also at a narrow bump beside a broad mode, which the
+power family cannot resolve:
 
 ```@example adaptive
 rng = Xoshiro(7)
@@ -206,30 +205,30 @@ xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:2000]   # a n
 round(κb(3.0) / κb(0.0); digits = 1)    # finer at the bump than at the broad mode
 ```
 
-Because the window shape is estimated from the same sample the score holds points out of, the
-score rates the window candidate slightly too well; it is charged a penalty for that (see
-[`WindowRule`](@ref)) before it is compared with the power family's choice.
+Because the window is estimated from the same sample that the score holds points out of, the
+score slightly favors the window candidate. A penalty offsets this (see [`WindowRule`](@ref))
+before the candidate is compared with the power family's choice.
 
-The constant scale competes in the same comparison — it's the ``\alpha = 0`` member of the
-power family — and when it scores best the selector returns a plain number rather than a
-callable, keeping the fast path and the goodness-of-fit machinery. `window = nothing` leaves the
-window rule out; the power family then must beat the constant scale by more than one standard
-error of the gain in score (the keyword `nse` sets the multiple). On uniform data, where
-``\kappa \propto \hat p^\alpha`` has no contrast to exploit, that returns the constant:
+The constant scale, the ``\alpha = 0`` member of the power family, competes in the same
+comparison; when it scores best, the selector returns a plain number rather than a callable.
+`window = nothing` leaves out the window rule; the power family must then beat the constant
+scale by more than one standard error of the gain in score (the keyword `nse` sets the
+multiple). On uniform data, where ``\hat p^\alpha`` has no variation to exploit, the result is
+the constant:
 
 ```@example adaptive
-select_kappa(rand(2000), Adaptive(; window=nothing)) isa Real   # nothing to buy
+select_kappa(rand(2000), Adaptive(; window=nothing)) isa Real
 ```
 
 ## Fitting a hard edge
 
-A varying scale sharpens resolution near a feature, but it still fits an amplitude built from
-exponential tails, which extend over all of ``\mathbb{R}``. When the true density has a genuine
-edge — zero on one side, nonzero on the other — no choice of ``\kappa(x)`` reproduces that
-exactly: the fit always leaks a sliver of mass across the line. [`DensityEstimate`](@ref)'s
-`support` keyword fixes this directly, by imposing a natural (Neumann) boundary condition at a
-finite endpoint rather than approximating it with decay; [`select_support`](@ref) chooses that
-endpoint from the data, the same way the other selectors choose ``\kappa``.
+A varying scale sharpens resolution near a feature, but the amplitude is still built from
+exponential tails that extend over all of ``\mathbb{R}``. When the true density has an edge
+(zero on one side, nonzero on the other), no choice of ``\kappa(x)`` reproduces it exactly:
+some of the fit's mass always lies beyond the edge. The `support` keyword of
+[`DensityEstimate`](@ref) instead imposes a natural (Neumann) boundary condition at a finite
+endpoint, and [`select_support`](@ref) chooses that endpoint from the data, the same way the
+other selectors choose ``\kappa``.
 
 As an example, take a sample from the standard exponential distribution, whose density jumps
 from `0` to `1` at ``x=0``:
@@ -247,10 +246,9 @@ d_unbounded = DensityEstimate(x, κ_const)
 (κ = round(κ_const; digits=1), leaked_mass = round(cdf(d_unbounded, 0.0); digits=4))
 ```
 
-`leaked_mass` is [`cdf`](@ref)`(d_unbounded, 0.0)`, the fitted probability of landing on the
-wrong side of the true edge: about one percent of the fit's mass sits below `x = 0`, where the
-true density is exactly zero. [`select_support`](@ref) finds a left wall that removes this
-directly:
+`leaked_mass` is [`cdf`](@ref)`(d_unbounded, 0.0)`: about one percent of the fit's mass lies
+below `x = 0`, where the true density is zero. [`select_support`](@ref) finds a left boundary
+(a "wall") that removes it:
 
 ```@example bounded
 r = select_support(x)
@@ -259,11 +257,10 @@ d_bounded = DensityEstimate(x, r.κ; support = r.support)
 (wall = round(r.support[1]; digits=5), κ = round(r.κ; digits=2), cdf_at_wall = cdf(d_bounded, r.support[1]))
 ```
 
-`cdf_at_wall` is exactly `0`, not merely small: mass cannot cross a natural boundary. Note also
-that the selected scale drops to about a fifth of `κ_const` — the unbounded fit was
-over-sharpening to fight the leak, and no longer needs to once the wall is doing that job (the search
-re-optimizes `κ` at every boundary candidate; see
-[`select_support`](@ref)'s docstring). The wall itself sits close to the data:
+`cdf_at_wall` is exactly `0`, because no mass lies outside the support. The selected scale is
+also about a fifth of `κ_const`: without a wall, a large `κ` is needed to keep the leaked mass
+small. (The search re-optimizes `κ` at every boundary candidate; see [`select_support`](@ref).)
+The wall lies close to the data:
 
 ```@example bounded
 xs = sort(x)
@@ -272,12 +269,11 @@ gap = minimum(x) - r.support[1]
 round(gap / spacing; digits=2)
 ```
 
-which is the search's hard floor: **`select_support` never places a wall closer than five mean
-edge-spacings to the data, because a boundary any closer reflects the nearest interior points
-back onto themselves and inflates their leave-one-out likelihood on any sample, edge or not, not
-only this one.** On a genuine hard edge this floor is usually where the search lands, as it does
-here; a smooth sample has no edge to find in the first place, and the search says so plainly by
-returning the unbounded candidate:
+This is the search's lower limit: `select_support` never places a wall closer to the data than
+five mean spacings of the points nearest the edge. A closer boundary reflects the nearest
+points back onto themselves and inflates their leave-one-out likelihood on any sample, whether
+or not it has an edge. On a sample with a hard edge, the search usually stops at this limit, as
+it does here. A smooth sample has no edge, and the search returns the unbounded candidate:
 
 ```@example bounded
 xg = randn(1500)
@@ -286,8 +282,8 @@ rg = select_support(xg)
 (support = rg.support, κ_matches_plain_selection = rg.κ === select_kappa(xg))
 ```
 
-`support == (-Inf, Inf)` and the returned `κ` is not merely close to `select_kappa(xg)` but
-*identical* to it — the unbounded candidate always competes, and here it wins outright.
+The support is `(-Inf, Inf)`, and the returned `κ` is identical to `select_kappa(xg)`: the
+unbounded candidate always competes, and here it wins.
 
 To combine a boundary with a varying scale, pass the chosen
 `support` on to [`select_kappa`](@ref)`(x, Adaptive())` so that its own search runs on the bounded domain.
@@ -301,8 +297,7 @@ d_composed = DensityEstimate(x, κ_composed; support = r.support)
 κ_composed
 ```
 
-We can test whether this fit is a genuine improvement by generating independent data from
-the same underlying distribution:
+To compare the three fits, score them on independent data from the same distribution:
 
 ```@example bounded
 xtest = -log.(1 .- rand(N))
@@ -313,19 +308,18 @@ loglik(d) = mean(logdensity.(d, xtest))
  bounded_and_adaptive = round(loglik(d_composed); digits=3))
 ```
 
-The wall accounts for essentially all of the gain here: once it has absorbed the edge's leak,
-little irregularity is left in an otherwise-exponential interior, and
-the two scores agree to within the noise of a fresh `N`-point sample. The picture below makes
-the boundary's effect on the fit itself concrete — the unbounded estimate (blue) trailing off
-below `x = 0` where the true density (dashed) is zero, against the bounded estimate (crimson),
-pinned flat at the wall:
+The wall accounts for nearly all of the gain. The exponential interior has little
+irregularity left for a varying scale to resolve, and the two bounded scores agree to within
+the sampling noise of a fresh `N`-point sample. The figure below shows the fits near the edge:
+the unbounded estimate (blue) extends below `x = 0`, where the true density (dashed) is zero,
+while the bounded estimate (crimson) has zero slope at the wall:
 
 ![An exponential jump edge: leaking mass past x=0 versus a wall that stops it exactly](assets/bounded_edge.png)
 
 ## Goodness of fit
 
-Because the estimate is a genuine likelihood fit, you can ask how well a *specific* model
-distribution describes the data. Using the fit `d` from above, [`chisq`](@ref) is a
+Because the estimate is a likelihood fit, you can ask how well a specific model distribution
+describes the data. Using the fit `d` from above, [`chisq`](@ref) is a
 robust, binning-free ``\chi^2`` (the squared Hellinger distance between a trial density and
 the data):
 
@@ -337,9 +331,9 @@ wrong(x) = exp(-((x - 0.5) / 2.5)^2 / 2) / (2.5 * sqrt(2π))   # a single broad 
 ```
 
 The true mixture yields a far smaller ``\chi^2`` than the mismatched single Gaussian.
-To judge significance, build the reference distribution of ``\chi^2`` for the fit once with
+To judge significance, build the reference distribution of ``\chi^2`` for the fit with
 [`ChisqReference`](@ref); by default it is evaluated as the finite-``N`` generalized
-chi-squared law. [`pvalue`](@ref) turns each statistic into a significance under it, and one
+chi-squared law. [`pvalue`](@ref) converts a statistic into a p-value under it, and one
 reference serves any number of trial densities:
 
 ```@example tutorial
@@ -357,32 +351,30 @@ round(mean(ref); digits = 2)
 ```
 
 The reference law is exact for the Gaussian fluctuation field of the Laplace approximation
-about the fit, and `method = :exact` evaluates it at finite ``N``, taking no large-``N``
-limit. See [`ChisqReference`](@ref) for context and more information.
+about the fit, and `method = :exact` (the default) evaluates it at finite ``N``, without a
+large-``N`` limit. See [`ChisqReference`](@ref) for details.
 
-The exact law is a per-call integral (Imhof inversion): accurate, but tens of milliseconds
-apiece. Passing `method = :largeN` selects instead the closed-form inverse-Gaussian (Wald)
-shape of the original paper's large-``N`` limit, parameterized by the mean
-`mean(ref)`; it costs microseconds, so a large batch of trial densities against
-one fit is far cheaper. Anchored to that mean, it tracks the exact tail closely rather
-than overstating it:
+Each evaluation of the exact law is a numerical integral (Imhof inversion) that takes tens of
+milliseconds. `method = :largeN` instead uses the closed-form inverse-Gaussian (Wald) shape
+of the paper's large-``N`` limit, with mean `mean(ref)`. It takes microseconds, which makes
+testing many trial densities against one fit much cheaper, and because it matches the exact
+mean it tracks the exact tail closely:
 
 ```@example tutorial
 (exact = round(pvalue(ref, chisq(d, truepdf)); digits = 3),
  largeN = round(pvalue(ref, chisq(d, truepdf); method = :largeN); digits = 3))
 ```
 
-All of this — the exact law and the `:largeN` shape alike — works unchanged on a fit at a
-varying scale or a finite `support`: both are read from the same reference the fit assembles,
-in the same ``O(N)``.
+Both methods apply equally to fits with a varying scale or a finite `support`, at the same
+``O(N)`` cost.
 
 ## Entropy and negentropy
 
-Because the fit is a smooth density, its information content follows in closed form.
+Because the fit is a smooth density, its entropy can be computed in closed form.
 [`entropy`](@ref) is a plug-in estimate of the differential entropy ``H(Q) = -\int Q \ln Q``,
 and [`negentropy`](@ref) is the entropy deficit relative to the Gaussian of the same mean and
-variance — a scale-free measure of how *non-Gaussian* the density is, zero for a Gaussian and
-positive otherwise:
+variance. Negentropy measures how non-Gaussian the density is: it is zero for a Gaussian and
+positive otherwise.
 
 ```@example tutorial
 (H = round(entropy(d); digits = 3), J = round(negentropy(d); digits = 3))
@@ -390,11 +382,11 @@ positive otherwise:
 
 The bimodal fit is strongly non-Gaussian, so its negentropy is well above zero. `negentropy`
 is invariant to shifting and rescaling the data (with the matching ``\kappa \mapsto \kappa/|a|``),
-so it measures shape alone.
+so it depends only on shape.
 
-Both quantities also take a second argument of *held-out* points — data that did not enter
-the fit — in which case ``\ln \hat Q`` is scored there and the Gaussian reference uses the
-held-out sample's own variance:
+Both functions also accept a second argument of held-out points, data that did not enter the
+fit. Then ``\ln \hat Q`` is evaluated at those points, and the Gaussian reference uses the
+held-out sample's variance:
 
 ```@example tutorial
 xeval = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
@@ -403,16 +395,15 @@ xeval = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 ```
 
 The held-out negentropy is close to the in-sample value here because the fit generalizes
-well. Scoring on points that did not build the fit is what makes the held-out form
-informative: unlike the in-sample value, it is not inflated by concentrating the density
-onto the fit sample, the same reason [`select_kappa`](@ref) cross-validates.
+well. In general the in-sample value is inflated, because the fit concentrates density on its
+own sample; the held-out form avoids this, for the same reason that [`select_kappa`](@ref)
+cross-validates.
 
-The log density itself is [`logdensity`](@ref), and it can be used to circumvent
-density underflows to zero once ``2\kappa`` times the distance to the nearest
-node exceeds about 745. `logdensity(d, x)` holds throughout that region, where
-`log(d(x))` would give `-Inf`.
+[`logdensity`](@ref) returns ``\ln \hat Q`` directly. Far from the data, where ``2\kappa``
+times the distance to the nearest node exceeds about 745, `d(x)` underflows to zero and
+`log(d(x))` gives `-Inf`, but `logdensity(d, x)` remains finite and accurate.
 
-The derivatives of the log density are exposed directly:
+Two functions give derivatives of the log density:
 [`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,
 and [`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities
 with respect to the node positions, by an implicit-function adjoint that reuses the fit's

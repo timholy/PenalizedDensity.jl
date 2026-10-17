@@ -49,7 +49,7 @@ where `s` interpolates the values `logb` linearly on the sorted grid `x` and is 
 beyond it. [`select_kappa`](@ref)`(x, Adaptive())` constructs one with `s = ln(1/ĥ)` from the window
 rule (see [`WindowRule`](@ref)), shifted to mean zero over the sample, so that `c` is the
 scale at a point of typical window size. Like [`AdaptiveScale`](@ref), the result is callable
-and is passed straight to [`DensityEstimate`](@ref) as the smoothing scale.
+and can be passed to [`DensityEstimate`](@ref) as the smoothing scale.
 
 The scale is floored at `1e-6 c`.
 """

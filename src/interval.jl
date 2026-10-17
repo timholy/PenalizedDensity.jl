@@ -1297,14 +1297,17 @@ end
 # The fit
 
 """
-    IntervalDensityEstimate(lower, upper, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
-    IntervalDensityEstimate(x, κ; resolution, support=(-Inf, Inf), rtol=cbrt(eps(T)))
+    IntervalDensityEstimate(lower, upper, κ; support=(-Inf, Inf), rtol=cbrt(eps(R)))
+    IntervalDensityEstimate(x, κ; resolution, support=(-Inf, Inf), rtol=cbrt(eps(R)))
+    IntervalDensityEstimate{T}(lower, upper, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
+    IntervalDensityEstimate{T}(x, κ; resolution, support=(-Inf, Inf), rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional density from interval observations: observation `i` is
 known only to lie in `[lower[i], upper[i]]`. An observation with `lower[i] == upper[i]` is an
 exact point, so a sample may mix exact and interval-valued observations; a bound of `-Inf` or
 `Inf` describes a censored value. Intervals may share endpoints but must not otherwise
-overlap (overlapping intervals throw an `ArgumentError`).
+overlap; overlapping intervals throw an `ArgumentError`, as does an interval that covers the
+whole support.
 
 The second form is for data recorded on a lattice of spacing `resolution` (rounded values):
 each `x[i]` stands for the interval `[x[i] - resolution/2, x[i] + resolution/2]`, clipped to the
@@ -1313,19 +1316,23 @@ support; a value whose interval does not overlap the interior of the support thr
 or an `ArgumentError` names the first value that does not.
 
 `κ` and `support` have the same meaning as for [`DensityEstimate`](@ref): a positive number or
-a callable `κ(x)`, and a domain `(a, b)` outside of which the density is zero. Every
-observation must lie within the support. Interval endpoints (and points) closer than
-`rtol / κ(x)` are merged.
+a callable `κ(x)`, and a domain `(a, b)` outside of which the estimate is zero. Every
+observation must lie within the support, or a `DomainError` is thrown. Interval endpoints (and
+points) closer than `rtol / κ(x)` are merged. In the default `rtol`, `R` is the floating-point
+type of the observations: `float` of the element type of `x`, or of the promoted element types
+of `lower` and `upper`. A `κ` so large that `κ` times the width of a cell inside an interval
+exceeds `eps(T)^(-1/4)` throws an `ArgumentError`: the fit cannot be computed accurately
+there, and the estimate has already reached its histogram limit.
 
 The fit's floating-point type `T` is the promotion of the observations, `κ`, `rtol`,
 `resolution` and any finite `support` bound. `IntervalDensityEstimate{T}(…)`, in either form,
 sets `T` instead and converts the observations and parameters to it.
 
 The estimate maximizes the penalized likelihood in which an interval observation contributes
-the log-probability of its interval rather than a log-density, so a density spike inside an
-interval earns nothing. Rounded data are therefore never pulled toward point masses at the
-recorded values; the finest structure they can support is the histogram at the rounding
-increment.
+the log-probability of its interval rather than a log-density, so concentrating density at a
+point inside an interval does not raise the likelihood. Rounded data are therefore not pulled
+toward point masses at the recorded values; the finest structure they can support is the
+histogram at the rounding increment.
 
 The result is callable, `d(x)` giving the density, and supports every operation listed under
 [`AbstractDensityEstimate`](@ref): evaluation, sampling, moments, entropy and action, and the
@@ -1347,7 +1354,7 @@ julia> c = IntervalDensityEstimate([0.0, 0.5, 1.0], [0.0, 0.5, Inf], 1.0);  # 1.
 
 # Extended help
 
-The amplitude `ψ = √Q` minimizes
+The amplitude `ψ = √Q̂` minimizes
 
     S[ψ] = ∫ (λ/κ(x)²) (ψ')² dx - 2 Σᵢ wᵢ ln ψ(xᵢ) - Σⱼ rⱼ ln ∫_{Bⱼ} ψ² dx
 
@@ -1364,6 +1371,9 @@ The fields `d.x` (nodes), `d.ψ` (normalized amplitudes there), `d.k2` (the real
 each cell between nodes), and `d.kL`, `d.kR` (the tails' decay rates) describe the fitted
 curve. `d.κ` is the smoothing scale. `d.w` counts only the point observations, so the total
 count is [`nobs`](@ref)`(d)`.
+
+As for [`DensityEstimate`](@ref), passing a [`SolveStats`](@ref) as the `stats` keyword records
+the Newton-step and backtracking counts of the solve; it does not change the fit.
 """
 struct IntervalDensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: AbstractDensityEstimate
     x::Vector{T}        # sorted distinct nodes: interval endpoints and points
