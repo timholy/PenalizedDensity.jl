@@ -1150,13 +1150,13 @@ function _action_and_slope(nodes::Vector{T}, w::Vector{T}, κ::T) where {T<:Abst
 end
 
 """
-    amplitude(d::DensityEstimate, x)
+    amplitude(d::AbstractDensityEstimate, x)
 
 Evaluate the amplitude `ψ(x)` (so that the density is `d(x) == ψ(x)^2`) at real `x`. Zero
-outside a finite `support` (see [`DensityEstimate`](@ref)); the fitted density is exactly zero
-there, not merely small.
+outside a finite support (see [`DensityEstimate`](@ref) and [`IntervalDensityEstimate`](@ref));
+the fitted density is exactly zero there, not merely small.
 """
-amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
+amplitude(d::AbstractDensityEstimate, x::Real) = _amplitude(d, x)
 
 # Pointwise evaluation computes in `promote_type(T, typeof(x))`, so a Float64 point on a
 # Float32 fit gets a Float64 result. The mass functions (`cdf`, `quantile`, `gaussianize`)
@@ -1199,10 +1199,10 @@ function _amplitude(d::DensityEstimate{T}, k::Integer, x::Real) where {T}
 end
 
 """
-    logdensity(d::DensityEstimate, x)
+    logdensity(d::AbstractDensityEstimate, x)
 
 Evaluate the log fitted density `ln Q̂(x) == 2 ln ψ(x)` at real `x`. `-Inf` outside a
-finite `support` (see [`DensityEstimate`](@ref)), where the density is exactly zero.
+finite support, where the density is exactly zero.
 
 Prefer this to `log(d(x))` or `2 * log(amplitude(d, x))`, as `logdensity` avoids
 the underflow that would occur when evaluating the density directly. The result
@@ -1221,7 +1221,7 @@ julia> amplitude(d, -800.0), isfinite(logdensity(d, -800.0))
 (0.0, true)
 ```
 """
-logdensity(d::DensityEstimate, x::Real) = _logdensity(d, x)
+logdensity(d::AbstractDensityEstimate, x::Real) = _logdensity(d, x)
 
 # ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`, and the two must be kept
 # so: a caller reaching either one for the same quantity may not get a different answer.
@@ -1610,11 +1610,11 @@ end
 cdf(d::AbstractDensityEstimate, x::Real) = _cdf_mass(d, x) / d.total
 
 """
-    cdf(d::DensityEstimate, x)
+    cdf(d::AbstractDensityEstimate, x)
 
 Cumulative distribution function of the fitted density, `F(x) = ∫_a^x Q(t) dt` with `Q = ψ²`
-and `a` the fit's left support endpoint (`-Inf` unless [`DensityEstimate`](@ref) was given a
-finite `support`), evaluated in closed form (no quadrature). `F` is nondecreasing with
+and `a` the fit's left support endpoint (`-Inf` unless the fit was given a finite `support`),
+evaluated without adaptive quadrature. `F` is nondecreasing with
 `F(a) == 0` and `F(b) == 1` exactly, and outside a finite `[a, b]` support is exactly `0` at or
 below `a` and exactly `1` at or above `b`.
 
@@ -1633,24 +1633,27 @@ julia> quantile(d, 0.5)
 
 # Extended help
 
-The tails (or, on a finite support, the two boundary segments) are pure exponentials or `cosh`
-arcs; on each inter-node interval `ψ'' = κ²ψ` makes `ψ'² - κ²ψ²` constant, which yields the
-exact antiderivative of the hyperbolic interpolant. The `F(a) == 0`/`F(b) == 1` endpoints are
+For a [`DensityEstimate`](@ref), the tails (or, on a finite support, the two boundary segments)
+are pure exponentials or `cosh` arcs; on each inter-node interval `ψ'' = κ²ψ` makes
+`ψ'² - κ²ψ²` constant, which yields the exact antiderivative of the hyperbolic interpolant. An
+[`IntervalDensityEstimate`](@ref) uses the same antiderivative on its hyperbolic cells and
+16-point Gauss–Legendre quadrature on its trigonometric ones, where `ψ²` is a trigonometric
+polynomial of low enough frequency that the rule is exact to roundoff. The `F(a) == 0`/`F(b) == 1` endpoints are
 exact because the few ulps of normalization roundoff in the fitted amplitudes are absorbed by a
 global rescaling.
 """
-cdf(d::DensityEstimate, x)
+cdf(d::AbstractDensityEstimate, x)
 
 Statistics.quantile(d::AbstractDensityEstimate, q::Real) = _quantile(d, q)
 
 """
-    quantile(d::DensityEstimate, q)
+    quantile(d::AbstractDensityEstimate, q)
 
 Quantile function of the fitted density, the inverse of [`cdf`](@ref):
 `cdf(d, quantile(d, q)) ≈ q` for `q ∈ [0, 1]`, with `quantile(d, 0) == a` and
-`quantile(d, 1) == b` (the fit's support endpoints, `-Inf`/`Inf` unless
-[`DensityEstimate`](@ref) was given a finite `support`); `q` outside `[0, 1]` (including `NaN`)
-throws a `DomainError`. Extends `Statistics.quantile`.
+`quantile(d, 1) == b` (the fit's support endpoints, `-Inf`/`Inf` unless the fit was given a
+finite `support`); `q` outside `[0, 1]` (including `NaN`) throws a `DomainError`. Extends
+`Statistics.quantile`.
 
 In an unbounded tail the inversion is in closed form; on interior intervals, and on a finite
 boundary segment (transcendental there), a Newton iteration on the closed-form CDF, bracketed
@@ -1658,7 +1661,7 @@ by the enclosing nodes or by the wall and the outermost node, converges to float
 accuracy. The right side is solved through `1 - q`, so upper quantiles lose no more precision
 than `q` itself carries.
 """
-Statistics.quantile(d::DensityEstimate, q)
+Statistics.quantile(d::AbstractDensityEstimate, q)
 
 # Sampling by inversion, `quantile(d, q)` at uniform `q`, for any fit; each draw costs one
 # inversion. `q = 0` (probability 2⁻⁵³ in Float64) is redrawn: on an unbounded left side its

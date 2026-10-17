@@ -171,7 +171,7 @@ sample:
 
 ```@example adaptive
 ztest = randn(4000) .^ 2
-loglik(d) = mean(log.(d.(ztest)))
+loglik(d) = mean(logdensity.(d, ztest))
 
 (constant = round(loglik(d_const); digits = 3),
  varying = round(loglik(d_var); digits = 3),
@@ -290,13 +290,15 @@ rg = select_support(xg)
 *identical* to it — the unbounded candidate always competes, and here it wins outright.
 
 To combine a boundary with a varying scale, pass the chosen
-`support` on to [`select_kappa`](@ref)`(x, Adaptive())` so that its own search runs on the bounded domain:
+`support` on to [`select_kappa`](@ref)`(x, Adaptive())` so that its own search runs on the bounded domain.
+The result is whichever kind of scale wins: a number, an [`AdaptiveScale`](@ref) or a
+[`WindowScale`](@ref).
 
 ```@example bounded
 κ_composed = select_kappa(x, Adaptive(); support=r.support)
 d_composed = DensityEstimate(x, κ_composed; support = r.support)
 
-(α = κ_composed.α, c = round(κ_composed.c; digits=2))
+κ_composed
 ```
 
 We can test whether this fit is a genuine improvement by generating independent data from
@@ -304,7 +306,7 @@ the same underlying distribution:
 
 ```@example bounded
 xtest = -log.(1 .- rand(N))
-loglik(d) = mean(log.(d.(xtest)))
+loglik(d) = mean(logdensity.(d, xtest))
 
 (unbounded = round(loglik(d_unbounded); digits=3),
  bounded = round(loglik(d_bounded); digits=3),

@@ -1603,22 +1603,6 @@ function _amplitude_slope(d::IntervalDensityEstimate, c::Integer, x::Real)
            (d.ψ[c] * _Sfun(k2, a) + d.ψ[c+1] * _Sfun(k2, b))
 end
 
-"""
-    amplitude(d::IntervalDensityEstimate, x)
-
-Evaluate the amplitude `ψ(x)`, so that `d(x) == ψ(x)^2`, at real `x`. Zero outside a finite
-support.
-"""
-amplitude(d::IntervalDensityEstimate, x::Real) = _amplitude(d, x)
-
-"""
-    logdensity(d::IntervalDensityEstimate, x)
-
-Evaluate `ln Q̂(x)` at real `x` without underflow in the tails; `-Inf` outside a finite
-support.
-"""
-logdensity(d::IntervalDensityEstimate, x::Real) = _logdensity(d, x)
-
 (d::IntervalDensityEstimate)(x::Real) = _amplitude(d, x)^2
 
 _tail_rates(d::IntervalDensityEstimate) = (d.kL, d.kR)
@@ -1674,22 +1658,6 @@ function _ccdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where 
     (2 * G[c+1] >= G[c] || 2 * m >= G[c]) && return m
     return G[c+1] + _cell_partial_mass(d, c, x, false)
 end
-
-"""
-    cdf(d::IntervalDensityEstimate, x)
-
-Cumulative distribution function of the fitted density at real `x`; exactly `0` and `1` at the
-support endpoints.
-"""
-cdf(d::IntervalDensityEstimate, x)
-
-"""
-    quantile(d::IntervalDensityEstimate, q)
-
-Quantile function of the fitted density, the inverse of [`cdf`](@ref), for `q ∈ [0, 1]`;
-`q` outside `[0, 1]` throws a `DomainError`.
-"""
-Statistics.quantile(d::IntervalDensityEstimate, q)
 
 # ---------------------------------------------------------------------------------------------
 # Entropy and action
