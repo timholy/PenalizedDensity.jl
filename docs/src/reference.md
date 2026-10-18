@@ -9,4 +9,11 @@ CurrentModule = PenalizedDensity
 
 ```@autodocs
 Modules = [PenalizedDensity]
+Private = false
+```
+
+Support queries, defined as methods of the `Base` functions:
+
+```@docs
+Base.minimum(::AbstractDensityEstimate)
 ```
