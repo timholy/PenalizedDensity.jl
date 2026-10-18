@@ -312,7 +312,7 @@ function _solve_tau(L::_IntervalLayout{T}, g::_IntervalGroup{T}, v, τ0::T) wher
         (τn == τ || abs(τn - τ) <= 4 * eps(T) * abs(τ)) && return τn
         τ = τn
     end
-    error("interval potential did not converge; please report this")
+    throw(ConvergenceError("the interval potential", "safeguarded Newton for a group's τ did not converge in 200 iterations; please report this"))
 end
 
 # Workspace and results of one evaluation of Φ.
@@ -605,7 +605,8 @@ Minimize the reduced objective Φ(s) over positive nodal densities by damped New
 banded Hessian and Armijo backtracking, stopping when the Newton correction reaches
 `eps(T)^(3/4)` relative to `s` or the floor roundoff imposes on it (the same criteria as
 `_solve_amplitude`). Returns the minimizer and the evaluation at it. Throws `_UnresolvableScale`
-if an accepted iterate has a non-finite gradient or Hessian.
+if an accepted iterate has a non-finite gradient or Hessian, and a [`ConvergenceError`](@ref)
+on reaching `maxiter`.
 """
 function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing) where {T}
     m = length(L.y)
@@ -670,7 +671,7 @@ function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing)
         _check_finite_eval(E, L, s)
         finalα = α
     end
-    converged || error("Newton did not converge in $maxiter iterations; the fit is unreliable")
+    converged || throw(ConvergenceError("the interval amplitude solve", "Newton did not converge in $maxiter iterations"))
     if stats !== nothing
         stats.iterations = iters
         stats.backtracks = backs
@@ -1202,8 +1203,8 @@ function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T
             vl[i] <= sqrt(eps(T)) * v0[i] && (resolved[i] = false)
         end
     end
-    converged || error("deleting an observation in [$(L.y[first(nodes)]), $(L.y[last(nodes)])] " *
-                       "did not converge; please report this")
+    converged || throw(ConvergenceError("the leave-one-out update",
+        "deleting the observation in [$(L.y[first(nodes)]), $(L.y[last(nodes)])] did not converge in 100 iterations; please report this"))
     return vl, cur, resolved
 end
 
@@ -1399,6 +1400,7 @@ end
 # The rounding interval of each lattice value. Bounds are formed from integer lattice indices so
 # that adjacent intervals share their endpoint exactly.
 function _lattice_bounds(x::AbstractVector, δ::T, support) where {T}
+    _check_no_nan_observations(x)
     x0 = T(minimum(x))
     lo, hi = support
     lower = similar(x, T)
@@ -1483,6 +1485,7 @@ function _cell_log_amplitude(d::IntervalDensityEstimate{T}, c::Int, x::T) where 
 end
 
 function _amplitude(d::IntervalDensityEstimate{T}, x::Real) where {T}
+    _check_not_nan(x)
     xs = d.x
     m = length(xs)
     xT = T(x)
@@ -1497,6 +1500,7 @@ function _amplitude(d::IntervalDensityEstimate{T}, x::Real) where {T}
 end
 
 function _logdensity(d::IntervalDensityEstimate{T}, x::Real) where {T}
+    _check_not_nan(x)
     xs = d.x
     m = length(xs)
     xT = T(x)
@@ -1581,7 +1585,7 @@ _gauss16(::Type{Float64}) = _GAUSS16_F64
 function _cdf_mass(d::IntervalDensityEstimate{T}, F::Vector{T}, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     m = length(xs)
-    isnan(x) && return T(NaN)
+    _check_not_nan(x)
     xT = T(x)
     if xT <= xs[1]
         isfinite(d.lo) || return ψ[1]^2 / (2d.kL) * exp(2d.kL * (xT - xs[1]))
@@ -1642,7 +1646,7 @@ function _invert_mass(d::IntervalDensityEstimate{T}, massfun, lo::T, hi::T, y::T
         ynew == y && return y
         y = ynew
     end
-    error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
+    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
 end
 
 function _quantile(d::IntervalDensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}

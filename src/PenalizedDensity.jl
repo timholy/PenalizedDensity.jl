@@ -23,12 +23,32 @@ Supertype of the fitted densities: [`DensityEstimate`](@ref) (point observations
 [`IntervalDensityEstimate`](@ref) (interval observations, optionally mixed with points). Every
 subtype is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
 [`logdensity`](@ref), [`cdf`](@ref), and [`quantile`](@ref Statistics.quantile).
+Evaluating any of these at `NaN` throws a `DomainError`.
 
 Every subtype also supports the support queries [`minimum`](@ref Base.minimum),
 `maximum` and `extrema`, and sampling by inversion through `rand`: `rand(d)`,
 `rand(rng, d, dims...)` and `rand!(rng, A, d)` draw from the fitted density.
 """
 abstract type AbstractDensityEstimate end
+
+"""
+    ConvergenceError(routine, msg)
+
+Thrown when an iterative routine (a fit's Newton solve, a quantile or probit inversion, or a
+selector's search) stops without converging. `routine` names it and `msg` describes the state
+at which it stopped. The result such a routine would return is unreliable, so it is not
+returned.
+"""
+struct ConvergenceError <: Exception
+    routine::String
+    msg::String
+end
+Base.showerror(io::IO, e::ConvergenceError) = print(io, "ConvergenceError in ", e.routine, ": ", e.msg)
+
+# The evaluators order `x` against the nodes, and NaN has no place in that order.
+_check_not_nan(x) = isnan(x) ? throw(DomainError(x, "the evaluation point must not be NaN")) : nothing
+_check_no_nan_observations(x) =
+    any(isnan, x) ? throw(ArgumentError("observations must not be NaN")) : nothing
 
 """
     DensityEstimate(x::AbstractVector{T}, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
@@ -292,6 +312,8 @@ A sorted, one-based working copy of the sample `x`, whatever its axes. Every ind
 takes afterwards — into the sample, into a scale realized on it, into the merged nodes —
 is an index into this copy, and none of them escape, so the caller's axes have nothing to
 propagate to.
+
+A NaN in `x` throws an `ArgumentError`.
 """
 function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
     xs = Vector{T}(undef, length(x))
@@ -300,6 +322,7 @@ function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
         xs[i] = xi
         i += 1
     end
+    _check_no_nan_observations(xs)
     return sort!(xs)
 end
 
@@ -516,7 +539,7 @@ Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and back
 along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
 Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
 roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
-tolerance. Reaching `maxiter` throws.
+tolerance. Reaching `maxiter` throws a [`ConvergenceError`](@ref).
 
 A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
 """
@@ -614,7 +637,7 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
         Fψ = Fnew
         finalα = α
     end
-    converged || error("Newton did not converge in $maxiter iterations; the fit is unreliable")
+    converged || throw(ConvergenceError("the amplitude solve", "Newton did not converge in $maxiter iterations"))
     if stats !== nothing
         stats.iterations = iters
         stats.backtracks = backs
@@ -939,6 +962,7 @@ amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
 amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
 function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
+    _check_not_nan(x)
     xs = d.x
     n = length(xs)
     if x <= xs[1]
@@ -1003,6 +1027,7 @@ logdensity(d::DensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi),
 # ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`, and the two must be kept
 # so: a caller reaching either one for the same quantity may not get a different answer.
 function _logdensity(d::DensityEstimate{T}, x::Real) where {T}
+    _check_not_nan(x)
     xs = d.x
     n = length(xs)
     if x <= xs[1]
@@ -1089,6 +1114,7 @@ _sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + 
 # value returned at a node is the limit from within the enclosing interval. Outside a finite
 # support ψ ≡ 0, so ψ' = 0 there.
 function _amplitude_prime(d::DensityEstimate{T}, x::Real) where {T}
+    _check_not_nan(x)
     xs, ψ = d.x, d.ψ
     n = length(xs)
     xT = T(x)
@@ -1232,7 +1258,7 @@ end
 function _cdf_mass(d::DensityEstimate{T}, F::Vector{T}, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
-    isnan(x) && return T(NaN) * one(x)
+    _check_not_nan(x)
     if x <= xs[1]
         isfinite(d.lo) || return ψ[1]^2 / (2 * d.κL) * exp(2 * d.κL * (x - xs[1]))
         x <= d.lo && return zero(T) * one(x)
@@ -1294,7 +1320,7 @@ end
 function _ccdf_mass(d::DensityEstimate{T}, G::Vector{T}, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
-    isnan(x) && return T(NaN) * one(x)
+    _check_not_nan(x)
     if x >= xs[n]
         isfinite(d.hi) || return ψ[n]^2 / (2 * d.κR) * exp(-2 * d.κR * (x - xs[n]))
         x >= d.hi && return zero(T) * one(x)
@@ -1455,7 +1481,7 @@ function _invert_cdf_mass(d::DensityEstimate{T}, massfun, lo::T, hi::T, y::T, ta
         ynew == y && return y
         y = ynew
     end
-    error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
+    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
 end
 
 # As `_invert_cdf_mass`, but for a `massfun` that *decreases* with y (derivative `-ψ(y)²`) —
@@ -1471,7 +1497,7 @@ function _invert_cdf_mass_complement(d::DensityEstimate{T}, massfun, lo::T, hi::
         ynew == y && return y
         y = ynew
     end
-    error("quantile: safeguarded Newton failed to converge at target = $target — please report this")
+    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
 end
 
 function _quantile(d::DensityEstimate{T}, F::Vector{T}, total::T, q::Real) where {T}
@@ -1520,7 +1546,7 @@ function _probit_from_log(ℓ::T) where {T<:AbstractFloat}
         t += Δ
         abs(Δ) <= 2 * eps(t) && return -t
     end
-    error("gaussianize: probit iteration failed to converge at ln(p) = $ℓ — please report this")
+    throw(ConvergenceError("gaussianize", "the probit Newton iteration did not converge in 12 iterations at ln(p) = $ℓ; please report this"))
 end
 
 # Φ⁻¹ fed from whichever tail mass is smaller, so it always receives a probability at full
@@ -1539,7 +1565,7 @@ _probit_from_masses(mlo::T, mhi::T, total::T) where {T} =
 function _gaussianize(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, total::T, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
-    isnan(x) && return T(NaN) * one(x)
+    _check_not_nan(x)
     if x <= xs[1]
         isinf(d.lo) &&
             return _probit_from_log(2 * d.κL * (x - xs[1]) + log(ψ[1]^2 / (2 * d.κL * total)))
@@ -1564,7 +1590,7 @@ end
 function _ungaussianize(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, total::T, y::Real) where {T}
     xs, ψ = d.x, d.ψ
     n = length(xs)
-    isnan(y) && return T(NaN) * one(y)
+    _check_not_nan(y)
     if y <= 0
         ℓ = _logΦ(y)
         if isinf(d.lo) && ℓ <= log(F[1] / total)    # left tail: ln F is linear in x
@@ -1593,7 +1619,6 @@ function _gaussianize_logjac(d::DensityEstimate{T}, F::Vector{T}, G::Vector{T}, 
     xs = d.x
     n = length(xs)
     y = _gaussianize(d, F, G, total, x)
-    isnan(x) && return (; y, logjac = y)
     if x <= xs[1]
         isinf(d.lo) &&
             return (; y, logjac = log(2 * d.κL) + log(T(π) / 2) / 2 + log(erfcx(-y / sqrt(T(2)))))
@@ -1618,7 +1643,7 @@ density is positive.
 On an unbounded side the composition is evaluated in log space beyond the extreme node
 (`ln F` is exactly linear in `x` in the exponential tail), so `y` remains finite and fully
 accurate arbitrarily far into the tail instead of saturating to `±Inf` where `F` would round
-to 0 or 1. `gaussianize(d, ±Inf) == ±Inf`, and `NaN` propagates.
+to 0 or 1. `gaussianize(d, ±Inf) == ±Inf`, and `NaN` throws a `DomainError`.
 
 A finite `support` (see [`DensityEstimate`](@ref)) and a per-interval `κ` are both handled.
 Because a compact-support density has no bijection onto all of `ℝ`, the walls map to infinity
@@ -1664,8 +1689,7 @@ and mapping them through this function samples from the fit.
 The probability `Φ(y)` is never formed on its losing side: for `y > 0` the complement
 `1 - Φ(y)` is computed directly, and deep tails run in log space through the closed-form
 exponential-tail inverse, so large `|y|` maps to the corresponding finite `x` rather than
-saturating to `±Inf`. `ungaussianize(d, ±Inf) == ±Inf`, and `NaN` propagates (every real
-`y` is in the domain, unlike `quantile`, whose out-of-domain `q` throws).
+saturating to `±Inf`. `ungaussianize(d, ±Inf) == ±Inf`, and `NaN` throws a `DomainError`.
 
 `y` may be a scalar or an array; the array method assembles the per-node cumulative
 masses once and shares them across all evaluations.
@@ -2279,6 +2303,15 @@ function _wald_ccdf(μ::T, z::Real) where {T}
     return _Φ(-a) - erfcx(b / sqrt(T(2))) * exp(2λ / μ - b^2 / 2) / 2
 end
 
+# The reference χ² law is supported on z > 0, so both methods return the same limits outside
+# it: survival 1 and density 0 for z ≤ 0, survival and density 0 at z = Inf.
+function _check_chisq_args(z::Real, method::Symbol)
+    method === :exact || method === :largeN ||
+        throw(ArgumentError("method must be :exact or :largeN, got :$method"))
+    isnan(z) && throw(DomainError(z, "the χ² value must not be NaN"))
+    return nothing
+end
+
 """
     chisq_ccdf(d::DensityEstimate, z; method=:exact)   -> P(χ² ≥ z)
     chisq_ccdf(ref::ChisqReference, z; method=:exact)  -> P(χ² ≥ z)
@@ -2294,8 +2327,10 @@ is a closed form, far cheaper per call, and — like the exact law — defined a
 Pass a prebuilt [`ChisqReference`](@ref) to avoid reassembling it across calls.
 """
 function chisq_ccdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
+    _check_chisq_args(z, method)
+    z > 0 || return one(T)
+    isfinite(z) || return zero(T)
     method === :largeN && return _wald_ccdf(r.mean, z)
-    method === :exact || throw(ArgumentError("method must be :exact or :largeN, got :$method"))
     # atol is required: at the median of the law the integral is ~0, and a purely relative
     # tolerance would subdivide without end. It bounds the error in the probability by atol/π.
     zT = T(z)
@@ -2326,8 +2361,9 @@ with `⟨χ²⟩ =` [`expected_chisq`](@ref) the exact mean: a closed form, defi
 Pass a prebuilt [`ChisqReference`](@ref) to reuse it.
 """
 function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
+    _check_chisq_args(z, method)
+    z > 0 && isfinite(z) || return zero(T)
     method === :largeN && return _wald_pdf(r.mean, z)
-    method === :exact || throw(ArgumentError("method must be :exact or :largeN, got :$method"))
     # atol floors the density: deep in the tail the true value underflows to ~0, and a purely
     # relative tolerance would otherwise subdivide the oscillatory integrand without end.
     zT = T(z)
@@ -2376,6 +2412,7 @@ end
 # Geometric κ grid from coarse (≈ one blob over the data) to fine (≈ individual points),
 # scaled to the data's extent, wide enough to bracket the minimum-sensitivity scale.
 function _default_κs(x::AbstractVector{<:Real})
+    _check_no_nan_observations(x)
     lo, hi = extrema(x)
     span = hi - lo
     span > 0 || throw(ArgumentError("need at least two distinct points to select κ"))
@@ -3077,7 +3114,7 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
                 fl = f(l)
                 fl < typemax(T) && return exp(l), fl
                 skip_unresolved && return nothing
-                error("no resolvable $label at the clamped bound c = $(exp(l))")
+                throw(ConvergenceError("the $label search", "no resolvable $label at the clamped bound c = $(exp(l))"))
             end
         end
         lncs = range(loln, hiln; length=ngrid)
@@ -3087,7 +3124,7 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
         end
         if all(==(typemax(T)), scores)
             skip_unresolved && return nothing
-            error("no resolvable $label anywhere in the search bracket around c = $c0")
+            throw(ConvergenceError("the $label search", "no resolvable $label anywhere in the search bracket around c = $c0"))
         end
         i = argmin(scores)
         if i != firstindex(lncs) && i != lastindex(lncs)
@@ -3101,7 +3138,7 @@ function _select_c_scored(score, c0::T; span::Real=_CSPAN, ngrid::Int=_CGRID, it
         end
         c0 = exp(lncs[i])                       # recenter on the winning edge and search on
     end
-    error("the $label kept running off its search bracket after $maxshifts expansions")
+    throw(ConvergenceError("the $label search", "the minimum kept running off the search bracket after $maxshifts expansions"))
 end
 
 include("window.jl")
@@ -3424,13 +3461,13 @@ function _select_gap(score, spacing::T) where {T}
             scores[j] = f(lncs[j])
         end
         all(==(typemax(T)), scores) &&
-            error("no resolvable boundary gap anywhere in the search bracket above $(exp(lo0))")
+            throw(ConvergenceError("the boundary-gap search", "no resolvable boundary gap anywhere in the search bracket above $(exp(lo0))"))
         i = argmin(scores)
         i == firstindex(lncs) && return exp(lo0)     # hit the floor: accept it, don't recenter
         i == lastindex(lncs) || return exp(_golden_min(f, lncs[i-1], lncs[i+1]; iters=_GAP_ITERS))
         lo0, hi0 = hi0, hi0 + (hi0 - lo0)            # extend outward and search on
     end
-    error("the boundary gap kept running off its search bracket after $_CSHIFTS expansions")
+    throw(ConvergenceError("the boundary-gap search", "the minimum kept running off the search bracket after $_CSHIFTS expansions"))
 end
 
 # Finite-boundary search for one side (:left or :right), the opposite side fixed at

@@ -453,7 +453,8 @@ end
         # Limits, NaN, and domain errors.
         @test cdf(d, -Inf) == 0 && cdf(d, Inf) == 1
         @test quantile(d, 0) == -Inf && quantile(d, 1) == Inf
-        @test isnan(cdf(d, NaN))
+        @test_throws DomainError cdf(d, NaN)
+        @test_throws "the evaluation point must not be NaN" cdf(d, NaN)
         @test_throws DomainError quantile(d, -0.1)
         @test_throws DomainError quantile(d, 1.1)
         @test_throws DomainError quantile(d, NaN)
@@ -558,9 +559,9 @@ end
         # Limits, NaN.
         @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
         @test ungaussianize(d, -Inf) == -Inf && ungaussianize(d, Inf) == Inf
-        @test isnan(gaussianize(d, NaN)) && isnan(ungaussianize(d, NaN))
-        nanlj = gaussianize_logjacobian(d, NaN)
-        @test isnan(nanlj.y) && isnan(nanlj.logjac)
+        @test_throws "the evaluation point must not be NaN" gaussianize(d, NaN)
+        @test_throws "the evaluation point must not be NaN" ungaussianize(d, NaN)
+        @test_throws "the evaluation point must not be NaN" gaussianize_logjacobian(d, NaN)
         @test gaussianize_logjacobian(d, Inf).logjac == -Inf   # dy/dx → 0 in the tails
         @test gaussianize_gradient(d, Inf) == 0
 
@@ -1069,10 +1070,11 @@ end
             @test c ≈ 2.0 && s == gridonly(c)
 
             # Nothing resolvable anywhere in the opening bracket.
+            @test_throws PenalizedDensity.ConvergenceError sel(_ -> NaN, 1.0)
             @test_throws "no resolvable smoothing scale" sel(_ -> NaN, 1.0)
             @test PenalizedDensity._select_c_scored(_ -> NaN, 1.0; skip_unresolved=true) === nothing
             # A score with no interior minimum runs off the bracket until it gives up.
-            @test_throws "kept running off its search bracket" sel(c -> -log(c), 1.0)
+            @test_throws "kept running off the search bracket" sel(c -> -log(c), 1.0)
         end
 
         @testset "an unresolvable candidate scores NaN" begin
@@ -1851,6 +1853,72 @@ end
         @test_throws ArgumentError select_kappa_kl([3.0])                        # need ≥ 2 distinct
         @test_throws "need at least two distinct points to select κ" select_kappa_kl([3.0])
     end
+
+    @testset "error model: NaN throws, non-convergence throws ConvergenceError" begin
+        # NaN observations, in every form that takes data.
+        @test_throws ArgumentError DensityEstimate([0.0, NaN, 1.0], 1.0)
+        @test_throws "observations must not be NaN" DensityEstimate([0.0, NaN, 1.0], 1.0)
+        @test_throws "observations must not be NaN" select_kappa_kl([0.0, NaN, 1.0, 2.0])
+        @test_throws "observations must not be NaN" IntervalDensityEstimate([0.0, NaN, 1.0], 1.0; resolution=1.0)
+
+        # NaN evaluation points, for every evaluator and every kind of fit; ±Inf keep their
+        # limits.
+        x = [-1.3, -0.2, 0.4, 0.9, 2.1]
+        fits = (DensityEstimate(x, 1.0),
+                DensityEstimate(x, 1.0; support=(-2.0, 3.0)),
+                DensityEstimate(x, t -> 1 + t^2 / 4),
+                IntervalDensityEstimate([-1.0, 0.0, 1.5], [-0.5, 0.5, 2.0], 1.0))
+        for d in fits
+            @test_throws DomainError d(NaN)
+            @test_throws "the evaluation point must not be NaN" d(NaN)
+            @test_throws "the evaluation point must not be NaN" amplitude(d, NaN)
+            @test_throws "the evaluation point must not be NaN" logdensity(d, NaN)
+            @test_throws "the evaluation point must not be NaN" cdf(d, NaN)
+            @test_throws "the evaluation point must not be NaN" logdensity(d, [0.0, NaN])
+            @test_throws "the evaluation point must not be NaN" cdf(d, [0.0, NaN])
+            @test d(-Inf) == 0 && logdensity(d, -Inf) == -Inf
+            @test cdf(d, -Inf) == 0 && cdf(d, Inf) == 1
+        end
+        for d in fits[1:3]
+            @test_throws "the evaluation point must not be NaN" gaussianize(d, NaN)
+            @test_throws "the evaluation point must not be NaN" gaussianize(d, [0.0, NaN])
+            @test_throws "the evaluation point must not be NaN" ungaussianize(d, NaN)
+            @test_throws "the evaluation point must not be NaN" gaussianize_logjacobian(d, NaN)
+            @test_throws "the evaluation point must not be NaN" gaussianize_gradient(d, NaN)
+            @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
+        end
+        @test_throws "the evaluation point must not be NaN" logdensity_eval_gradient(fits[1], NaN)
+        # Past a finite wall the conventions are the compact-support ones, not errors.
+        db = fits[2]
+        @test db(-2.5) == 0 && logdensity(db, -2.5) == -Inf
+        @test gaussianize(db, -2.5) == -Inf && gaussianize(db, 3.5) == Inf
+        @test gaussianize_logjacobian(db, 3.5).logjac == -Inf
+
+        # The χ² reference: both methods treat z identically outside its support.
+        r = chisq_reference(fits[1])
+        for method in (:exact, :largeN)
+            @test_throws DomainError chisq_ccdf(r, NaN; method)
+            @test_throws "the χ² value must not be NaN" chisq_ccdf(r, NaN; method)
+            @test_throws "the χ² value must not be NaN" chisq_pdf(r, NaN; method)
+            @test chisq_ccdf(r, -1.0; method) == 1 && chisq_ccdf(r, 0.0; method) == 1
+            @test chisq_ccdf(r, Inf; method) == 0
+            @test chisq_pdf(r, -1.0; method) == 0 && chisq_pdf(r, 0.0; method) == 0
+            @test chisq_pdf(r, Inf; method) == 0
+        end
+        @test_throws "method must be :exact or :largeN" chisq_ccdf(r, NaN; method=:bogus)
+
+        # Non-convergence: a Newton solve cut off before it converges.
+        nodes, w = [-1.0, 0.0, 0.5, 2.0], [1.0, 2.0, 1.0, 1.0]
+        M = PenalizedDensity.roughness_operator(nodes, 3.0)
+        @test_throws PenalizedDensity.ConvergenceError PenalizedDensity._solve_amplitude(M, w; maxiter=1)
+        err = try
+            PenalizedDensity._solve_amplitude(M, w; maxiter=1)
+        catch e
+            e
+        end
+        @test sprint(showerror, err) ==
+              "ConvergenceError in the amplitude solve: Newton did not converge in 1 iterations"
+    end
 end
 
 @testset "bounded support (natural/Neumann boundary)" begin
@@ -2445,10 +2513,10 @@ end
         @test_throws "the 10 points nearest the left edge coincide" select_support(x; resolution=0)
 
         # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
-        @test_throws ErrorException PenalizedDensity._select_gap(gap -> NaN, 1.0)
+        @test_throws PenalizedDensity.ConvergenceError PenalizedDensity._select_gap(gap -> NaN, 1.0)
         @test_throws "no resolvable boundary gap" PenalizedDensity._select_gap(gap -> NaN, 1.0)
-        @test_throws ErrorException PenalizedDensity._select_gap(gap -> -gap, 1.0)
-        @test_throws "kept running off its search bracket" PenalizedDensity._select_gap(gap -> -gap, 1.0)
+        @test_throws PenalizedDensity.ConvergenceError PenalizedDensity._select_gap(gap -> -gap, 1.0)
+        @test_throws "kept running off the search bracket" PenalizedDensity._select_gap(gap -> -gap, 1.0)
     end
 
     @testset "generic indexing: OffsetVector input" begin
