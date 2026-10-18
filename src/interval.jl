@@ -604,7 +604,7 @@ end
 
 Minimize the reduced objective Φ(s) over positive nodal densities by damped Newton with a
 banded Hessian and Armijo backtracking, stopping when the Newton correction reaches
-`eps(T)^(3/4)` relative to `s` or the floor roundoff imposes on it (the same criteria as
+`eps(T)^(3/4)` relative to `s` or the floor roundoff imposes on it (`_newton_stop`, shared with
 `_solve_amplitude`). Returns the minimizer and the evaluation at it. Throws `_UnresolvableScale`
 if an accepted iterate has a non-finite gradient or Hessian, and a [`ConvergenceError`](@ref)
 on reaching `maxiter`.
@@ -617,7 +617,6 @@ function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing)
     _check_finite_eval(E, L, s)
     Et = _PhiEval(L, bw)
     Δ = similar(s); snew = similar(s)
-    stol = eps(T)^(3 // 4)
     prevstep = T(Inf)
     unguarded = false
     iters = 0; backs = 0; reason = :none
@@ -628,20 +627,14 @@ function _solve_interval(L::_IntervalLayout{T}; maxiter::Int=200, stats=nothing)
         _banded_cholesky_solve!(E.band, Δ)          # Δ = H⁻¹∇Φ; the step is -Δ
         decrement = dot(E.gs, Δ)
         step = maximum(i -> abs(Δ[i]) / s[i], eachindex(s, Δ))
-        if step <= stol
-            converged = true; reason = :tolerance; finalstep = step
-            break
-        elseif unguarded && step >= prevstep
-            converged = true; reason = :floor; finalstep = step
+        reason = _newton_stop(step, prevstep, unguarded)
+        if reason !== :none
+            converged = true; finalstep = step
             break
         end
         iters += 1
         prevstep = step
-        α = one(T)
-        for i in eachindex(s, Δ)
-            Δ[i] > 0 && (α = min(α, s[i] / Δ[i]))
-        end
-        α < 1 && (α *= T(0.99))
+        α = _positivity_cap(s, Δ)
         Et.τ .= E.τ
         if α * decrement / 4 <= 4 * sqrt(T(m)) * eps(T) * E.scale
             unguarded = true

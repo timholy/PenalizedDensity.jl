@@ -657,6 +657,38 @@ mutable struct SolveStats
 end
 SolveStats() = SolveStats(0, 0, :none, NaN, NaN)
 
+# Stopping rule of the damped-Newton solvers, given the relative Newton correction `step` =
+# maxᵢ |Δᵢ|/xᵢ, its value `prevstep` at the previous iteration, and whether a step has been
+# taken without the Armijo test (`unguarded`). Returns `:tolerance`, `:floor` or `:none`.
+#
+# The correction Δ is what the next step would subtract, so in the quadratic regime it is the
+# remaining error in x. Testing the objective instead, or the Newton decrement, which predicts
+# the same difference, constrains a quantity that is stationary at the minimizer, and is
+# satisfied while x is still wrong by the square root of the tolerance; that error would carry
+# into the normalization and the density.
+#
+# Roundoff floors the attainable correction at a level set by the conditioning of the Hessian,
+# and on a widely spread sample that floor can sit well above the tolerance; stopping when the
+# correction ceases to fall covers that case. The floor is only meaningful once the objective
+# has stopped resolving the decrease the step predicts, which is what `unguarded` records:
+# while the Armijo test is still informative the correction may plateau for a step or two
+# without the iteration being finished.
+function _newton_stop(step::T, prevstep::T, unguarded::Bool) where {T}
+    step <= eps(T)^(3 // 4) && return :tolerance
+    unguarded && step >= prevstep && return :floor
+    return :none
+end
+
+# Largest α ≤ 1 keeping x - αΔ strictly positive, shortened by 1% when that bound binds so the
+# iterate stays off the boundary of the orthant.
+function _positivity_cap(x::AbstractVector{T}, Δ::AbstractVector{T}) where {T}
+    α = one(T)
+    for i in eachindex(x, Δ)
+        Δ[i] > 0 && (α = min(α, x[i] / Δ[i]))
+    end
+    return α < one(T) ? α * oftype(α, 0.99) : α
+end
+
 """
     _solve_amplitude(M, w)    -> ψ
 
@@ -679,13 +711,6 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
     ψ = fill(oneunit(T), n)             # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
     Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
-    # The correction Δ is what the next step would subtract, so in the quadratic
-    # regime it is the remaining error in ψ. Testing F instead — or the Newton
-    # decrement, which predicts the same difference — constrains a quantity that
-    # is stationary at the minimizer, and is satisfied while ψ is still wrong by
-    # the square root of the tolerance; that error would carry into Z, λ, and the
-    # density.
-    stol = eps(T)^(3//4)                # relative tolerance on the Newton correction
     W = sum(w)                          # total multiplicity, the scale of F's two terms
     Fψ = _objective(M, w, ψ)
     prevstep = T(Inf)
@@ -706,28 +731,14 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
         for i in eachindex(Δ, ψ)
             step = max(step, abs(Δ[i]) / ψ[i])   # ψ > 0 throughout
         end
-        # Roundoff floors the attainable correction at a level set by the
-        # conditioning of ∇²F, and on a widely spread sample that floor can sit
-        # well above `stol`; stopping when the correction ceases to fall covers
-        # that case. The floor is only meaningful once F has stopped resolving
-        # the decrease the step predicts, which is what `unguarded` records —
-        # while the Armijo test is still informative the correction may plateau
-        # for a step or two without the iteration being finished.
-        if step <= stol
-            converged = true; reason = :tolerance; finalstep = step
-            break
-        elseif unguarded && step >= prevstep
-            converged = true; reason = :floor; finalstep = step
+        reason = _newton_stop(step, prevstep, unguarded)
+        if reason !== :none
+            converged = true; finalstep = step
             break
         end
         iters += 1
         prevstep = step
-        # Largest α ≤ 1 keeping ψ - αΔ strictly positive, then Armijo backtracking.
-        α = one(T)
-        for i in eachindex(ψ, Δ)
-            Δ[i] > 0 && (α = min(α, ψ[i] / Δ[i]))
-        end
-        α < one(T) && (α *= oftype(α, 0.99))
+        α = _positivity_cap(ψ, Δ)         # then Armijo backtracking
         # Armijo compares two values of F differing by α·decrement/4. F is a
         # difference of terms accumulated over n nodes, so rounding leaves it
         # uncertain by roughly √n·eps times the size of those terms
