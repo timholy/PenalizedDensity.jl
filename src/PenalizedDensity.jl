@@ -1251,40 +1251,32 @@ _cosh_ratio2(v::T, u::T) where {T} = exp(v - u) * (oneunit(T) + exp(-2v)) / (one
 # (via expm1, the same treatment _sinh_ratio gives its numerator).
 _sinh_ratio2(v::T, u::T) where {T} = exp(v - u) * (-expm1(-2v)) / (oneunit(T) + exp(-2u))
 
-# ψ'(x): derivative of the amplitude with respect to the evaluation coordinate. Mirrors
-# `_amplitude` interval by interval, with cosh/sinh written through the overflow-safe ratios.
-# In an unbounded tail ψ = ψ_edge e^{∓κ(x - x_edge)}, so ψ' = ±κ ψ; at a finite boundary the
-# cosh arc's derivative is the matching sinh arc. Discontinuous at the nodes (ψ' jumps); the
-# value returned at a node is the limit from within the enclosing interval. Outside a finite
-# support ψ ≡ 0, so ψ' = 0 there.
-function _amplitude_prime(d::DensityEstimate{T}, x::Real) where {T}
-    _check_not_nan(x)
-    xs, ψ = d.x, d.ψ
-    n = length(xs)
-    xT = T(x)
-    if xT <= xs[1]
-        xT < d.lo && return zero(T)
-        return _left_tail_amplitude_prime(ψ[1], d.κL, xT, xs[1], d.lo)
-    elseif xT >= xs[n]
-        xT > d.hi && return zero(T)
-        return _right_tail_amplitude_prime(ψ[n], d.κR, xT, xs[n], d.hi)
-    end
-    k = searchsortedlast(xs, xT)
-    κ = _kappa(d, k)
-    a = κ * (xs[k+1] - xT)          # a, b ≥ 0 and a + b = θ
-    b = κ * (xT - xs[k])
-    θ = a + b
-    return κ * (ψ[k+1] * _cosh_ratio(b, θ) - ψ[k] * _cosh_ratio(a, θ))
+# ψ'(x)/ψ(x) on a sinh arc ψ ∝ ψk sinh(a) + ψk1 sinh(b), with a = κ(x_{k+1} - x) and
+# b = κ(x - x_k), in units of κ. Every hyperbolic function is scaled by e^{-max(a, b)}, so
+# the larger term of each sum is O(1); ψ and ψ' themselves underflow in the middle of a
+# wide interval, where the ratio is still finite.
+function _sinh_arc_slope(ψk::T, ψk1::T, a::T, b::T) where {T}
+    m = max(a, b)
+    ea, eb = exp(a - m), exp(b - m)
+    num = ψk1 * eb * (1 + exp(-2b)) - ψk * ea * (1 + exp(-2a))
+    den = ψk * ea * (-expm1(-2a)) + ψk1 * eb * (-expm1(-2b))
+    return num / den
 end
 
-# ψ'(x) in the left tail: κ ψ₁ e^{κ(x-x1)} when unbounded, or the Neumann cosh arc's derivative
-# κ ψ₁ sinh(κ(x-lo))/cosh(κ(x1-lo)) at a finite boundary (the derivative of `_left_tail_amplitude`).
-_left_tail_amplitude_prime(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
-    isfinite(lo) ? κ * ψ1 * _sinh_ratio2(κ * (x - lo), κ * (x1 - lo)) : κ * ψ1 * exp(κ * (x - x1))
+# ψ'(x)/ψ(x) inside interval k.
+function _amplitude_slope(d::DensityEstimate{T}, k::Integer, x::T) where {T}
+    xs, ψ = d.x, d.ψ
+    κ = _kappa(d, k)
+    return κ * _sinh_arc_slope(ψ[k], ψ[k+1], κ * (xs[k+1] - x), κ * (x - xs[k]))
+end
 
-# Mirror of `_left_tail_amplitude_prime` for the right tail; the sign flips with dx.
-_right_tail_amplitude_prime(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
-    isfinite(hi) ? -κ * ψn * _sinh_ratio2(κ * (hi - x), κ * (hi - xn)) : -κ * ψn * exp(-κ * (x - xn))
+# ψ'(x)/ψ(x) in the left tail (lo ≤ x ≤ x1) with decay rate κ: the constant κ when
+# unbounded, and κ tanh(κ(x - lo)) on the Neumann cosh arc of a finite boundary. Neither
+# depends on ψ, which underflows deep in a tail.
+_left_tail_slope(κ::T, x::T, lo::T) where {T} = isfinite(lo) ? κ * tanh(κ * (x - lo)) : κ
+
+# Mirror of `_left_tail_slope` for the right tail.
+_right_tail_slope(κ::T, x::T, hi::T) where {T} = isfinite(hi) ? -κ * tanh(κ * (hi - x)) : -κ
 
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
@@ -1998,24 +1990,39 @@ function negentropy(d::AbstractDensityEstimate, xeval::AbstractVector)
 end
 
 """
-    logdensity_eval_gradient(d::DensityEstimate, y) -> ∂ln Q̂(y)/∂y
+    logdensity_eval_gradient(d::AbstractDensityEstimate, y) -> ∂ln Q̂(y)/∂y
 
 Derivative of the log fitted density with respect to the evaluation coordinate,
 
     ∂ ln Q̂(y) / ∂y = 2 ψ'(y) / ψ(y),
 
-in closed form: `ψ, ψ'` are the hyperbolic interpolant and its derivative on the interval
-enclosing `y` (and `±κ ψ` in the tails), so the cost is `O(1)` per point with no linear
-solve. See [`logdensity_node_gradient`](@ref) for the sensitivity to the node positions
-instead. The log density has a kink at each node `d.x[k]` (`ψ'` jumps there), so at a node
-the value returned is the one-sided derivative approaching from within the enclosing
-interval.
+in closed form on the cell enclosing `y`, so the cost is `O(1)` per point with no linear
+solve. The ratio is formed without evaluating `ψ`, so it stays finite where the density
+underflows: on an unbounded tail with decay rate `k` it is exactly `±2k`. Outside a finite
+support, where `ln Q̂ ≡ -Inf`, the result is `NaN`. See [`logdensity_node_gradient`](@ref)
+for the sensitivity to the node positions instead. The log density has a kink at each node
+`d.x[k]` (`ψ'` jumps there), so at a node the value returned is the one-sided derivative
+approaching from within the enclosing interval.
 
 `y` may be a scalar or an array; the array method returns an array with the axes of `y`.
 """
-logdensity_eval_gradient(d::DensityEstimate, y::Real) =
-    2 * _amplitude_prime(d, y) / _amplitude(d, y)
-logdensity_eval_gradient(d::DensityEstimate, y::AbstractArray) =
+function logdensity_eval_gradient(d::AbstractDensityEstimate, y::Real)
+    _check_not_nan(y)
+    T = eltype(d)
+    xs = d.x
+    n = length(xs)
+    yT = T(y)
+    κL, κR = _tail_rates(d)
+    if yT <= xs[1]
+        yT < d.lo && return T(NaN)
+        return 2 * _left_tail_slope(κL, yT, d.lo)
+    elseif yT >= xs[n]
+        yT > d.hi && return T(NaN)
+        return 2 * _right_tail_slope(κR, yT, d.hi)
+    end
+    return 2 * _amplitude_slope(d, searchsortedlast(xs, yT), yT)
+end
+logdensity_eval_gradient(d::AbstractDensityEstimate, y::AbstractArray) =
     map(yi -> logdensity_eval_gradient(d, yi), y)
 
 """

@@ -1533,6 +1533,21 @@ function _logdensity(d::IntervalDensityEstimate{T}, x::Real) where {T}
     return 2 * _cell_log_amplitude(d, searchsortedlast(xs, xT), xT)
 end
 
+# ψ'(x)/ψ(x) on interior cell c. A cell with k² ≤ 0 has |k|h < π, so S is positive and
+# bounded across it and the direct ratio does not underflow.
+function _amplitude_slope(d::IntervalDensityEstimate{T}, c::Integer, x::T) where {T}
+    x0, x1 = d.x[c], d.x[c+1]
+    k2 = d.k2[c]
+    if k2 > 0
+        k = sqrt(k2)
+        return k * _sinh_arc_slope(d.ψ[c], d.ψ[c+1], k * (x1 - x), k * (x - x0))
+    end
+    k = sqrt(-k2)
+    a, b = x1 - x, x - x0
+    return (d.ψ[c+1] * cos(k * b) - d.ψ[c] * cos(k * a)) /
+           (d.ψ[c] * _Sfun(k2, a) + d.ψ[c+1] * _Sfun(k2, b))
+end
+
 """
     amplitude(d::IntervalDensityEstimate, x)
 
