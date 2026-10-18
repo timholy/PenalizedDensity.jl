@@ -42,6 +42,9 @@ subtype supports:
 - the probit transform [`gaussianize`](@ref), its inverse [`ungaussianize`](@ref), and
   [`gaussianize_logjacobian`](@ref).
 
+A fit acts as a scalar in broadcasting: `cdf.(d, xs)` equals `cdf(d, xs)`. The array methods
+are faster, because they assemble the node cumulatives once for all of `xs`.
+
 The goodness-of-fit statistic ([`chisq`](@ref), [`chisq_reference`](@ref)) and
 [`logdensity_node_gradient`](@ref) are defined for [`DensityEstimate`](@ref) only.
 
@@ -1646,6 +1649,9 @@ Base.minimum(d::AbstractDensityEstimate) = d.lo
 Base.maximum(d::AbstractDensityEstimate) = d.hi
 Base.extrema(d::AbstractDensityEstimate) = (minimum(d), maximum(d))
 
+# A fit is a scalar in broadcasting, so `cdf.(d, xs)` evaluates `d` at each element of `xs`.
+Base.broadcastable(d::AbstractDensityEstimate) = Ref(d)
+
 DensityInterface.DensityKind(::AbstractDensityEstimate) = HasDensity()
 DensityInterface.logdensityof(d::AbstractDensityEstimate, x::Real) = logdensity(d, x)
 DensityInterface.densityof(d::AbstractDensityEstimate, x::Real) = d(x)
@@ -1903,7 +1909,8 @@ so `logjac` is finite and grows toward the wall as the map stretches it to infin
 
 `x` may be a scalar or an array; for an array the result holds two arrays sharing the
 argument's axes, and the `O(length(d.x))` node-cumulative assembly is shared across all
-evaluations. The plain derivative `dy/dx` is `exp(logjac)`.
+evaluations. Broadcasting, `gaussianize_logjacobian.(d, x)`, instead returns an array of
+`(; y, logjac)` pairs. The plain derivative `dy/dx` is `exp(logjac)`.
 """
 function gaussianize_logjacobian(d::AbstractDensityEstimate, x::Real)
     F, G, total = _node_cumulatives(d)
@@ -2232,6 +2239,7 @@ end
 
 Base.show(io::IO, r::ChisqReference) =
     print(io, "ChisqReference($(length(r.g)) nodes, ⟨χ²⟩=$(r.mean))")
+Base.broadcastable(r::ChisqReference) = Ref(r)
 
 # Coefficients of the per-interval accumulation the Green's-function sweeps run on. Both
 # solutions of 𝒜u = 0 have the form u(s) = u(xₖ)cosh(κₖs) + κₖ v(xₖ)sinh(κₖs) on interval k,
