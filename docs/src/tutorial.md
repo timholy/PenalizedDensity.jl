@@ -344,23 +344,23 @@ wrong(x) = exp(-((x - 0.5) / 2.5)^2 / 2) / (2.5 * sqrt(2π))   # a single broad 
 ```
 
 The true mixture yields a far smaller ``\chi^2`` than the mismatched single Gaussian.
-[`pvalue`](@ref) turns the statistic into a significance under the reference distribution of
-``\chi^2`` — the finite-``N`` generalized chi-squared law, computed by default:
-
-```@example tutorial
-(p_correct = round(pvalue(d, truepdf); digits = 3),
- p_incorrect = round(pvalue(d, wrong); digits = 6))
-```
-
-The single Gaussian is decisively rejected; the true mixture is not. [`chisq_pdf`](@ref) /
-[`chisq_ccdf`](@ref) give the reference density and upper-tail probability, and
-[`expected_chisq`](@ref) its mean. To test many trial densities against one fit, build the
-reference once with [`chisq_reference`](@ref) and reuse it:
+To judge significance, build the reference distribution of ``\chi^2`` for the fit once with
+[`chisq_reference`](@ref); by default it is evaluated as the finite-``N`` generalized
+chi-squared law. [`pvalue`](@ref) turns each statistic into a significance under it, and one
+reference serves any number of trial densities:
 
 ```@example tutorial
 ref = chisq_reference(d)
-(mean = round(expected_chisq(ref); digits = 2),
- p_correct = round(pvalue(ref, chisq(d, truepdf)); digits = 3))
+(p_correct = round(pvalue(ref, chisq(d, truepdf)); digits = 3),
+ p_incorrect = round(pvalue(ref, chisq(d, wrong)); digits = 6))
+```
+
+The single Gaussian is decisively rejected; the true mixture is not. [`chisq_pdf`](@ref) and
+[`chisq_ccdf`](@ref) give the reference density and upper-tail probability, and
+[`expected_chisq`](@ref) its mean:
+
+```@example tutorial
+round(expected_chisq(ref); digits = 2)
 ```
 
 The reference law is exact for the Gaussian fluctuation field of the Laplace approximation
@@ -375,8 +375,8 @@ one fit is far cheaper. Anchored to that mean, it tracks the exact tail closely 
 than overstating it:
 
 ```@example tutorial
-(exact = round(pvalue(d, truepdf); digits = 3),
- largeN = round(pvalue(d, truepdf; method = :largeN); digits = 3))
+(exact = round(pvalue(ref, chisq(d, truepdf)); digits = 3),
+ largeN = round(pvalue(ref, chisq(d, truepdf); method = :largeN); digits = 3))
 ```
 
 All of this — the exact law and the `:largeN` shape alike — works unchanged on a fit at a
