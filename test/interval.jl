@@ -651,7 +651,7 @@ end
         for κ in (1.0, 4.0), holdout in (:location, :observation)
             L = PenalizedDensity._interval_layout(x, x, κ, cbrt(eps()), -Inf, Inf)
             _, ld = PenalizedDensity._interval_loo(L; holdout)
-            _, looi = PenalizedDensity._loo_density(L.y, L.w, κ, κ, κ; holdout)
+            _, looi = PenalizedDensity._loo_density(L.y, L.w, κ, κ, κ, -Inf, Inf; holdout)
             @test ld ≈ log.(looi) rtol = 1e-10
         end
     end

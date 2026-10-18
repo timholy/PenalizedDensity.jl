@@ -1416,7 +1416,7 @@ function IntervalDensityEstimate(lower::AbstractVector{<:Real}, upper::AbstractV
     a, b = _check_support_bounds(support)
     T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol), _kappa_eltype(κ, lower, upper),
                            _support_eltype(a), _support_eltype(b)))
-    κ isa Real && !(κ > 0 && isfinite(κ)) && throw(ArgumentError("κ must be finite and positive, got $κ"))
+    κ isa Real && _check_kappa(κ)
     L = _interval_layout(lower, upper, κ, T(rtol), T(a), T(b))
     return _interval_fit(L, κ isa Real ? T(κ) : L.κs; stats)
 end
