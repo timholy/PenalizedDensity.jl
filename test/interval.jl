@@ -157,6 +157,12 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test cdf(di, ts) ≈ cdf(d, ts) rtol = 1e-11
             @test mean(di) ≈ mean(d) rtol = 1e-11
             @test var(di) ≈ var(d) rtol = 1e-11
+            xe = randn(Xoshiro(4), 30)
+            @test entropy(di) ≈ entropy(d) rtol = 1e-10
+            @test negentropy(di) ≈ negentropy(d) rtol = 1e-8
+            @test action(di) ≈ action(d) rtol = 1e-10
+            @test entropy(di, xe) ≈ entropy(d, xe) rtol = 1e-10
+            @test negentropy(di, xe) ≈ negentropy(d, xe) rtol = 1e-8
         end
     end
 
@@ -275,6 +281,57 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
         @test @inferred(mean(d32)) isa Float32
         @test @inferred(var(d32)) ≈ var(fits.rounded) rtol = 1e-4
+    end
+
+    @testset "entropy, negentropy, action" begin
+        x = randn(Xoshiro(7), 200)
+        xr = round.(x; digits=1)
+        a, b = extrema(x)
+        fits = (rounded  = (IntervalDensityEstimate(xr, 3.0; resolution=0.1), 3.0),
+                fine     = (IntervalDensityEstimate(round.(x; digits=3), 3.0; resolution=0.001), 3.0),
+                censored = (IntervalDensityEstimate([x[1:150]; fill(1.0, 50)], [x[1:150]; fill(Inf, 50)], 2.0), 2.0),
+                leftcens = (IntervalDensityEstimate([fill(-Inf, 30); x[31:200]], [fill(-1.0, 30); x[31:200]], 2.0), 2.0),
+                bounded  = (IntervalDensityEstimate(xr, 3.0; resolution=0.1, support=(a - 0.3, b + 0.5)), 3.0),
+                # a wide, nearly flat interval: ψ is close to linear across it
+                wide     = (IntervalDensityEstimate([-1.0, 0.0, 0.5, 2.0], [-1.0, 0.0, 0.5, 60.0], 1.5), 1.5))
+        xe = randn(Xoshiro(8), 50)
+        for (name, (d, κ)) in pairs(fits)
+            edges = [d.lo; d.x; d.hi]
+            integrate(f, lo, hi) = (pts = [lo; filter(t -> lo < t < hi, d.x); hi];
+                                    sum(quadgk(f, pts[i], pts[i+1]; rtol=1e-13)[1] for i in 1:length(pts)-1))
+            qlogq(t) = (ℓ = logdensity(d, t); exp(ℓ) * ℓ)
+            s = sum(d.w[i] * logdensity(d, d.x[i]) for i in eachindex(d.x) if d.w[i] > 0; init=0.0)
+            N = sum(d.w)
+            lnP = 0.0
+            for g in d.groups
+                lo, hi = edges[g.first+1], edges[g.last+2]
+                P = integrate(d, lo, hi)
+                s += g.r * integrate(qlogq, lo, hi) / P
+                lnP += g.r * log(P)
+                N += g.r
+            end
+            @test entropy(d) ≈ -s / N rtol = 1e-12
+            @test PenalizedDensity._log_geomean(d) == -entropy(d)
+            @test negentropy(d) ≈ log(2π * ℯ * var(d)) / 2 - entropy(d) rtol = 1e-12
+            @test negentropy(d, xe) ≈ log(2π * ℯ * var(xe; corrected=false)) / 2 - entropy(d, xe) rtol = 1e-12
+            @test entropy(d, xe) ≈ -mean(logdensity(d, xe)) rtol = 1e-12
+            # The action from its definition: the roughness term (with ψ' by central differences)
+            # plus the likelihood terms. Skipped on the finely rounded fit, whose thousands of
+            # cells make the differenced quadrature slow.
+            name === :fine && continue
+            ψp(t) = (amplitude(d, t + 1e-6) - amplitude(d, t - 1e-6)) / 2e-6
+            kinetic = d.λ / κ^2 * sum(quadgk(t -> ψp(t)^2, edges[i], edges[i+1]; rtol=1e-8)[1]
+                                      for i in 1:length(edges)-1)
+            pointterm = sum(d.w[i] * logdensity(d, d.x[i]) for i in eachindex(d.x) if d.w[i] > 0; init=0.0)
+            @test action(d) ≈ kinetic - pointterm - lnP rtol = 1e-7
+        end
+        # An unbounded censored tail: ⟨ln Q⟩ = ln Q(x_edge) - 1.
+        d = IntervalDensityEstimate([0.0, 0.5, 1.0], [0.0, 0.5, Inf], 1.0)
+        @test entropy(d) ≈ -(logdensity(d, 0.0) + logdensity(d, 0.5) + logdensity(d, 1.0) - 1) / 3 rtol = 1e-12
+        d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
+        @test @inferred(entropy(d32)) isa Float32
+        @test @inferred(negentropy(d32)) ≈ negentropy(fits.rounded[1]) rtol = 1e-3
+        @test @inferred(action(d32)) ≈ action(fits.rounded[1]) rtol = 1e-4
     end
 
     @testset "lattice data (resolution)" begin
@@ -728,17 +785,13 @@ end
         x = randn(Xoshiro(7), 200)
         @test PenalizedDensity._log_geomean(IntervalDensityEstimate(x, x, 2.0)) ≈
               PenalizedDensity._log_geomean(DensityEstimate(x, 2.0)) rtol = 1e-10
-        # Intervals: each contributes the log of its mean density, P/width.
+        # Intervals: ln ḡ is -entropy, each interval contributing the pilot's mean of ln p̂ over it.
         lower, upper = [-1.0, -1.0, 0.0, 0.5], [0.0, 0.0, 0.5, 1.5]
         d = IntervalDensityEstimate(lower, upper, 1.5)
-        P(a, b) = cdf(d, b) - cdf(d, a)
-        expect = (2log(P(-1, 0)) + log(P(0, 0.5) / 0.5) + log(P(0.5, 1.5)))/4
-        @test PenalizedDensity._log_geomean(d) ≈ expect rtol = 1e-10
-        # Censored observations: the log density at the finite bound.
+        expect = -entropy(d)
+        @test PenalizedDensity._log_geomean(d) == expect
         dc = IntervalDensityEstimate([-Inf, -1.0, 0.0, 0.5], [-1.0, 0.0, 0.5, Inf], 1.5)
-        Pc(a, b) = cdf(dc, b) - cdf(dc, a)
-        expectc = (logdensity(dc, -1.0) + log(Pc(-1, 0)) + log(Pc(0, 0.5) / 0.5) + logdensity(dc, 0.5)) / 4
-        @test PenalizedDensity._log_geomean(dc) ≈ expectc rtol = 1e-10
+        @test PenalizedDensity._log_geomean(dc) == -entropy(dc)
         κ = AdaptiveScale(2.0, 0.5, d)
         @test κ(0.25) ≈ 2.0 * exp(0.5 * (logdensity(d, 0.25) - expect))
         @test_throws "must be positive" AdaptiveScale(2.0, 0.0, d)

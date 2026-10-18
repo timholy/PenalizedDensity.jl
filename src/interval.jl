@@ -1691,6 +1691,103 @@ function _quantile(d::IntervalDensityEstimate{T}, F::Vector{T}, total::T, q::Rea
 end
 
 # ---------------------------------------------------------------------------------------------
+# Entropy and action
+
+# Fitted mass of a group's cells (0 and m are the tails), unnormalized like `_node_cdf`.
+function _fitted_group_mass(d::IntervalDensityEstimate{T}, g::_IntervalGroup) where {T}
+    m = length(d.x)
+    P = zero(T)
+    for c in g.first:g.last
+        P += c == 0 ? _left_end_mass(d) : c == m ? _right_end_mass(d) : _cell_mass(d, c)
+    end
+    return P
+end
+
+# ∫ Q ln Q over a group's cells. A group reaches a tail only through a censored bound of ∓Inf,
+# so on an unbounded side, where Q = Q₁e^{-2kr} gives Q₁(ln Q₁ - 1)/(2k) in closed form;
+# interior cells use `_cell_qlogq`.
+function _group_qlogq(d::IntervalDensityEstimate{T}, g::_IntervalGroup) where {T}
+    xs, ψ = d.x, d.ψ
+    m = length(xs)
+    s = zero(T)
+    for c in g.first:g.last
+        s += if c == 0
+            ψ[1]^2 * (2log(ψ[1]) - 1) / (2d.kL)
+        elseif c == m
+            ψ[m]^2 * (2log(ψ[m]) - 1) / (2d.kR)
+        else
+            _cell_qlogq(d, c)
+        end
+    end
+    return s
+end
+
+# ∫ Q ln Q over interior cell c, by adaptive quadrature. A fixed rule is not enough: when ψ nearly
+# vanishes just outside the cell (a trigonometric arc with |k|h near π, or a nearly linear ψ
+# falling to a small end value) ln Q is nearly singular at that end. The absolute tolerance is
+# relative to the cell's mass, so the error in ⟨ln Q⟩ is at most about `rtol` in absolute terms.
+# ln Q comes from `_cell_log_amplitude`, so a stretch where Q underflows contributes zero.
+function _cell_qlogq(d::IntervalDensityEstimate{T}, c::Int) where {T}
+    rtol = eps(T)^(3 // 4)
+    f(t) = (ℓ = 2 * _cell_log_amplitude(d, c, t); exp(ℓ) * ℓ)
+    return first(quadgk(f, d.x[c], d.x[c+1]; rtol, atol = rtol * _cell_mass(d, c)))
+end
+
+"""
+    entropy(d::IntervalDensityEstimate) -> Ĥ
+
+Plug-in estimate of the differential entropy `H(Q) = -∫ Q ln Q dx` of the fitted density,
+
+    Ĥ = -(1/N) [Σᵢ wᵢ ln Q(xᵢ) + Σⱼ rⱼ ⟨ln Q⟩_Bⱼ],   ⟨ln Q⟩_B = ∫_B Q ln Q dx / ∫_B Q dx,
+
+where `wᵢ` counts the point observations at `xᵢ`, `rⱼ` the observations in interval `Bⱼ`, and
+`N = Σ wᵢ + Σ rⱼ`. An interval observation contributes the fit's mean of `ln Q` over its
+interval, the expected value of the `ln Q(xᵢ)` its unrecorded value would have contributed. As
+an interval shrinks to a point this becomes the point term, so with point observations only
+`Ĥ` equals [`entropy`](@ref)`(DensityEstimate(x, κ))`. A censored observation is handled the
+same way; on an unbounded tail `⟨ln Q⟩ = ln Q(x_edge) - 1` exactly.
+"""
+function entropy(d::IntervalDensityEstimate{T}) where {T}
+    s = zero(T)
+    n = zero(T)
+    for i in eachindex(d.x, d.w)
+        d.w[i] == 0 && continue
+        s += d.w[i] * 2 * log(d.ψ[i])
+        n += d.w[i]
+    end
+    for g in d.groups
+        s += g.r * _group_qlogq(d, g) / _fitted_group_mass(d, g)
+        n += g.r
+    end
+    return -s / n
+end
+
+"""
+    action(d::IntervalDensityEstimate) -> S
+
+Classical action of the fitted density,
+
+    S = N - λ - Σᵢ wᵢ ln Q(xᵢ) - Σⱼ rⱼ ln Pⱼ,
+
+the interval counterpart of [`action`](@ref)`(::DensityEstimate)`: `wᵢ` counts the point
+observations at `xᵢ`, `rⱼ` the observations in interval `Bⱼ`, `Pⱼ = ∫_Bⱼ Q dx` is the fitted
+probability of `Bⱼ`, and `N = Σ wᵢ + Σ rⱼ`. At the fit the roughness term
+`∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the action to this form.
+"""
+function action(d::IntervalDensityEstimate{T}) where {T}
+    _, total = _node_cdf(d)
+    S = -d.λ
+    for i in eachindex(d.x, d.w)
+        d.w[i] == 0 && continue
+        S += d.w[i] * (1 - 2 * log(d.ψ[i]))
+    end
+    for g in d.groups
+        S += g.r * (1 - log(_fitted_group_mass(d, g) / total))
+    end
+    return S
+end
+
+# ---------------------------------------------------------------------------------------------
 # Spatially varying scale
 
 function AdaptiveScale(c::Real, α::Real, pilot::IntervalDensityEstimate{T}) where {T}
@@ -1699,31 +1796,12 @@ function AdaptiveScale(c::Real, α::Real, pilot::IntervalDensityEstimate{T}) whe
     return AdaptiveScale{T}(T(c), T(α), pilot, _log_geomean(pilot), T(_KAPPA_FLOOR) * T(c))
 end
 
-# ln ḡ over the pilot's observations: a point contributes ln p̂ at the point, a finite interval
-# the log of its mean density P/width (the quantity interval data determine), and a censored
-# observation ln p̂ at its finite bound.
-function _log_geomean(d::IntervalDensityEstimate{T}) where {T}
-    s = zero(T)
-    n = zero(T)
-    for i in eachindex(d.x, d.w)
-        d.w[i] == 0 && continue
-        s += d.w[i] * 2 * log(d.ψ[i])
-        n += d.w[i]
-    end
-    m = length(d.x)
-    for g in d.groups
-        lp = if g.first == 0
-            _logdensity(d, d.x[g.last+1])
-        elseif g.last == m
-            _logdensity(d, d.x[g.first])
-        else
-            log(sum(c -> _cell_mass(d, c), g.first:g.last) / (d.x[g.last+1] - d.x[g.first]))
-        end
-        isfinite(lp) || error("the pilot's log density on an observation is $lp")
-        s += g.r * lp
-        n += g.r
-    end
-    return s / n
+# ln ḡ over the pilot's observations, -entropy(d): a point contributes ln p̂ at the point, an
+# interval observation the pilot's mean of ln p̂ over its interval.
+function _log_geomean(d::IntervalDensityEstimate)
+    lg = -entropy(d)
+    isfinite(lg) || error("the pilot's mean log density over its observations is $lg")
+    return lg
 end
 
 _logdensity_sorted(d::IntervalDensityEstimate{T}, ts::AbstractVector) where {T} =
