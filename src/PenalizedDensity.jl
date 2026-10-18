@@ -10,7 +10,7 @@ using Random: Random, AbstractRNG, Repetition, SamplerSimple
 using Statistics: Statistics, mean, quantile, std, var
 using StatsAPI: StatsAPI, pvalue
 
-export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support, kappa_interval
+export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support
 export Adaptive, AdaptiveScale, WindowScale, WindowRule
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
@@ -352,7 +352,7 @@ function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
 end
 
 # Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
-# Factored out so kappa_interval can reMerge one sorted copy at many tolerances. If `nodeof`
+# Factored out so a selector can merge one sorted copy at many tolerances. If `nodeof`
 # is a vector, `nodeof[i]` receives the index of the node that `xs[i]` joined.
 function _merge_presorted(xs, atol::T, nodeof=nothing) where {T}
     nodes = T[]
@@ -2545,8 +2545,7 @@ minimizing [`action_sensitivity`](@ref)`(x, κ) = |dS/d ln κ|` (Fig. 1 of the p
 must be sorted and positive, with at least three values to bracket the minimum, and defaults to
 a geometric range scaled to the data's extent.
 
-This and the entropy-based [`kappa_interval`](@ref) both resolve *information* and over-resolve
-smooth densities; to target estimation error instead, use [`select_kappa`](@ref) (or
+This criterion resolves *information* and over-resolves smooth densities; to target estimation error instead, use [`select_kappa`](@ref) (or
 [`select_kappa_lscv`](@ref)); for rounded data, pass the rounding increment to `select_kappa` as
 `resolution`.
 
@@ -2589,81 +2588,6 @@ end
 
 _action_sensitivity(xs::Vector{T}, r::T, κ::T) where {T} =
     abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
-
-"""
-    kappa_interval(x; level=0.2, rtol=cbrt(eps(T))) -> (; κ, lo, hi)
-
-Principled smoothing-scale selection returning a point value and an interval of plausible
-scales. `κ` is the half-entropy scale — the `h = 1/2` point of the entropy fraction `h(κ)`
-defined below — and `lo`, `hi` bracket `h ∈ [(1-level)/2, (1+level)/2]`, so the default
-`level=0.2` spans `h ∈ [0.4, 0.6]`. Requires at least two distinct points.
-
-This entropy criterion is distinct from the minimum-sensitivity scale of
-[`select_kappa_ms`](@ref); one advantage of this function is that it doesn't require computing
-a noisy numerical derivative.
-
-This selector takes no `support` keyword: the exact `κ → 0`/`κ → ∞` entropy limits it relies
-on are derived for the unbounded line, so it always fits (and returns a scale for) the
-unbounded problem.
-
-# Extended help
-
-As `κ` sweeps from `0` to `∞` the classical action's reduced form `g(κ) = S(κ) + W ln κ`
-(with `W = Σ wᵢ` the total count) rises monotonically between two exact limits:
-`g → W/2` as `κ → 0` (all points merge into one lump) and `g → W/2 + W H` as `κ → ∞`
-(the `N` points become isolated), where `H = -Σᵢ (wᵢ/W) ln(wᵢ/W)` is the Shannon entropy
-of the multiplicities (`ln N` for distinct points). The normalized quantity
-
-    h(κ) = (g(κ) - W/2) / (W H) ∈ [0, 1]
-
-is therefore the fraction of the data's entropy that scale `κ` resolves, and its half-point
-`h = 1/2` is returned as `κ`.
-"""
-function kappa_interval(x::AbstractVector{<:Real}; level::Real=0.2, rtol::Real=cbrt(eps(float(eltype(x)))))
-    0 < level < 1 || throw(ArgumentError("level must be in (0, 1), got $level"))
-    _check_rtol(rtol)
-    T = float(promote_type(eltype(x), typeof(rtol)))
-    xs = _sorted_sample(x, T)
-    nodes0, w0 = _merge_presorted(xs, zero(T))      # exact duplicates fix the entropy baseline
-    length(nodes0) >= 2 || throw(ArgumentError("need at least two distinct points to select κ"))
-    W = sum(w0)
-    Hent = -sum(wi / W * log(wi / W) for wi in w0)  # entropy of the multiplicities
-    r = T(rtol)
-    # h(κ): fraction of the entropy resolved, monotone from 0 (κ→0) to 1 (κ→∞). Points closer
-    # than rtol/κ are merged before each fit; as κ→∞ this reduces to the distinct nodes, so h
-    # still approaches 1 against the same entropy baseline W, H.
-    function h(κ)
-        nodes, w = _merge_presorted(xs, r / κ)
-        return (action(_fit(nodes, w, κ)) + W * log(κ) - W / 2) / (W * Hent)
-    end
-    lvl = T(level)
-    lo = _invert_monotone(h, (1 - lvl) / 2)
-    κ = _invert_monotone(h, oneunit(T) / 2)
-    hi = _invert_monotone(h, (1 + lvl) / 2)
-    return (; κ, lo, hi)
-end
-
-# Solve h(κ) = target for a function h that increases monotonically in κ, by bracketing
-# in ln κ and bisecting. Used by kappa_interval.
-function _invert_monotone(h, target::T) where {T}
-    # At very large κ the points become numerically isolated and h(κ) can overflow to a
-    # non-finite value; since h → 1 there, treat non-finite as "above target".
-    above(κ) = (v = h(κ); !isfinite(v) || v >= target)
-    lnlo, lnhi = log(T(1e-6)), log(T(1e6))
-    for _ in 1:40                     # expand outward until the root is bracketed
-        above(exp(lnlo)) || break
-        lnlo -= log(T(10))
-    end
-    for _ in 1:40
-        above(exp(lnhi)) && break
-        lnhi += log(T(10))
-    end
-    for _ in 1:60                     # bisection
-        m = (lnlo + lnhi) / 2
-        above(exp(m)) ? (lnhi = m) : (lnlo = m)
-    end
-    return exp((lnlo + lnhi) / 2)
-end
 
 # Diagonal and first off-diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from
 # the top-down and bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ - aᵢ), with aᵢ the original
@@ -2842,9 +2766,8 @@ Choose the smoothing scale by least-squares cross-validation: return the `κ` mi
 an unbiased estimate — up to the `κ`-independent `∫Q²` — of the integrated squared error
 `∫(Q̂_κ - Q)²`, where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. Its
 minimizer therefore targets minimum mean integrated squared error (MISE). This generally
-selects a finer scale than [`select_kappa_ms`](@ref) (minimum sensitivity) and
-[`kappa_interval`](@ref) (half-entropy), which resolve information rather than squared error
-and tend to over-resolve smooth densities.
+selects a coarser scale than [`select_kappa_ms`](@ref) (minimum sensitivity), which resolves
+information rather than squared error and tends to over-resolve smooth densities.
 
 `support`, `kappas`, `rtol` and `holdout` mean what they do for [`select_kappa`](@ref).
 `resolution` may be `nothing` (check for ties) or `0` (accept the values as exact points);
@@ -2916,9 +2839,7 @@ choose `support` as well, see [`select_support`](@ref).
   `resolution = δ > 0` declares that each `x[i]` was rounded to a lattice of spacing `δ`; the
   scale is then chosen for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, and each
   observation contributes the held-out log-probability of its rounding interval.
-  `resolution = 0` declares the values exact points, fitted by [`DensityEstimate`](@ref); on
-  heavily tied points the score can favor over-resolved scales, and [`kappa_interval`](@ref) is
-  safer there.
+  `resolution = 0` declares the values exact points, fitted by [`DensityEstimate`](@ref).
 
 The second form takes the bounds of interval observations directly, for
 [`IntervalDensityEstimate`](@ref)`(lower, upper, κ)`, including censored values and a mix of
@@ -2935,8 +2856,7 @@ the default grid stops where `κ` times the widest interval reaches 4096, beyond
 at its histogram limit and cannot be computed accurately.
 
 [`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
-of the manual for the alternative criteria [`select_kappa_lscv`](@ref), [`select_kappa_ms`](@ref)
-and [`kappa_interval`](@ref).
+of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and [`select_kappa_ms`](@ref).
 
 # Extended help
 

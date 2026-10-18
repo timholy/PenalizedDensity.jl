@@ -36,26 +36,19 @@ nothing # hide
 
 `κ` determines the amount of smoothing: the amplitude of the density estimate will decay over a length scale `1/κ`.
 `d` is a callable density: `d(x)` returns the estimated density at a single point `x`.
-Let's plot this estimate (constructed using the recommended [`select_kappa`](@ref) to compute the scale),
-along with the result for a different ``\kappa`` estimator, the half-entropy as computed by
-[`kappa_interval`](@ref): 
+Let's plot this estimate against the true density:
 
 ```julia
 using CairoMakie                              # for plotting
-ki = kappa_interval(x)                        # alternative estimator for scale
-d_half = DensityEstimate(x, ki.κ)             # construct the alternative estimate
 g = range(-4.5, 7.5; length = 800)
 lines(g, truepdf.(g); linestyle = :dash, label = "true density")
-lines!(g, d.(g); label = "κ = $(round(κ, digits=1)) (KL, recommended)")
-lines!(g, d_half.(g); label = "κ = $(round(ki.κ, digits=1)) (half-entropy)")
+lines!(g, d.(g); label = "κ = $(round(κ, digits=1))")
 axislegend()
 ```
 
 ![Two-Gaussian mixture recovered with a single κ](assets/mixture_example.png)
 
-Both scales recover both peaks: the recommended KL ``\kappa`` is visibly
-smoother, the half-entropy ``\kappa`` sharper, but each resolves the narrow and
-the broad component at once. Note that **`κ` is a resolution scale, not a
+A single scale resolves both the narrow and the broad component. Note that **`κ` is a resolution scale, not a
 component width.** Its reciprocal ``1/\kappa`` is smaller than either
 component's ``\sigma``, so the estimator resolves features of any larger width,
 which is set by the underlying distribution and the data obtained by sampling
@@ -83,9 +76,9 @@ If more than 1% of the observations repeat another value, `select_kappa` throws 
 `ArgumentError` unless you say what the repeats mean with the `resolution` keyword. For values
 rounded to a lattice of spacing `δ`, `select_kappa(x; resolution = δ)` selects the scale for
 [`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
-rounding interval. `resolution = 0` declares the repeats to be exact points. On heavily tied
-exact points the cross-validation score can favor over-resolved scales, and
-[`kappa_interval`](@ref), described below, is the safer choice.
+rounding interval. `resolution = 0` declares the repeats to be exact points; each held-out term
+then leaves out every observation at the held-out value (`holdout = :location`), so the score
+does not reward spikes at the repeated values.
 
 ## Comparing selection criteria
 
@@ -98,7 +91,6 @@ and, where it minimizes a score, as a function that evaluates that score at a gi
 | likelihood cross-validation (KLCV) | [`select_kappa`](@ref) | [`klcv`](@ref) |
 | least-squares cross-validation (LSCV) | [`select_kappa_lscv`](@ref) | [`lscv`](@ref) |
 | minimum sensitivity | [`select_kappa_ms`](@ref) | [`action_sensitivity`](@ref) |
-| half-entropy | [`kappa_interval`](@ref) | — |
 
 Evaluating a score over a range of ``\kappa`` shows how sharply its minimum is defined:
 
@@ -122,41 +114,18 @@ range of test densities `select_kappa` tracks the error-optimal scale more close
 `benchmarks/`), and it is cheaper, because it needs no ``\int \hat Q^2`` term. LSCV has no
 interval form, so rounded data should go to `select_kappa` with `resolution`.
 
-The remaining two criteria resolve *information* in the data rather than minimizing error.
-[`kappa_interval`](@ref) returns a principled scale with a plausible range. Its basis is that
-the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa`` (``W`` = total count) rises
-monotonically between two *exact* limits — ``W/2`` as ``\kappa\to0`` (all points merge into
-one lump) and ``W/2 + W H`` as ``\kappa\to\infty`` (the ``N`` points become isolated), where
-``H`` is the Shannon entropy of the data. The normalized quantity ``h(\kappa)\in[0,1]`` is thus
-the *fraction of the data's entropy that ``\kappa`` resolves*, and its half-point is the
-returned scale:
-
-```@example tutorial
-ki = kappa_interval(xs)          # (; κ, lo, hi): the half-entropy scale and a band
-(κ = round(ki.κ, digits=1), lo = round(ki.lo, digits=1), hi = round(ki.hi, digits=1))
-```
-
-The picture below makes this concrete. The reduced action (red) climbs from its
-``\kappa\to0`` floor ``W/2`` (nothing resolved, ``h=0``) to its ``\kappa\to\infty`` ceiling
-``W/2 + W H`` (every point resolved, ``h=1``); both dashed limits are exact and depend only
-on the counts. The returned scale is where the curve is halfway up — half the entropy
-resolved — and the shaded band is the plausible range:
-
-![Reduced action rising between its two entropy limits](assets/action_entropy.png)
-
-[`select_kappa_ms`](@ref) returns a related but distinct scale: the point of *minimum
-sensitivity*, where [`action_sensitivity`](@ref) ``= |dS/d\ln\kappa|`` is smallest. The
-derivative is computed analytically, so the result is free of the noise that
-finite-differencing the action curve would introduce.
+[`select_kappa_ms`](@ref) resolves *information* in the data rather than minimizing error. It
+returns the point of *minimum sensitivity*, where [`action_sensitivity`](@ref)
+``= |dS/d\ln\kappa|`` is smallest. The derivative is computed analytically, so the result is
+free of the noise that finite-differencing the action curve would introduce.
 
 ```@example tutorial
 κ_ms = select_kappa_ms(xs)
 ```
 
-`select_kappa_ms` and `kappa_interval` generally select different scales, and on smooth
-densities both over-resolve, which is why `select_kappa` is the default. Their value is on
-heavily tied or discrete data, where they stay bounded and the cross-validation scores do not.
-Neither takes `support`: the entropy limits they rely on are derived for the unbounded line.
+On smooth densities minimum sensitivity over-resolves: its scale grows faster with ``N`` than
+the error-optimal ``N^{1/5}``, which is why `select_kappa` is the default. It takes no `support`,
+because the entropy asymptotics it relies on are derived for the unbounded line.
 
 ## Letting the scale vary across the data
 

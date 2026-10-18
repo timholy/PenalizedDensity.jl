@@ -154,14 +154,13 @@ end
 # ----------------------------------------------------------------------------------------
 
 # PenalizedDensity offers several automatic scale selectors. Hold the estimator fixed and pit
-# them head-to-head. The action-based selectors (minimum sensitivity, half-entropy) resolve
-# information and scale like √N; the cross-validation selectors (LSCV, KL) target error and
+# them head-to-head. The action-based minimum-sensitivity selector resolves information and
+# scales like √N; the cross-validation selectors (LSCV, KL) target error and
 # scale like N^{1/5}. For each selector report the mean selected κ and the resulting L1/ISE,
 # alongside the oracle κ that minimises L1 on a scan — the best the estimator can do at any
 # fixed scale. The selector whose error sits closest to the oracle wins.
 const SELECTORS = [
     ("select_kappa_ms (min-sensitivity)", x -> PenalizedDensity.select_kappa_ms(x; rtol = 1e-3)),
-    ("kappa_interval (half-entropy)",  x -> kappa_interval(x; rtol = 1e-3).κ),
     ("select_kappa_lscv (LSCV/MISE)",    x -> PenalizedDensity.select_kappa_lscv(x; rtol = 1e-3)),
     ("select_kappa (KL)",           x -> select_kappa(x; rtol = 1e-3)),
 ]

@@ -32,9 +32,9 @@ checked in; the first run resolves and installs the comparison packages.
    shootout below.
 
 3. **Selector shootout** — `PenalizedDensity` offers several automatic scale selectors; this
-   holds the estimator fixed and pits them head-to-head. The action-based selectors
-   (`PenalizedDensity.select_kappa_ms`, minimum sensitivity; `kappa_interval`, half-entropy) resolve information
-   and their κ grows like `√N`; the cross-validation selectors (`PenalizedDensity.select_kappa_lscv`, LSCV;
+   holds the estimator fixed and pits them head-to-head. The action-based selector
+   (`PenalizedDensity.select_kappa_ms`, minimum sensitivity) resolves information
+   and its κ grows like `√N`; the cross-validation selectors (`PenalizedDensity.select_kappa_lscv`, LSCV;
    `select_kappa`, KL) target error and grow like `N^{1/5}`. Each row's `L1`/`ISE` is
    compared against the `oracle` κ that minimises `L1` on a scan — the best the estimator can
    do at any fixed scale.
@@ -49,11 +49,9 @@ checked in; the first run resolves and installs the comparison packages.
   the smoothing length that carries no independent information — which bounds the
   conditioning and keeps the fit fast. Use `rtol > 0` on large, densely packed samples.
 
-- **The action-based selectors over-resolve smooth data.** The minimum-sensitivity and
-  half-entropy scales grow like `√N`, faster than the mean-integrated-error-optimal scale
-  (`~N^{1/5}`), so they choose a finer κ than minimises `L1`/`ISE`. They are the right choice
-  only for heavily tied or discrete data, where the cross-validation scores are unbounded as
-  `κ → ∞` (see the docstrings).
+- **Minimum sensitivity over-resolves smooth data.** Its scale grows like `√N`, faster than
+  the mean-integrated-error-optimal scale (`~N^{1/5}`), so it chooses a finer κ than
+  minimises `L1`/`ISE`.
 
 - **`select_kappa` is the recommended default.** Across the test densities it sits closest
   to the oracle in `L1` — tracking the oracle κ tightly even on the skewed log-normal, where
