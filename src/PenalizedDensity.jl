@@ -1,5 +1,6 @@
 module PenalizedDensity
 
+using DensityInterface: DensityInterface, HasDensity
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, Symmetric, ZeroPivotException, cholesky, dot,
                      issuccess, ldiv!, ldlt!, mul!
 using LogExpFunctions: logabssinh, logaddexp, logcosh
@@ -29,6 +30,21 @@ Evaluating any of these at `NaN` throws a `DomainError`.
 Every subtype also supports the support queries [`minimum`](@ref Base.minimum),
 `maximum` and `extrema`, and sampling by inversion through `rand`: `rand(d)`,
 `rand(rng, d, dims...)` and `rand!(rng, A, d)` draw from the fitted density.
+
+# Interoperability
+
+Every subtype implements [DensityInterface.jl](https://github.com/JuliaMath/DensityInterface.jl)
+as an object that *has* a density (`DensityKind(d) == HasDensity()`, as for a Distributions.jl
+distribution): `logdensityof(d, x) == logdensity(d, x)` and `densityof(d, x) == d(x)` at a real
+`x`.
+
+When Distributions.jl is loaded, `Distributions.cdf`, `Distributions.pdf` and
+`Distributions.logpdf` accept a fit and agree with [`cdf`](@ref), `d(x)` and
+[`logdensity`](@ref); `quantile` is already shared with Distributions through `Statistics`.
+When StatsBase.jl is loaded, `StatsBase.entropy(d)` agrees with [`entropy`](@ref)`(d)`. The
+held-out `entropy(d, xeval)` has no StatsBase counterpart, because StatsBase's two-argument
+`entropy(p, b)` takes a logarithm base. With both packages loaded, the unqualified names `cdf`
+and `entropy` are ambiguous, and either qualified name gives the same result.
 """
 abstract type AbstractDensityEstimate end
 
@@ -1460,6 +1476,10 @@ Lower and upper ends of the support of the fitted density: the `support` the fit
 Base.minimum(d::AbstractDensityEstimate) = d.lo
 Base.maximum(d::AbstractDensityEstimate) = d.hi
 Base.extrema(d::AbstractDensityEstimate) = (minimum(d), maximum(d))
+
+DensityInterface.DensityKind(::AbstractDensityEstimate) = HasDensity()
+DensityInterface.logdensityof(d::AbstractDensityEstimate, x::Real) = logdensity(d, x)
+DensityInterface.densityof(d::AbstractDensityEstimate, x::Real) = d(x)
 
 # Closed-form quantile in an unbounded exponential tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}.
 _left_tail_quantile(ψ1::T, κ::T, x1::T, target::T) where {T} = x1 + log(2κ * target / ψ1^2) / (2κ)
