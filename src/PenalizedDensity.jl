@@ -16,7 +16,7 @@ export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
 export cdf, quantile, mean, var, std
-export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
+export gaussianize, ungaussianize, gaussianize_logjacobian
 
 """
     AbstractDensityEstimate
@@ -228,6 +228,8 @@ end
 # rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
 # to. The scale has to arrive as a function of position.
 _estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
+    _vector_scale_error()
+_vector_scale_error() =
     throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
                         "on the local scale, so the nodes it would index do not exist yet. Pass a " *
                         "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
@@ -350,18 +352,20 @@ function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
 end
 
 # Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
-# Factored out so kappa_interval can reMerge one sorted copy at many tolerances.
-function _merge_presorted(xs, atol::T) where {T}
+# Factored out so kappa_interval can reMerge one sorted copy at many tolerances. If `nodeof`
+# is a vector, `nodeof[i]` receives the index of the node that `xs[i]` joined.
+function _merge_presorted(xs, atol::T, nodeof=nothing) where {T}
     nodes = T[]
     weights = T[]
-    for xi in xs
-        xk = T(xi)
+    for i in eachindex(xs)
+        xk = T(xs[i])
         if !isempty(nodes) && xk - nodes[end] <= atol
             weights[end] += oneunit(T)
         else
             push!(nodes, xk)
             push!(weights, oneunit(T))
         end
+        nodeof === nothing || (nodeof[i] = lastindex(nodes))
     end
     return nodes, weights
 end
@@ -370,7 +374,7 @@ end
 # `κx[i]` for the point `xs[i]`: the merge threshold is a fraction `rtol` of the smoothing
 # length there. The scales come in already realized on `xs` because the merge threshold is
 # what *produces* the nodes — a caller has no node geometry to align a per-node vector to.
-function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}) where {T}
+function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}, nodeof=nothing) where {T}
     nodes = T[]
     weights = T[]
     κrun = zero(T)                  # scale at the run's first member, which sets its tolerance
@@ -383,8 +387,88 @@ function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}) where {T}
             push!(weights, oneunit(T))
             κrun = κx[i]
         end
+        nodeof === nothing || (nodeof[i] = lastindex(nodes))
     end
     return nodes, weights
+end
+
+"""
+    merge_samples(x, κ; rtol=cbrt(eps(eltype(x)))) -> (; nodes, weights, nodeindex)
+
+Merge the sample `x` into the nodes and weights that `DensityEstimate(x, κ; rtol)` fits, and
+report which node each sample joined.
+
+The sorted sample is split into runs, each starting at the smallest sample not yet assigned.
+A run collects every following sample within `rtol/κ` of its first member, where `κ` is the
+scale at that first member; `κ` may be a positive number or a callable `κ(x)`, as for
+[`DensityEstimate`](@ref). Each run becomes one node located at its first member, with
+weight equal to the number of samples in the run.
+
+- `nodes`: the sorted, distinct node locations, as `d.x` of the fit.
+- `weights`: the number of samples merged into each node, as `d.w` of the fit.
+- `nodeindex`: an integer array with the axes of `x`; sample `x[j]` was merged into node
+  `nodes[nodeindex[j]]`. A node lies at the value of its run's first member, so the samples
+  with `x[j] == nodes[nodeindex[j]]` (that member and any exact ties to it) are the ones
+  whose values set the node's position.
+
+`nodes` and `weights` have the float type that `DensityEstimate(x, κ; rtol)` uses on the
+unbounded line. A NaN in `x` throws an `ArgumentError`.
+
+# Examples
+```jldoctest
+julia> m = PenalizedDensity.merge_samples([2.0, 0.0, 1e-9, 2.0], 1.0);
+
+julia> m.nodes, m.weights
+([0.0, 2.0], [2.0, 2.0])
+
+julia> m.nodeindex
+4-element Vector{Int64}:
+ 2
+ 1
+ 1
+ 2
+```
+"""
+function merge_samples(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(R))) where {R<:Real}
+    _check_rtol(rtol)
+    isempty(x) && throw(ArgumentError("cannot merge zero points"))
+    return _merge_samples(x, κ, rtol)
+end
+
+function _merge_samples(x::AbstractVector{R}, κ::Real, rtol::Real) where {R<:Real}
+    κ > 0 || throw(ArgumentError("κ must be positive, got $κ"))
+    T = float(promote_type(R, typeof(κ), typeof(rtol)))
+    perm, xs = _sortperm_sample(x, T)
+    nodeof = similar(perm)
+    nodes, weights = _merge_presorted(xs, T(rtol) / T(κ), nodeof)
+    return (; nodes, weights, nodeindex = _unsort_nodeindex(x, perm, nodeof))
+end
+
+_merge_samples(::AbstractVector{<:Real}, ::AbstractVector, ::Real) = _vector_scale_error()
+
+function _merge_samples(x::AbstractVector{R}, κfun, rtol::Real) where {R<:Real}
+    T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x)))))
+    perm, xs = _sortperm_sample(x, T)
+    nodeof = similar(perm)
+    nodes, weights = _merge_presorted(xs, T(rtol), _kappa_sorted(κfun, xs, T), nodeof)
+    return (; nodes, weights, nodeindex = _unsort_nodeindex(x, perm, nodeof))
+end
+
+# `_sorted_sample` together with the permutation that sorts `x`: `xs[i] == x[perm[i]]`.
+function _sortperm_sample(x::AbstractVector, ::Type{T}) where {T}
+    perm = sortperm(x)
+    xs = T[x[p] for p in perm]
+    _check_no_nan_observations(xs)
+    return perm, xs
+end
+
+# Carry node indices from sorted positions back to the positions (and axes) of `x`.
+function _unsort_nodeindex(x::AbstractVector, perm::AbstractVector, nodeof::AbstractVector)
+    nodeindex = similar(x, Int)
+    for i in eachindex(perm, nodeof)
+        nodeindex[perm[i]] = nodeof[i]
+    end
+    return nodeindex
 end
 
 # Merge the sample at the tolerance a scale implies, then realize that scale on the nodes the
@@ -396,12 +480,23 @@ function _merge_and_realize(xs::Vector{T}, κfun, rtol::T) where {T}
     return nodes, weights, κs, κL, κR
 end
 
-# Tridiagonal operator M (SPD) coupling the nodal amplitudes, with an optional natural
-# (Neumann) boundary at `lo`/`hi` (either may be infinite). Off-diagonal e[k] = -csch(κ hₖ);
-# diagonal d[i] accumulates coth(κ hₖ) from each adjacent interval, and from each tail
-# `_tail_diag(κ, Δ)` — `tanh(κΔ)` at a finite gap Δ, or exactly `1` as Δ → ∞, so an unbounded
-# side reproduces the fixed-tail entry exactly.
-function roughness_operator(x::Vector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
+"""
+    roughness_operator(x, κ, lo=-Inf, hi=Inf) -> SymTridiagonal
+
+The symmetric positive-definite tridiagonal matrix `M` of the roughness penalty on the
+amplitude `ψ` at sorted, distinct nodes `x` with constant scale `κ`: the penalty
+`∫ (ψ'(t)² + κ² ψ(t)²) dt`, minimized between and beyond the nodes for given nodal amplitudes
+`ψ`, is `κ * dot(ψ, M * ψ)`. A finite `lo` or `hi` is a support wall with a natural (zero-slope) boundary
+condition; an infinite one is an exponentially decaying tail.
+
+For the gap `hₖ = x[k+1] - x[k]`, the off-diagonal entry is `-csch(κ hₖ)`, and the diagonal
+entry at each node sums `coth(κ hₖ)` over its adjacent gaps, plus `tanh(κ Δ)` for the
+distance `Δ` from an end node to its wall (`1` for an unbounded side).
+
+`x` must be 1-based, because `M[i, j]` couples `x[i]` and `x[j]`.
+"""
+function roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
+    Base.require_one_based_indexing(x)
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
     d = zeros(T, n)
@@ -418,7 +513,7 @@ function roughness_operator(x::Vector{T}, κ::T, lo::T, hi::T) where {T<:Abstrac
 end
 
 # `roughness_operator` on the unbounded line.
-roughness_operator(x::Vector{T}, κ::T) where {T<:AbstractFloat} =
+roughness_operator(x::AbstractVector{T}, κ::T) where {T<:AbstractFloat} =
     roughness_operator(x, κ, T(-Inf), T(Inf))
 
 # tanh(u), overflow-free through e^{-2u} (accurate and finite up to u ≈ 1e300, well past where
@@ -1684,7 +1779,7 @@ maps back to the wall.
 evaluations.
 
 See [`ungaussianize`](@ref) for the inverse, [`gaussianize_logjacobian`](@ref) for the map
-together with its log-Jacobian, and [`gaussianize_gradient`](@ref) for its derivative.
+together with its log-Jacobian, whose exponential is the map's derivative.
 
 # Examples
 ```jldoctest
@@ -1748,7 +1843,7 @@ so `logjac` is finite and grows toward the wall as the map stretches it to infin
 
 `x` may be a scalar or an array; for an array the result holds two arrays sharing the
 argument's axes, and the `O(length(d.x))` node-cumulative assembly is shared across all
-evaluations. See [`gaussianize_gradient`](@ref) for the plain derivative `exp(logjac)`.
+evaluations. The plain derivative `dy/dx` is `exp(logjac)`.
 """
 function gaussianize_logjacobian(d::DensityEstimate, x::Real)
     F, G, total = _node_cumulatives(d)
@@ -1758,26 +1853,6 @@ function gaussianize_logjacobian(d::DensityEstimate, x::AbstractArray)
     F, G, total = _node_cumulatives(d)
     yl = map(xi -> _gaussianize_logjac(d, F, G, total, xi), x)
     return (; y = map(first, yl), logjac = map(t -> t.logjac, yl))
-end
-
-"""
-    gaussianize_gradient(d::DensityEstimate, x)
-
-Derivative `dy/dx` of the Gaussianizing map [`gaussianize`](@ref) with respect to the
-evaluation coordinate: `Q̂(x) / φ(y)`, the fitted density over the standard normal density
-at the image point. Always positive; it tends to `0` in the tails (like `2κ/|y|`) and can
-be arbitrarily large where the fit is much denser than the matched normal. Computed as
-`exp(logjac)` from [`gaussianize_logjacobian`](@ref), which see for stability notes.
-
-`x` may be a scalar or an array; the array method shares the node-cumulative assembly.
-"""
-function gaussianize_gradient(d::DensityEstimate, x::Real)
-    F, G, total = _node_cumulatives(d)
-    return exp(_gaussianize_logjac(d, F, G, total, x).logjac)
-end
-function gaussianize_gradient(d::DensityEstimate, x::AbstractArray)
-    F, G, total = _node_cumulatives(d)
-    return map(xi -> exp(_gaussianize_logjac(d, F, G, total, xi).logjac), x)
 end
 
 """
@@ -1894,7 +1969,7 @@ function negentropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
 end
 
 """
-    logdensity_eval_gradient(d::DensityEstimate, y::Real) -> ∂ln Q̂(y)/∂y
+    logdensity_eval_gradient(d::DensityEstimate, y) -> ∂ln Q̂(y)/∂y
 
 Derivative of the log fitted density with respect to the evaluation coordinate,
 
@@ -1906,9 +1981,13 @@ solve. See [`logdensity_node_gradient`](@ref) for the sensitivity to the node po
 instead. The log density has a kink at each node `d.x[k]` (`ψ'` jumps there), so at a node
 the value returned is the one-sided derivative approaching from within the enclosing
 interval.
+
+`y` may be a scalar or an array; the array method returns an array with the axes of `y`.
 """
 logdensity_eval_gradient(d::DensityEstimate, y::Real) =
     2 * _amplitude_prime(d, y) / _amplitude(d, y)
+logdensity_eval_gradient(d::DensityEstimate, y::AbstractArray) =
+    map(yi -> logdensity_eval_gradient(d, yi), y)
 
 """
     logdensity_node_gradient(d::DensityEstimate, yeval::AbstractVector, weights=nothing) -> g

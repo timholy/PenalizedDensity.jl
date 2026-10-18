@@ -145,6 +145,48 @@ end
         @test maximum(abs.(da.(g) .- db.(g))) < 1e-3
     end
 
+    @testset "merge_samples: nodes, weights, and the sample→node map" begin
+        merge_samples = PenalizedDensity.merge_samples
+        # Unsorted, with exact ties and near-ties on both sides of the rtol/κ boundary `b`; a
+        # power of two keeps `2.0 + b - 2.0 == b` exact.
+        b = 2.0^-10
+        x = [5.0, b, 0.0, nextfloat(b), 5.0, 0.0, 2.0, 2.0 + b, 2.0 + 2.5b]
+        m = merge_samples(x, 1.0; rtol = b)
+        @test m.nodes == [0.0, nextfloat(b), 2.0, 2.0 + 2.5b, 5.0]
+        @test m.weights == [3.0, 1.0, 2.0, 1.0, 2.0]
+        @test m.nodeindex == [5, 1, 1, 2, 5, 1, 3, 3, 4]
+        d = DensityEstimate(x, 1.0; rtol = b)
+        @test m.nodes == d.x && m.weights == d.w
+        # Each node's weight counts its samples; each sample lies within its run's tolerance.
+        @test m.weights == [count(==(k), m.nodeindex) for k in eachindex(m.nodes)]
+        @test all(j -> 0 <= x[j] - m.nodes[m.nodeindex[j]] <= b, eachindex(x))
+
+        # Random data with many ties: agreement with the fit, at a constant and a callable κ.
+        rng = Random.Xoshiro(11)
+        xr = round.(randn(rng, 2_000); digits = 2)
+        for κ in (3.0, x -> 2.0 + abs(x))
+            mr = merge_samples(xr, κ; rtol = 1e-2)
+            dr = DensityEstimate(xr, κ; rtol = 1e-2)
+            @test mr.nodes == dr.x && mr.weights == dr.w
+            @test mr.weights == [count(==(k), mr.nodeindex) for k in eachindex(mr.nodes)]
+            @test all(k -> any(j -> mr.nodeindex[j] == k && xr[j] == mr.nodes[k], eachindex(xr)),
+                      eachindex(mr.nodes))
+        end
+
+        # The map follows the argument's axes; the element type follows the promotion.
+        xo = OffsetArray(x, -4)
+        mo = merge_samples(xo, 1.0; rtol = b)
+        @test axes(mo.nodeindex) == axes(xo) && parent(mo.nodeindex) == m.nodeindex
+        @test mo.nodes == m.nodes
+        @test eltype(merge_samples(Float32[1, 0, 2], 1.0f0).nodes) == Float32
+
+        @test_throws "κ must be positive" merge_samples(x, 0.0)
+        @test_throws "cannot merge zero points" merge_samples(Float64[], 1.0)
+        @test_throws "rtol must be nonnegative" merge_samples(x, 1.0; rtol = -1.0)
+        @test_throws "cannot be given as a vector" merge_samples(x, ones(length(x)))
+        @test_throws ArgumentError merge_samples([0.0, NaN], 1.0)
+    end
+
     @testset "solver is robust and allocates O(N), not O(N·iterations)" begin
         # Dense samples drive adjacent-node spacings toward zero, which sharply
         # ill-conditions the tridiagonal Newton system; the fit must still converge
@@ -557,7 +599,7 @@ end
         end
         @test abs(gaussianize(d, x0)) < 1e-8          # median maps to ≈ 0
         # The map's derivative at the median: Q(x₀)/φ(0) = κ√(2π).
-        @test gaussianize_gradient(d, x0) ≈ κ * sqrt(2π) rtol = 1e-8
+        @test exp(gaussianize_logjacobian(d, x0).logjac) ≈ κ * sqrt(2π) rtol = 1e-8
 
         # Limits, NaN.
         @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
@@ -566,7 +608,6 @@ end
         @test_throws "the evaluation point must not be NaN" ungaussianize(d, NaN)
         @test_throws "the evaluation point must not be NaN" gaussianize_logjacobian(d, NaN)
         @test gaussianize_logjacobian(d, Inf).logjac == -Inf   # dy/dx → 0 in the tails
-        @test gaussianize_gradient(d, Inf) == 0
 
         # Multi-node fits across smoothing regimes, from smooth (θ ≪ 1) to isolated
         # points (θ ≫ 1).
@@ -608,14 +649,13 @@ end
                           lo - 50 / κ, hi + 50 / κ)
                 h = 1e-6 / κ
                 fd = (gaussianize(d, t + h) - gaussianize(d, t - h)) / (2h)
-                @test gaussianize_gradient(d, t) ≈ fd rtol = 1e-4
+                @test exp(gaussianize_logjacobian(d, t).logjac) ≈ fd rtol = 1e-4
             end
             # The log-Jacobian is the log-derivative, and it makes the change of
             # variables exact: ln φ(y) + logjac = ln Q̂(x).
             for t in range(lo - 3 / κ, hi + 3 / κ; length = 41)
                 (; y, logjac) = gaussianize_logjacobian(d, t)
                 @test y == gaussianize(d, t)
-                @test exp(logjac) ≈ gaussianize_gradient(d, t) rtol = 1e-13
                 @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-9
             end
             # Deep-tail log-Jacobian: finite, and consistent with the map's slope.
@@ -677,7 +717,6 @@ end
         d64 = DensityEstimate([-1.0, 0.0, 1.0], 1.0)
         @test @inferred(gaussianize(d32, 0.5f0)) isa Float32
         @test @inferred(ungaussianize(d32, 0.5f0)) isa Float32
-        @test @inferred(gaussianize_gradient(d32, 0.5f0)) isa Float32
         @test @inferred(gaussianize_logjacobian(d32, 0.5f0)).logjac isa Float32
         @test gaussianize(d32, 0.5f0) ≈ gaussianize(d64, 0.5) atol = 1e-5
         y32 = gaussianize(d32, -30.0f0)
@@ -694,8 +733,6 @@ end
         ljo = gaussianize_logjacobian(d64, xo)
         @test axes(ljo.y) == axes(xo) && axes(ljo.logjac) == axes(xo)
         @test parent(ljo.y) == gaussianize(d64, [-0.5, 0.0, 0.5])
-        @test axes(gaussianize_gradient(d64, xo)) == axes(xo)
-        @test parent(gaussianize_gradient(d64, xo)) == gaussianize_gradient(d64, [-0.5, 0.0, 0.5])
     end
 
     @testset "gaussianize: bounded support and per-interval κ" begin
@@ -1646,6 +1683,12 @@ end
             # In the tails ψ ∝ e^{∓κ|·|}, so the slope is exactly ±2κ.
             @test logdensity_eval_gradient(d, nodes[1] - 3.0) ≈ 2κ
             @test logdensity_eval_gradient(d, nodes[end] + 3.0) ≈ -2κ
+            # The array method maps the scalar one and keeps the argument's axes.
+            ys = [-2.0, 0.0, 0.7, 3.5]
+            @test logdensity_eval_gradient(d, ys) == [logdensity_eval_gradient(d, y) for y in ys]
+            yo = OffsetArray(ys, -3)
+            @test axes(logdensity_eval_gradient(d, yo)) == axes(yo)
+            @test parent(logdensity_eval_gradient(d, yo)) == logdensity_eval_gradient(d, ys)
         end
     end
 
@@ -1892,7 +1935,6 @@ end
             @test_throws "the evaluation point must not be NaN" gaussianize(d, [0.0, NaN])
             @test_throws "the evaluation point must not be NaN" ungaussianize(d, NaN)
             @test_throws "the evaluation point must not be NaN" gaussianize_logjacobian(d, NaN)
-            @test_throws "the evaluation point must not be NaN" gaussianize_gradient(d, NaN)
             @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
         end
         @test_throws "the evaluation point must not be NaN" logdensity_eval_gradient(fits[1], NaN)
