@@ -1591,6 +1591,25 @@ function _node_cdf(d::IntervalDensityEstimate{T}) where {T}
     return F, F[m] + _right_end_mass(d)
 end
 
+# Node cumulatives from both ends, F[i] = ∫_{lo}^{xᵢ} ψ² and G[i] = ∫_{xᵢ}^{hi} ψ², and the
+# total mass. Each is accumulated from its own end, so both keep full relative precision; F and
+# the total equal those of `_node_cdf`.
+function _node_cumulatives(d::IntervalDensityEstimate{T}) where {T}
+    m = length(d.x)
+    mc = T[_cell_mass(d, c) for c in 1:m-1]
+    F = Vector{T}(undef, m)
+    F[1] = _left_end_mass(d)
+    for c in 1:m-1
+        F[c+1] = F[c] + mc[c]
+    end
+    G = Vector{T}(undef, m)
+    G[m] = _right_end_mass(d)
+    for c in m-1:-1:1
+        G[c] = G[c+1] + mc[c]
+    end
+    return F, G, F[m] + G[m]
+end
+
 # ∫ψ² over [x_c, x] (fromleft) or [x, x_{c+1}] on interior cell c, meant for the half of the cell
 # nearer the node integrated from. Hyperbolic cells use the exact antiderivative; trigonometric
 # ones Gauss–Legendre quadrature, which is exact to roundoff because ψ² there is a
@@ -1640,6 +1659,32 @@ function _cdf_mass(d::IntervalDensityEstimate{T}, F::Vector{T}, x::Real) where {
     c = searchsortedlast(xs, xT)
     return xT - xs[c] <= xs[c+1] - xT ? F[c] + _cell_partial_mass(d, c, xT, true) :
                                         F[c+1] - _cell_partial_mass(d, c, xT, false)
+end
+
+# Unnormalized mass above x, ∫_x^{hi} ψ², integrated from the nearer end of its cell. It is
+# formed from G rather than as `total - _cdf_mass`, which would cancel where the mass above x
+# is small.
+function _ccdf_mass(d::IntervalDensityEstimate{T}, G::Vector{T}, x::Real) where {T}
+    xs, ψ = d.x, d.ψ
+    m = length(xs)
+    _check_not_nan(x)
+    xT = T(x)
+    if xT >= xs[m]
+        isfinite(d.hi) || return ψ[m]^2 / (2d.kR) * exp(-2d.kR * (xT - xs[m]))
+        xT >= d.hi && return zero(T)
+        vp, u = d.kR * (d.hi - xT), d.kR * (d.hi - xs[m])
+        return vp <= u / 2 ? _boundary_mass_from_wall(ψ[m], d.kR, vp, u) :
+                             G[m] - _boundary_mass_from_node(ψ[m], d.kR, vp, u)
+    elseif xT <= xs[1]
+        isfinite(d.lo) || return G[1] + ψ[1]^2 / (2d.kL) * (-expm1(2d.kL * (xT - xs[1])))
+        xT <= d.lo && return G[1] + _left_end_mass(d)
+        v, u = d.kL * (xT - d.lo), d.kL * (xs[1] - d.lo)
+        return v >= u / 2 ? G[1] + _boundary_mass_from_node(ψ[1], d.kL, v, u) :
+                            G[1] + _left_end_mass(d) - _boundary_mass_from_wall(ψ[1], d.kL, v, u)
+    end
+    c = searchsortedlast(xs, xT)
+    return xs[c+1] - xT <= xT - xs[c] ? G[c+1] + _cell_partial_mass(d, c, xT, false) :
+                                        G[c] - _cell_partial_mass(d, c, xT, true)
 end
 
 """
