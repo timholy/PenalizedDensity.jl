@@ -253,6 +253,10 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         d = IntervalDensityEstimate(rounded_intervals(; support=(-1.625, 2.125))..., 3.0; support=(-1.625, 2.125))
         @test d(-2.0) == 0 && logdensity(d, 3.0) == -Inf
         @test_throws DomainError quantile(d, 1.5)
+        # Near q = 1 the right boundary segment is inverted through the mass above y.
+        for q in (1 - 1e-12, 1 - 1e-10, 1 - 1e-8, 1 - 1e-4)
+            @test cdf(d, quantile(d, q)) ≈ q atol = 4 * eps(1.0)
+        end
     end
 
     @testset "moments" begin
