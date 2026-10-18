@@ -994,11 +994,10 @@ function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     Gψ[1] += t * ψ[1]
     Gψ[n] += t * ψ[n]
     for k in 1:n-1
-        h = x[k+1] - x[k]; θ = κ * h; ct = coth(θ); cs = csch(θ)
+        θ = κ * (x[k+1] - x[k])
         fdiag, fcross = _mass_coeffs(θ) ./ κ
         Z += fdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * fcross * ψ[k] * ψ[k+1]
-        dfdiag  = h * cs^2 * (θ * ct - oneunit(T)) / κ - (ct - θ * cs^2) / (2κ^2)
-        dfcross = h * cs * (2ct - θ * (ct^2 + cs^2)) / (2κ) - cs * (θ * ct - oneunit(T)) / (2κ^2)
+        dfdiag, dfcross = _mass_coeffs_dκ(θ) ./ κ^2
         dZ += dfdiag * (ψ[k]^2 + ψ[k+1]^2) + 2 * dfcross * ψ[k] * ψ[k+1]
         Gψ[k]   += fdiag * ψ[k]   + fcross * ψ[k+1]
         Gψ[k+1] += fdiag * ψ[k+1] + fcross * ψ[k]
@@ -1061,11 +1060,14 @@ function _dM_dκ_mul(x::Vector{T}, κ::T, ψ::Vector{T}) where {T}
     n = length(x)
     r = zeros(T, n)
     for k in 1:n-1
-        h = x[k+1] - x[k]; θ = κ * h; cs = csch(θ); ct = coth(θ)
-        dd = -h * cs^2                  # d/dκ coth(θ)
-        de =  h * cs * ct               # d/dκ (-csch(θ))
-        r[k]   += dd * ψ[k]   + de * ψ[k+1]
-        r[k+1] += dd * ψ[k+1] + de * ψ[k]
+        h = x[k+1] - x[k]; θ = κ * h
+        # d/dκ coth(θ) = -h csch²θ and d/dκ (-csch(θ)) = h csch θ coth θ nearly cancel against
+        # each other as θ → 0. With csch θ coth θ - csch²θ = 1/(1 + cosh θ), the cancellation
+        # is carried by the amplitude difference instead.
+        a = h * csch(θ)^2
+        b = h / (1 + cosh(θ))
+        r[k]   += a * (ψ[k+1] - ψ[k]) + b * ψ[k+1]
+        r[k+1] += a * (ψ[k] - ψ[k+1]) + b * ψ[k]
     end
     return r
 end
@@ -1320,6 +1322,56 @@ end
 function _interval_mass(ψk::T, ψk1::T, θ::T) where {T}
     fdiag, fcross = _mass_coeffs(θ)
     return fdiag * (ψk^2 + ψk1^2) + 2 * fcross * ψk * ψk1
+end
+
+# The θ-derivatives (fd′, fc′) of `_mass_coeffs`. For θ < 1 the coth/csch forms cancel
+# (relative error ~eps/θ²); the _sinhm/_coshm numerators are algebraically identical.
+function _mass_coeffs_dθ(θ::T) where {T}
+    if θ < 1
+        s3 = sinh(θ)^3
+        return (θ * _coshm(θ) - _sinhm(θ)) / s3, (_sinhm(2θ) - θ / 2 * _coshm(2θ)) / (2 * s3)
+    end
+    ct, cs = coth(θ), csch(θ)
+    return cs^2 * (θ * ct - 1), cs * (2ct - θ * (ct^2 + cs^2)) / 2
+end
+
+# (θfd′ - fd, θfc′ - fc), so that the κ-derivatives of the physical coefficients at fixed width
+# h are d(f/κ)/dκ = (θf′ - f)/κ². These are O(θ³) while θf′ and f are O(θ), so for θ < 1 they
+# come from `_mass_slope_series`.
+function _mass_coeffs_dκ(θ::T) where {T}
+    if θ < 1
+        Nd, Nc = _mass_slope_series(θ)
+        c = θ^3 / (2 * (sinh(θ) / θ)^3)
+        return c * Nd, -c * Nc
+    end
+    fd, fc = _mass_coeffs(θ)
+    fd′, fc′ = _mass_coeffs_dθ(θ)
+    return θ * fd′ - fd, θ * fc′ - fc
+end
+
+# θ⁻⁶ N_d and θ⁻⁶ N_c, where θfd′ - fd = N_d/(2 sinh³θ) and θfc′ - fc = -N_c/(2 sinh³θ) with
+#     N_d = 2θ² cosh θ - θ sinh θ - sinh²θ cosh θ,
+#     N_c = 2θ² + θ² sinh²θ - θ sinh θ cosh θ - sinh²θ.
+# Both are O(θ⁶), and from θ⁶ on their Taylor coefficients each have one sign:
+#     N_d = -Σ_{m≥3} ((9^m - 1)/4 - 8m² + 6m) θ^{2m}/(2m)!,
+#     N_c =  Σ_{m≥3} (2m + 1)(m - 2)/4 · (2θ)^{2m}/(2m)!,
+# so summing them loses nothing to cancellation.
+function _mass_slope_series(θ::T) where {T}
+    θ2 = θ^2
+    t = one(T) / 720                    # θ^{2(m-3)}/(2m)! at m = 3
+    p4, p9 = T(64), T(729)              # 4^m, 9^m
+    Nd = Nc = zero(T)
+    m = 3
+    while true
+        Ndnew = Nd - ((p9 - 1) / 4 - 8m^2 + 6m) * t
+        Ncnew = Nc + (2m + 1) * (m - 2) * p4 / 4 * t
+        Ndnew == Nd && Ncnew == Nc && return Nd, Nc
+        Nd, Nc = Ndnew, Ncnew
+        t *= θ2 / ((2m + 1) * (2m + 2))
+        p4 *= 4
+        p9 *= 9
+        m += 1
+    end
 end
 
 # Cumulative masses at the nodes, F[k] = ∫_{-∞}^{x[k]} ψ² dt, together with the grand
@@ -2090,12 +2142,13 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, yeval::AbstractVector
     μ = ldiv!(ldlt!(H), src)            # adjoint μ = H⁻¹ ∂L/∂φ (H and src are consumed)
     # Add the implicit response -μᵀ(∂M/∂xᵢ)φ and the explicit -C ∂ln Z/∂xᵢ|_φ. Both act only
     # through θₖ = κ hₖ, with ∂θₖ/∂xᵢ = κ(δ_{i,k+1} - δ_{i,k}), so interval k contributes
-    # ±(κ Bₖ + (C/Z) κ Dₖ) to nodes k and k+1. csch/coth stay finite as θ → ∞.
+    # ±(κ Bₖ + (C/Z) κ Dₖ) to nodes k and k+1. Bₖ is written as in `_dM_dκ_mul`, so that its two
+    # O(1/θ²) terms do not cancel as θ → 0, and stays finite as θ → ∞.
     for k in 1:n-1
-        θ = κ * (x[k+1] - x[k]); cs = csch(θ); ct = coth(θ)
-        Bk = -cs^2 * (μ[k] * φ[k] + μ[k+1] * φ[k+1]) + cs * ct * (μ[k] * φ[k+1] + μ[k+1] * φ[k])
-        dfdiag  = cs^2 * (θ * ct - 1) / κ
-        dfcross = cs * (2ct - θ * (ct^2 + cs^2)) / (2κ)
+        θ = κ * (x[k+1] - x[k])
+        Bk = (μ[k] * φ[k+1] + μ[k+1] * φ[k]) / (1 + cosh(θ)) -
+             csch(θ)^2 * (μ[k+1] - μ[k]) * (φ[k+1] - φ[k])
+        dfdiag, dfcross = _mass_coeffs_dθ(θ) ./ κ
         Dk = dfdiag * (φ[k]^2 + φ[k+1]^2) + 2 * dfcross * φ[k] * φ[k+1]
         contrib = κ * Bk + (C / Z) * κ * Dk
         g[k]   += contrib

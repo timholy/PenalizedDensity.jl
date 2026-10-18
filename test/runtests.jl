@@ -2179,6 +2179,42 @@ end
         @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[1] ≈ Zb rtol = 4eps()
         @test last(PenalizedDensity._node_cdf(d)) ≈ Zb rtol = 4eps()
         @test PenalizedDensity._int_quartic(x, ψ, κ) ≈ PenalizedDensity._int_quartic(X, Ψ, K) rtol = 4eps()
+        # κ-derivatives of the mass and of the roughness operator, on the same amplitudes.
+        @test PenalizedDensity._norm_sq_grad(x, ψ, κ)[2] ≈ PenalizedDensity._norm_sq_grad(X, Ψ, K)[2] rtol = 4eps()
+        r, rb = PenalizedDensity._dM_dκ_mul(x, κ, ψ), PenalizedDensity._dM_dκ_mul(X, K, Ψ)
+        @test all(isapprox.(r, rb; rtol=1e-13))
+        # The node gradient, from the same fit evaluated in BigFloat. What remains is the
+        # conditioning of the adjoint solve, whose entries grow like 1/θ.
+        db = DensityEstimate{BigFloat}(X, big.(d.w), Ψ, K, K, K, big(d.lo), big(d.hi), big(d.λ))
+        yev = randn(Xoshiro(7), 30)
+        g, gb = logdensity_node_gradient(d, yev), logdensity_node_gradient(db, big.(yev))
+        @test all(isapprox.(g, gb; rtol=1e-8))
+    end
+
+    @testset "derivatives of the interval mass coefficients" begin
+        # Against the closed coth/csch forms evaluated in BigFloat, where their cancellation
+        # costs nothing, over widths from near-coincident nodes to isolated points.
+        dθref(θ) = (cs = csch(θ); ct = coth(θ); (cs^2 * (θ * ct - 1), cs * (2ct - θ * (ct^2 + cs^2)) / 2))
+        function dκref(θ)
+            cs, ct = csch(θ), coth(θ)
+            fd, fc = (ct - θ * cs^2) / 2, cs * (θ * ct - 1) / 2
+            fd′, fc′ = dθref(θ)
+            return θ * fd′ - fd, θ * fc′ - fc
+        end
+        setprecision(BigFloat, 512) do
+            for θ in exp.(range(log(1e-9), log(40); length=101))
+                for (f, ref) in ((PenalizedDensity._mass_coeffs_dθ, dθref), (PenalizedDensity._mass_coeffs_dκ, dκref))
+                    a, b = f(θ), ref(big(θ))
+                    # Measured on the scale of the pair: fc′ passes through zero near θ = 1.5.
+                    @test maximum(abs.(a .- b)) <= 8eps() * sum(abs.(b))
+                end
+            end
+            # The series converges to the working precision.
+            a, b = PenalizedDensity._mass_coeffs_dκ(big"1e-3"), dκref(big"1e-3")
+            @test all(abs.(a .- b) .<= 1e-140 .* abs.(b))
+        end
+        @test @inferred(PenalizedDensity._mass_coeffs_dκ(0.01f0)) isa Tuple{Float32,Float32}
+        @test @inferred(PenalizedDensity._mass_coeffs_dθ(0.01f0)) isa Tuple{Float32,Float32}
     end
 
     @testset "mass" begin
