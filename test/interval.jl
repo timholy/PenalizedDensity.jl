@@ -375,6 +375,8 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test isnan(logdensity_eval_gradient(d, d.hi + 1))
         d32 = IntervalDensityEstimate(Float32.(xr), 3.0f0; resolution=0.1f0)
         @test @inferred(logdensity_eval_gradient(d32, 0.25f0)) isa Float32
+        @test @inferred(logdensity_eval_gradient(d32, 0.25)) isa Float64
+        @test logdensity_eval_gradient(d32, 0.25) ≈ logdensity_eval_gradient(d32, 0.25f0) rtol = 1e-5
     end
 
     @testset "gaussianize, ungaussianize, gaussianize_logjacobian" begin
@@ -476,6 +478,17 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test d32 isa IntervalDensityEstimate{Float32,Float32}
         ts = range(-3, 3; length=61)
         @test d32.(ts) ≈ d64.(ts) rtol = 1e-4
+        # Pointwise evaluation promotes with the argument; mass functions use the fit's type.
+        d32b = IntervalDensityEstimate(Float32.(abs.(x)) .+ 0.1f0, 3.0f0; resolution=0.1f0,
+                                       support=(0.0f0, 10.0f0))
+        for dd in (d32, d32b), t in (-50.0, 0.05, 0.3, 2.0, 11.0)
+            @test @inferred(logdensity(dd, t)) isa Float64
+            @test @inferred(dd(t)) isa Float64
+            @test @inferred(amplitude(dd, t)) isa Float64
+            @test @inferred(logdensity(dd, Float32(t))) isa Float32
+            @test @inferred(dd(Float32(t))) isa Float32
+            @test logdensity(dd, t) ≈ logdensity(dd, Float32(t)) rtol = 1e-5
+        end
         # Partial cell masses inside occupied cells with k² < 0 use Gauss–Legendre in Float32.
         @test any(<(0), d32.k2)
         @test cdf(d32, Float32.(ts)) ≈ cdf(d64, ts) rtol = 1e-5

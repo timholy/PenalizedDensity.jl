@@ -1129,15 +1129,19 @@ which may be a scalar or an array. Zero outside a finite `support` (see
 amplitude(d::DensityEstimate, x::Real) = _amplitude(d, x)
 amplitude(d::DensityEstimate, x::AbstractArray) = map(xi -> _amplitude(d, xi), x)
 
+# Pointwise evaluation computes in `promote_type(T, typeof(x))`, so a Float64 point on a
+# Float32 fit gets a Float64 result. The mass functions (`cdf`, `quantile`, `gaussianize`)
+# instead convert their argument to `T`.
 function _amplitude(d::DensityEstimate{T}, x::Real) where {T}
     _check_not_nan(x)
+    R = promote_type(T, typeof(x))
     xs = d.x
     n = length(xs)
     if x <= xs[1]
-        x < d.lo && return zero(T)
+        x < d.lo && return zero(R)
         return _left_tail_amplitude(d.ψ[1], d.κL, x, xs[1], d.lo)
     elseif x >= xs[n]
-        x > d.hi && return zero(T)
+        x > d.hi && return zero(R)
         return _right_tail_amplitude(d.ψ[n], d.κR, x, xs[n], d.hi)
     end
     return _amplitude(d, searchsortedlast(xs, x), x)    # xs[k] <= x < xs[k+1]
@@ -1196,13 +1200,14 @@ logdensity(d::DensityEstimate, x::AbstractArray) = map(xi -> _logdensity(d, xi),
 # so: a caller reaching either one for the same quantity may not get a different answer.
 function _logdensity(d::DensityEstimate{T}, x::Real) where {T}
     _check_not_nan(x)
+    R = promote_type(T, typeof(x))
     xs = d.x
     n = length(xs)
     if x <= xs[1]
-        x < d.lo && return T(-Inf)
+        x < d.lo && return R(-Inf)
         return 2 * _log_left_tail_amplitude(d.ψ[1], d.κL, x, xs[1], d.lo)
     elseif x >= xs[n]
-        x > d.hi && return T(-Inf)
+        x > d.hi && return R(-Inf)
         return 2 * _log_right_tail_amplitude(d.ψ[n], d.κR, x, xs[n], d.hi)
     end
     return 2 * _log_amplitude(d, searchsortedlast(xs, x), x)
@@ -1270,6 +1275,7 @@ _cosh_ratio(u::T, θ::T) where {T} = -exp(u - θ) * (1 + exp(-2u)) / expm1(-2θ)
 # cosh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u (a cosh-denominator
 # companion to _sinh_ratio/_cosh_ratio, used by the boundary-segment amplitude).
 _cosh_ratio2(v::T, u::T) where {T} = exp(v - u) * (oneunit(T) + exp(-2v)) / (oneunit(T) + exp(-2u))
+_cosh_ratio2(v, u) = _cosh_ratio2(promote(v, u)...)
 
 # sinh(v)/cosh(u) for 0 ≤ v ≤ u, evaluated without overflow at large u and accurate as v → 0
 # (via expm1, the same treatment _sinh_ratio gives its numerator).
@@ -1286,9 +1292,10 @@ function _sinh_arc_slope(ψk::T, ψk1::T, a::T, b::T) where {T}
     den = ψk * ea * (-expm1(-2a)) + ψk1 * eb * (-expm1(-2b))
     return num / den
 end
+_sinh_arc_slope(ψk, ψk1, a, b) = _sinh_arc_slope(promote(ψk, ψk1, a, b)...)
 
 # ψ'(x)/ψ(x) inside interval k.
-function _amplitude_slope(d::DensityEstimate{T}, k::Integer, x::T) where {T}
+function _amplitude_slope(d::DensityEstimate, k::Integer, x::Real)
     xs, ψ = d.x, d.ψ
     κ = _kappa(d, k)
     return κ * _sinh_arc_slope(ψ[k], ψ[k+1], κ * (xs[k+1] - x), κ * (x - xs[k]))
@@ -1298,9 +1305,11 @@ end
 # unbounded, and κ tanh(κ(x - lo)) on the Neumann cosh arc of a finite boundary. Neither
 # depends on ψ, which underflows deep in a tail.
 _left_tail_slope(κ::T, x::T, lo::T) where {T} = isfinite(lo) ? κ * tanh(κ * (x - lo)) : κ
+_left_tail_slope(κ, x, lo) = _left_tail_slope(promote(κ, x, lo)...)
 
 # Mirror of `_left_tail_slope` for the right tail.
 _right_tail_slope(κ::T, x::T, hi::T) where {T} = isfinite(hi) ? -κ * tanh(κ * (hi - x)) : -κ
+_right_tail_slope(κ, x, hi) = _right_tail_slope(promote(κ, x, hi)...)
 
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
@@ -2025,19 +2034,18 @@ approaching from within the enclosing interval.
 """
 function logdensity_eval_gradient(d::AbstractDensityEstimate, y::Real)
     _check_not_nan(y)
-    T = eltype(d)
+    R = promote_type(eltype(d), typeof(y))
     xs = d.x
     n = length(xs)
-    yT = T(y)
     κL, κR = _tail_rates(d)
-    if yT <= xs[1]
-        yT < d.lo && return T(NaN)
-        return 2 * _left_tail_slope(κL, yT, d.lo)
-    elseif yT >= xs[n]
-        yT > d.hi && return T(NaN)
-        return 2 * _right_tail_slope(κR, yT, d.hi)
+    if y <= xs[1]
+        y < d.lo && return R(NaN)
+        return 2 * _left_tail_slope(κL, y, d.lo)
+    elseif y >= xs[n]
+        y > d.hi && return R(NaN)
+        return 2 * _right_tail_slope(κR, y, d.hi)
     end
-    return 2 * _amplitude_slope(d, searchsortedlast(xs, yT), yT)
+    return 2 * _amplitude_slope(d, searchsortedlast(xs, y), y)
 end
 logdensity_eval_gradient(d::AbstractDensityEstimate, y::AbstractArray) =
     map(yi -> logdensity_eval_gradient(d, yi), y)
