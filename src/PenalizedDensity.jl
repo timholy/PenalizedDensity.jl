@@ -5,14 +5,15 @@ using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, Symmetric, ZeroPivotExcep
 using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
-using Statistics: Statistics, mean, quantile, std
+using Random: Random, AbstractRNG, Repetition, SamplerSimple
+using Statistics: Statistics, mean, quantile, std, var
 
 export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa_ms, select_kappa_cv, select_kappa_kl, select_support, kappa_interval
 export AdaptiveScale, WindowScale, WindowRule, select_kappa_adaptive
 export chisq, expected_chisq, chisq_reference, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
-export cdf, quantile
+export cdf, quantile, mean, var, std
 export gaussianize, ungaussianize, gaussianize_gradient, gaussianize_logjacobian
 
 """
@@ -22,6 +23,10 @@ Supertype of the fitted densities: [`DensityEstimate`](@ref) (point observations
 [`IntervalDensityEstimate`](@ref) (interval observations, optionally mixed with points). Every
 subtype is callable, `d(x)` giving the density, and supports [`amplitude`](@ref),
 [`logdensity`](@ref), [`cdf`](@ref), and [`quantile`](@ref Statistics.quantile).
+
+Every subtype also supports the support queries [`minimum`](@ref Base.minimum),
+`maximum` and `extrema`, and sampling by inversion through `rand`: `rand(d)`,
+`rand(rng, d, dims...)` and `rand!(rng, A, d)` draw from the fitted density.
 """
 abstract type AbstractDensityEstimate end
 
@@ -698,28 +703,33 @@ end
 _norm_sq_gram(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T) where {T} =
     _norm_sq_gram(x, ψ, κ, κL, κR, T(-Inf), T(Inf))
 
-# (μ, σ²) of the density Q = ψ², i.e. ∫x Q dx and ∫x² Q dx - μ², via the same per-interval
-# hyperbolic closed forms as _norm_sq (ψ is already normalized, so Z ≡ ∫Q dx = 1 is assumed
-# rather than recomputed). On each interval, with local coordinate t = x - x[k] ∈ [0, h],
-# ∫₀ʰ t Q dt and ∫₀ʰ t² Q dt reduce to the same tridiagonal quadratic-form structure as
-# ∫₀ʰ Q dt, via the coth/csch coefficients gdiag1, gdiag2, gcross (weight t) and hdiag1,
-# hdiag2, hcross (weight t²); the interval's contribution to μ and the second moment then
-# picks up the node offset x[k] as in ∫x Q dx = ∫(x[k] + t) Q dt.
+# (μ, σ²) of the fitted density Q = ψ², i.e. ∫x Q dx / Z and ∫x² Q dx / Z - μ² with Z = ∫Q dx,
+# from per-interval hyperbolic closed forms. On interior interval k, with local coordinate
+# t = x - x[k] ∈ [0, h] and rate κ = `_kappa(d, k)`, ∫₀ʰ Q dt, ∫₀ʰ t Q dt and ∫₀ʰ t² Q dt are
+# tridiagonal quadratic forms in the nodal amplitudes with the coth/csch coefficients fdiag,
+# fcross (weight 1), gdiag1, gdiag2, gcross (weight t) and hdiag1, hdiag2, hcross (weight t²);
+# the interval's contribution then picks up the node offset x[k] as in ∫x Q dx = ∫(x[k] + t) Q dt.
+# The tails contribute `_tail_moments` at their own rates and boundary gaps. Z is accumulated in
+# the same pass rather than assumed to be 1, so the result does not depend on how precisely ψ was
+# normalized.
 #
 # Node positions are measured relative to x[1] throughout (not the caller's absolute
 # coordinate) before accumulating M1, M2: since μ, σ² are translation-covariant/-invariant,
 # this doesn't change the result, but it keeps M1, M2 (and hence M2 - M1²) of order the data's
 # spread rather than of order its absolute location, which is what M2 - M1² needs to stay
 # well-conditioned. Without it, data far from the origin (e.g. x .+ 1e8) can drive σ² negative.
-function _moments(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
+function _moments(d::DensityEstimate{T}) where {T}
+    x, ψ = d.x, d.ψ
     n = length(x)
     x0 = x[1]
     xn = x[n] - x0
-    # Tails: ∫x Q dx and ∫x² Q dx over ψ² e^{-2κ|x - x_edge|}, exact via ∫₀^∞ uᵏ e^{-2κu} du.
-    M1 = ψ[1]^2 * (-1 / (4κ^2)) + ψ[n]^2 * (xn / (2κ) + 1 / (4κ^2))
-    M2 = ψ[1]^2 * (1 / (4κ^3)) +
-         ψ[n]^2 * (xn^2 / (2κ) + xn / (2κ^2) + 1 / (4κ^3))
+    L0, L1, L2 = _tail_moments(d.κL, x[1] - d.lo)     # left tail, r = x[1] - x ≥ 0
+    R0, R1, R2 = _tail_moments(d.κR, d.hi - x[n])     # right tail, r = x - x[n] ≥ 0
+    Z  = ψ[1]^2 * L0 + ψ[n]^2 * R0
+    M1 = -ψ[1]^2 * L1 + ψ[n]^2 * (xn * R0 + R1)
+    M2 = ψ[1]^2 * L2 + ψ[n]^2 * (xn^2 * R0 + 2 * xn * R1 + R2)
     for k in 1:n-1
+        κ = _kappa(d, k)
         h = x[k+1] - x[k]; θ = κ * h; ct, cs = coth(θ), csch(θ)
         p, q = ψ[k], ψ[k+1]
         fdiag  = (ct - θ * cs^2) / (2κ)
@@ -737,11 +747,74 @@ function _moments(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
         Kseg = hdiag1 * p^2 + hdiag2 * q^2 + 2 * hcross * p * q             # ∫₀ʰ t² Q dt
 
         xk = x[k] - x0
+        Z  += Iseg
         M1 += xk * Iseg + Jseg
         M2 += xk^2 * Iseg + 2 * xk * Jseg + Kseg
     end
-    return M1 + x0, M2 - M1^2
+    μ = M1 / Z
+    return μ + x0, M2 / Z - μ^2
 end
+
+# Moments (J₀, J₁, J₂) = ∫ rᵐ ψ̂(r)² dr, m = 0, 1, 2, of a tail field with unit amplitude at the
+# outermost node, r ≥ 0 being the distance from that node outward. On an unbounded side
+# ψ̂ = e^{-κr}, giving 1/(2κ), 1/(4κ²), 1/(4κ³). At a finite gap Δ the Neumann arc
+# ψ̂ = cosh(κ(Δ - r))/cosh(κΔ) on r ∈ [0, Δ] gives, with u = κΔ,
+#     J₀ = (tanh u + u sech²u) / (2κ)
+#     J₁ = (tanh²u + u² sech²u) / (4κ²)
+#     J₂ = (3 tanh u - 3u sech²u + 2u³ sech²u) / (12κ³),
+# each reducing to the unbounded value as u → ∞. J₀ is `_tail_mass` at unit amplitude.
+function _tail_moments(κ::T, Δ::T) where {T}
+    isfinite(Δ) || return (one(T) / (2κ), one(T) / (4κ^2), one(T) / (4κ^3))
+    u = κ * Δ
+    th, s2 = _tanh_stable(u), _sech2_stable(u)
+    J0 = (th + u * s2) / (2κ)
+    J1 = (th^2 + u^2 * s2) / (4κ^2)
+    J2 = (3th - 3u * s2 + 2u^3 * s2) / (12κ^3)
+    return J0, J1, J2
+end
+
+"""
+    mean(d::DensityEstimate)
+
+Mean `∫ x Q̂(x) dx` of the fitted density, computed in closed form from the nodal amplitudes
+(per-interval hyperbolic integrals plus the exponential or bounded tails). See also
+[`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
+
+# Examples
+
+```jldoctest
+julia> d = DensityEstimate([-1.0, 1.0], 1.0);
+
+julia> abs(mean(d)) < 1e-12
+true
+```
+"""
+Statistics.mean(d::DensityEstimate) = first(_moments(d))
+
+"""
+    var(d::DensityEstimate)
+
+Variance `∫ (x - μ)² Q̂(x) dx` of the fitted density, computed in closed form like
+[`mean`](@ref Statistics.mean). This is the variance of the fitted density itself, not of the
+sample it was fitted to.
+
+# Examples
+
+```jldoctest
+julia> d = DensityEstimate([0.0], 1.0);   # one point: a Laplace density of rate 2κ
+
+julia> var(d) ≈ 2 / (2 * 1.0)^2
+true
+```
+"""
+Statistics.var(d::DensityEstimate) = last(_moments(d))
+
+"""
+    std(d::DensityEstimate)
+
+Standard deviation `√var(d)` of the fitted density; see [`var`](@ref Statistics.var).
+"""
+Statistics.std(d::DensityEstimate) = sqrt(var(d))
 
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
@@ -1333,6 +1406,34 @@ function Statistics.quantile(d::DensityEstimate, q::AbstractArray)
     return map(qi -> _quantile(d, F, total, qi), q)
 end
 
+# Sampling by inversion, `quantile(d, q)` at uniform `q`, for any fit. Batches share the node
+# cumulatives through `SamplerSimple`, so drawing `n` values costs one O(N) setup plus `n`
+# inversions. `q = 0` (probability 2⁻⁵³ in Float64) is redrawn: on an unbounded left side its
+# quantile is `-Inf`, which is not a sample.
+Base.eltype(::Type{<:DensityEstimate{T}}) where {T} = T
+Random.Sampler(::Type{<:AbstractRNG}, d::AbstractDensityEstimate, ::Repetition) = SamplerSimple(d, _node_cdf(d))
+function Random.rand(rng::AbstractRNG, sp::SamplerSimple{<:AbstractDensityEstimate})
+    d = sp[]
+    F, total = sp.data
+    T = eltype(d)
+    while true
+        q = rand(rng, T)
+        q > 0 && return _quantile(d, F, total, q)
+    end
+end
+
+"""
+    minimum(d::AbstractDensityEstimate)
+    maximum(d::AbstractDensityEstimate)
+    extrema(d::AbstractDensityEstimate)
+
+Lower and upper ends of the support of the fitted density: the `support` the fit was given,
+`-Inf`/`Inf` on an unbounded side.
+"""
+Base.minimum(d::AbstractDensityEstimate) = d.lo
+Base.maximum(d::AbstractDensityEstimate) = d.hi
+Base.extrema(d::AbstractDensityEstimate) = (minimum(d), maximum(d))
+
 # Closed-form quantile in an unbounded exponential tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}.
 _left_tail_quantile(ψ1::T, κ::T, x1::T, target::T) where {T} = x1 + log(2κ * target / ψ1^2) / (2κ)
 
@@ -1664,8 +1765,8 @@ mean and variance,
 
     J = ½ ln(2π e σ²) - Ĥ,
 
-where `σ²` is the fit's variance (computed analytically from the nodal amplitudes, the same
-per-interval hyperbolic closed form as [`action`](@ref)'s normalization) and `Ĥ` is
+where `σ²` is the fit's variance [`var`](@ref Statistics.var)`(d)` (computed in closed form from
+the nodal amplitudes, for any scale profile and support) and `Ĥ` is
 [`entropy`](@ref)`(d)`. `J ≥ 0` in the large-sample limit (the Gaussian maximizes entropy at
 fixed variance), but the plug-in `Ĥ` can push a finite-sample estimate slightly off zero even
 when the underlying density is Gaussian. `J` is invariant under `x ↦ a·x + b` (with `κ ↦ κ/|a|`
@@ -1673,7 +1774,7 @@ for the corresponding fit, per the package's scale equivariance): both terms shi
 under the rescaling and cancel.
 """
 function negentropy(d::DensityEstimate{T}) where {T}
-    _, σ² = _moments(d.x, d.ψ, d.κ)
+    σ² = var(d)
     return log(2 * T(π) * exp(one(T)) * σ²) / 2 - entropy(d)
 end
 
@@ -1683,7 +1784,11 @@ end
 Held-out plug-in estimate of the differential entropy of the fitted density `d`, scored at
 points `xeval` that did *not* enter the fit `d`:
 
-    Ĥ = -(1/M) Σⱼ ln Q̂(xevalⱼ) = -(2/M) Σⱼ ln ψ(xevalⱼ),   M = length(xeval).
+    Ĥ = -(1/M) Σⱼ ln Q̂(xevalⱼ),   M = length(xeval),
+
+with `ln Q̂` evaluated by [`logdensity`](@ref), so it stays finite far into an unbounded tail
+where `Q̂` itself underflows. A point outside a finite `support` has `ln Q̂ = -Inf` and makes
+`Ĥ = Inf`.
 
 Unlike the one-argument [`entropy`](@ref)`(d)`, which evaluates `ln Q̂` at the fit's own
 nodes, this evaluates it at independent points and so does not reward collapsing the density
@@ -1694,9 +1799,9 @@ function entropy(d::DensityEstimate{T}, xeval::AbstractVector) where {T}
     M > 0 || throw(ArgumentError("need at least one evaluation point"))
     s = zero(T)
     for y in xeval
-        s += log(_amplitude(d, T(y)))
+        s += _logdensity(d, T(y))
     end
-    return -2 * s / M
+    return -s / M
 end
 
 # Empirical mean and population (maximum-likelihood) variance of `xeval`. Moments are
