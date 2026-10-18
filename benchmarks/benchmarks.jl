@@ -162,7 +162,7 @@ end
 const SELECTORS = [
     ("select_kappa_ms (min-sensitivity)", x -> PenalizedDensity.select_kappa_ms(x; rtol = 1e-3)),
     ("kappa_interval (half-entropy)",  x -> kappa_interval(x; rtol = 1e-3).κ),
-    ("select_kappa_cv (LSCV/MISE)",    x -> PenalizedDensity.select_kappa_cv(x; rtol = 1e-3)),
+    ("select_kappa_lscv (LSCV/MISE)",    x -> PenalizedDensity.select_kappa_lscv(x; rtol = 1e-3)),
     ("select_kappa (KL)",           x -> select_kappa(x; rtol = 1e-3)),
 ]
 

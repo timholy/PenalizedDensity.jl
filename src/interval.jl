@@ -1243,11 +1243,29 @@ function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Rea
     r, slo, shi = T(rtol), T(a), T(b)
     lu, uu, counts = _tally_intervals(lower, upper, T)
     function score(κ)
-        L = _interval_layout(lu, uu, κ, r, slo, shi; counts)
-        v = _unless_unresolvable(() -> _interval_klcv(L; holdout), T(NaN))
+        v = _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout)
         return isfinite(v) ? v : typemax(T)
     end
     return _minimize_on_grid(score, kappas, T)
+end
+
+function klcv(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ::Real;
+              support::Tuple{Real,Real}=(-Inf, Inf),
+              rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
+              holdout::Symbol=:location)
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
+    _check_bounds_axes(lower, upper)
+    T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol),
+                           _support_eltype(a), _support_eltype(b)))
+    lu, uu, counts = _tally_intervals(lower, upper, T)
+    return _interval_klcv_at(lu, uu, counts, _score_scale(κ, T), T(rtol), T(a), T(b); holdout)
+end
+
+# The KLCV score of the constant scale κ on tallied interval data; NaN when κ is unresolvable.
+function _interval_klcv_at(lu, uu, counts, κ, r::T, slo::T, shi::T; holdout::Symbol) where {T}
+    L = _interval_layout(lu, uu, κ, r, slo, shi; counts)
+    return _unless_unresolvable(() -> _interval_klcv(L; holdout), T(NaN))
 end
 
 _check_bounds_axes(lower, upper) = axes(lower) == axes(upper) ? nothing :

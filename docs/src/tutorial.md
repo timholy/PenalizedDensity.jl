@@ -63,51 +63,73 @@ from it.
 
 ## Choosing the smoothing scale
 
-PenalizedDensity offers four automatic selectors. They split into two families: two that
-target *estimation error* (recommended for smooth data) and two that resolve *information*
-in the data (the right choice for heavily tied or discrete data). The **recommended
-default** is [`select_kappa`](@ref), which minimizes a likelihood (Kullback–Leibler)
-cross-validation score:
+The recommended selector is [`select_kappa`](@ref), which minimizes a likelihood
+(Kullback–Leibler) cross-validation score:
 
 ```@example tutorial
-κ_kl = select_kappa(xs)                     # recommended: error-optimal, likelihood cross-validation
+κ_kl = select_kappa(xs)                     # likelihood cross-validation
 ```
 
 Its score is the leave-one-out log-likelihood ``-\tfrac1N\sum_i \ln \hat
 Q_{-i}(x_i)``, where ``\hat Q_{-i}(x_i)`` is an estimate at the point ``x_i``
 formed from all points *except* ``x_i`` itself. This score is an estimate of
 ``\mathrm{KL}(Q \,\|\, \hat Q_\kappa)`` up to a constant; it is the criterion
-native to the estimator, whose action is itself a log-likelihood. A close
-relative, `PenalizedDensity.select_kappa_cv` (not exported; used here for comparison), instead minimizes a least-squares (MISE)
-cross-validation score:
+native to the estimator, whose action is itself a log-likelihood. It is evaluated
+analytically: each leave-one-out density comes from a one-step expansion of the fit, so no
+point-by-point refitting is needed. The selected scale grows like ``N^{1/5}``.
+
+The score assumes a *continuous* underlying density, in which no two observations coincide.
+If more than 1% of the observations repeat another value, `select_kappa` throws an
+`ArgumentError` unless you say what the repeats mean with the `resolution` keyword. For values
+rounded to a lattice of spacing `δ`, `select_kappa(x; resolution = δ)` selects the scale for
+[`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
+rounding interval. `resolution = 0` declares the repeats to be exact points. On heavily tied
+exact points the cross-validation score can favor over-resolved scales, and
+[`kappa_interval`](@ref), described below, is the safer choice.
+
+## Comparing selection criteria
+
+`select_kappa` is the package's selection criterion. The alternatives below are `public` but
+not exported. They exist so you can compare criteria on your own data. Each comes as a selector
+and, where it minimizes a score, as a function that evaluates that score at a given ``\kappa``:
+
+| criterion | selector | score at `κ` |
+|:--|:--|:--|
+| likelihood cross-validation (KLCV) | [`select_kappa`](@ref) | [`klcv`](@ref) |
+| least-squares cross-validation (LSCV) | [`select_kappa_lscv`](@ref) | [`lscv`](@ref) |
+| minimum sensitivity | [`select_kappa_ms`](@ref) | [`action_sensitivity`](@ref) |
+| half-entropy | [`kappa_interval`](@ref) | — |
+
+Evaluating a score over a range of ``\kappa`` shows how sharply its minimum is defined:
 
 ```@example tutorial
-κ_cv = PenalizedDensity.select_kappa_cv(xs) # least-squares cross-validation (MISE)
+using PenalizedDensity: klcv, lscv, action_sensitivity, select_kappa_lscv, select_kappa_ms
+κs = exp.(range(log(0.5), log(50); length = 41))
+scores = [klcv(xs, κ) for κ in κs]
+κs[argmin(scores)], κ_kl                     # best grid point and the selected scale
 ```
 
-Both are evaluated analytically — each leave-one-out density comes from a one-step
-expansion of the fit, so no point-by-point refitting is needed — and to leading order they
-select the same ``\kappa \propto N^{1/5}``. Across a range of test densities `select_kappa`
-tracks the error-optimal scale most closely (see `benchmarks/`) and is the cheaper of the
-two, which is why it is the default.
+Least-squares cross-validation minimizes an unbiased estimate, up to a constant, of the
+integrated squared error ``\int(\hat Q_\kappa - Q)^2``, i.e. it targets minimum mean integrated
+squared error (MISE):
 
-Both assume a *continuous* underlying density, in which no two observations coincide. If
-more than 1% of the observations repeat another value, they throw an `ArgumentError` unless
-you say what the repeats mean with the `resolution` keyword. For values rounded to a lattice of
-spacing `δ`, `select_kappa(x; resolution = δ)` selects the scale for
-[`IntervalDensityEstimate`](@ref)`(x, κ; resolution = δ)`, treating each observation as its
-rounding interval; `PenalizedDensity.select_kappa_cv` and [`select_support`](@ref) have no interval form.
-`resolution = 0` declares the repeats to be exact points. On heavily tied exact points the
-cross-validation scores can favor over-resolved scales, and the two information-resolving
-selectors below are the safer choice.
+```@example tutorial
+κ_lscv = select_kappa_lscv(xs)
+```
 
-The first information-resolving selector, [`kappa_interval`](@ref), returns a principled
-scale with a plausible range. Its basis is that the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa``
-(``W`` = total count) rises monotonically between two *exact* limits — ``W/2`` as
-``\kappa\to0`` (all points merge into one lump) and ``W/2 + W H`` as ``\kappa\to\infty``
-(the ``N`` points become isolated), where ``H`` is the Shannon entropy of the data. The
-normalized quantity ``h(\kappa)\in[0,1]`` is thus the *fraction of the data's entropy that
-``\kappa`` resolves*, and its half-point is the returned scale:
+To leading order it selects the same ``\kappa \propto N^{1/5}`` as `select_kappa`. Across a
+range of test densities `select_kappa` tracks the error-optimal scale more closely (see
+`benchmarks/`), and it is cheaper, because it needs no ``\int \hat Q^2`` term. LSCV has no
+interval form, so rounded data should go to `select_kappa` with `resolution`.
+
+The remaining two criteria resolve *information* in the data rather than minimizing error.
+[`kappa_interval`](@ref) returns a principled scale with a plausible range. Its basis is that
+the reduced action ``g(\kappa) = S(\kappa) + W\ln\kappa`` (``W`` = total count) rises
+monotonically between two *exact* limits — ``W/2`` as ``\kappa\to0`` (all points merge into
+one lump) and ``W/2 + W H`` as ``\kappa\to\infty`` (the ``N`` points become isolated), where
+``H`` is the Shannon entropy of the data. The normalized quantity ``h(\kappa)\in[0,1]`` is thus
+the *fraction of the data's entropy that ``\kappa`` resolves*, and its half-point is the
+returned scale:
 
 ```@example tutorial
 ki = kappa_interval(xs)          # (; κ, lo, hi): the half-entropy scale and a band
@@ -122,20 +144,19 @@ resolved — and the shaded band is the plausible range:
 
 ![Reduced action rising between its two entropy limits](assets/action_entropy.png)
 
-The second information-resolving selector, `PenalizedDensity.select_kappa_ms` (also not exported), returns a related but
-distinct scale: the point of *minimum sensitivity*, where `|dS/d ln κ|` is smallest. Its
+[`select_kappa_ms`](@ref) returns a related but distinct scale: the point of *minimum
+sensitivity*, where [`action_sensitivity`](@ref) ``= |dS/d\ln\kappa|`` is smallest. The
 derivative is computed analytically, so the result is free of the noise that
 finite-differencing the action curve would introduce.
 
 ```@example tutorial
-κ_ms = PenalizedDensity.select_kappa_ms(xs) # minimum-sensitivity scale
+κ_ms = select_kappa_ms(xs)
 ```
 
-`PenalizedDensity.select_kappa_ms` and `kappa_interval` generally select different scales, but both resolve
-*information* in the data rather than minimizing error, and on smooth densities they tend to
-over-resolve — which is why the cross-validation selectors are recommended by default. Their
-value is on heavily tied or discrete data, where they stay bounded and the cross-validation
-scores do not.
+`select_kappa_ms` and `kappa_interval` generally select different scales, and on smooth
+densities both over-resolve, which is why `select_kappa` is the default. Their value is on
+heavily tied or discrete data, where they stay bounded and the cross-validation scores do not.
+Neither takes `support`: the entropy limits they rely on are derived for the unbounded line.
 
 ## Letting the scale vary across the data
 
@@ -412,7 +433,7 @@ xeval = [rand() < comps[1].w ? comps[1].μ + comps[1].σ * randn() :
 The held-out negentropy is close to the in-sample value here because the fit generalizes
 well. Scoring on points that did not build the fit is what makes the held-out form
 informative: unlike the in-sample value, it is not inflated by concentrating the density
-onto the fit sample, the same reason `PenalizedDensity.select_kappa_cv` cross-validates.
+onto the fit sample, the same reason [`select_kappa`](@ref) cross-validates.
 
 The log density itself is [`logdensity`](@ref), and it can be used to circumvent
 density underflows to zero once ``2\kappa`` times the distance to the nearest

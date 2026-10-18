@@ -989,7 +989,7 @@ end
 # ∫u⁴ = ([u³u']ₖ^{k+1} - 3E ∫u²)/(4κ²). The boundary and energy terms are written through
 # coshθ - 1 = 2 sinh²(θ/2) and the endpoint difference q - p, keeping them accurate for
 # near-coincident points (θ → 0, where the naive csch⁴ forms lose all precision) while staying
-# finite for isolated points (θ → ∞). Used by select_kappa_cv for the ∫Q² term.
+# finite for isolated points (θ → ∞). Used by select_kappa_lscv for the ∫Q² term.
 #
 # The derivation is local to one interval, so a piecewise-constant scale changes nothing but
 # which κ each term carries. Each tail is `_tail_quartic(ψ_edge, κ_edge, Δ)` — ψ_edge⁴/(4κ_edge)
@@ -2540,13 +2540,14 @@ end
     select_kappa_ms(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
-the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. `|dS/d ln κ|`
-is smallest (Fig. 1 of the paper). `kappas` must be sorted and positive, with at least three
-values to bracket the minimum, and defaults to a geometric range scaled to the data's extent.
+the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. the `κ`
+minimizing [`action_sensitivity`](@ref)`(x, κ) = |dS/d ln κ|` (Fig. 1 of the paper). `kappas`
+must be sorted and positive, with at least three values to bracket the minimum, and defaults to
+a geometric range scaled to the data's extent.
 
 This and the entropy-based [`kappa_interval`](@ref) both resolve *information* and over-resolve
 smooth densities; to target estimation error instead, use [`select_kappa`](@ref) (or
-[`select_kappa_cv`](@ref)); for rounded data, pass the rounding increment to `select_kappa` as
+[`select_kappa_lscv`](@ref)); for rounded data, pass the rounding increment to `select_kappa` as
 `resolution`.
 
 This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
@@ -2563,13 +2564,31 @@ sensitivity in `ln κ`.
 function select_kappa_ms(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
                          rtol::Real=cbrt(eps(float(eltype(x)))))
     _check_kappa_grid(kappas)
+    xs, r = _sensitivity_sample(x, rtol)
+    return _minimize_on_grid(κ -> _action_sensitivity(xs, r, κ), kappas, eltype(xs))
+end
+
+"""
+    action_sensitivity(x, κ; rtol=cbrt(eps(T))) -> s::T
+
+The minimum-sensitivity score `s = |dS/d ln κ|` of the scale `κ` for data `x`, where `S` is the
+classical [`action`](@ref) of the unbounded fit [`DensityEstimate`](@ref)`(x, κ; rtol)`.
+[`select_kappa_ms`](@ref) returns the `κ` minimizing it; evaluating it over a range of `κ` shows
+how sharply that minimum is defined. The derivative is computed analytically.
+"""
+function action_sensitivity(x::AbstractVector{<:Real}, κ::Real; rtol::Real=cbrt(eps(float(eltype(x)))))
+    xs, r = _sensitivity_sample(x, rtol)
+    return _action_sensitivity(xs, r, _score_scale(κ, eltype(xs)))
+end
+
+function _sensitivity_sample(x::AbstractVector{<:Real}, rtol::Real)
     _check_rtol(rtol)
     T = float(promote_type(eltype(x), typeof(rtol)))
-    xs = _sorted_sample(x, T)
-    r = T(rtol)
-    absslope(κ) = abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
-    return _minimize_on_grid(absslope, kappas, T)
+    return _sorted_sample(x, T), T(rtol)
 end
+
+_action_sensitivity(xs::Vector{T}, r::T, κ::T) where {T} =
+    abs(last(_action_and_slope(_merge_presorted(xs, r / κ)..., κ)))
 
 """
     kappa_interval(x; level=0.2, rtol=cbrt(eps(T))) -> (; κ, lo, hi)
@@ -2812,10 +2831,11 @@ _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T; kwargs...) where {T} =
 _klcv(nodes::Vector{T}, w::Vector{T}, κ::T; kwargs...) where {T} = _klcv(nodes, w, κ, κ, κ; kwargs...)
 
 """
-    select_kappa_cv(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
-                    resolution=nothing, holdout=:location) -> κ
+    select_kappa_lscv(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+                      resolution=nothing, holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
+[`lscv`](@ref)`(x, κ)`,
 
     LSCV(κ) = ∫ Q̂_κ(x)² dx - (2/N) Σᵢ Q̂_{κ,-i}(xᵢ),
 
@@ -2839,15 +2859,33 @@ segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from the same leave-on
 [`select_kappa`](@ref) uses, so no per-point refitting is needed. The score is minimized by a
 golden-section search over `ln κ`, bracketed by the grid `kappas`.
 """
-function select_kappa_cv(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
-                         rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
-                         resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
-    _is_rounded(resolution) &&
-        throw(ArgumentError("select_kappa_cv has no form for rounded (interval) data; use " *
-                            "select_kappa(x; resolution=$resolution), or resolution=0 to treat " *
-                            "the values as exact points"))
+function select_kappa_lscv(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
+                           rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
+                           resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
+    _check_lscv_resolution(resolution, "select_kappa_lscv")
     return _select_by_score(_lscv, x, kappas, rtol, support; holdout, checkties=resolution === nothing)
 end
+
+"""
+    lscv(x, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)), resolution=nothing,
+         holdout=:location) -> LSCV::T
+
+The least-squares cross-validation score of the constant scale `κ` for data `x`, the quantity
+[`select_kappa_lscv`](@ref) minimizes; the keywords mean what they do there. It is `NaN` when a
+leave-one-out density is undefined at `κ`.
+"""
+function lscv(x::AbstractVector{<:Real}, κ::Real; support::Tuple{Real,Real}=(-Inf, Inf),
+              rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,
+              holdout::Symbol=:location)
+    _check_lscv_resolution(resolution, "lscv")
+    xs, r, slo, shi = _scoring_sample(x, rtol, support, resolution === nothing)
+    return _score_at(_lscv, xs, r, slo, shi, _score_scale(κ, eltype(xs)); holdout)
+end
+
+_check_lscv_resolution(resolution, fname) = _is_rounded(resolution) &&
+    throw(ArgumentError("$fname has no form for rounded (interval) data; use " *
+                        "select_kappa(x; resolution=$resolution), or resolution=0 to treat " *
+                        "the values as exact points"))
 
 """
     select_kappa(x; support=(-Inf, Inf), rtol=cbrt(eps(T)), resolution=nothing,
@@ -2896,8 +2934,9 @@ three values, and defaults to a geometric range scaled to the data's extent. For
 the default grid stops where `κ` times the widest interval reaches 4096, beyond which the fit is
 at its histogram limit and cannot be computed accurately.
 
-See the "Comparing selection criteria" section of the manual for the alternative criteria
-[`select_kappa_cv`](@ref), [`select_kappa_ms`](@ref) and [`kappa_interval`](@ref).
+[`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
+of the manual for the alternative criteria [`select_kappa_lscv`](@ref), [`select_kappa_ms`](@ref)
+and [`kappa_interval`](@ref).
 
 # Extended help
 
@@ -2905,7 +2944,7 @@ See the "Comparing selection criteria" section of the manual for the alternative
 `KL(Q ‖ Q̂_κ)`; minimizing it is maximum-likelihood cross-validation. It is the criterion native
 to the estimator, whose action `-Σ ln Q̂(xᵢ)` is itself the (in-sample) log-likelihood. To
 leading order it selects the same error-optimal scale as least-squares cross-validation
-([`select_kappa_cv`](@ref)), and it is cheaper, because the `∫Q̂²` roughness term is not needed.
+([`select_kappa_lscv`](@ref)), and it is cheaper, because the `∫Q̂²` roughness term is not needed.
 For interval data it estimates the divergence between the true and fitted probabilities of the
 recorded intervals, which is all such data determine.
 
@@ -2931,6 +2970,30 @@ function select_kappa(x::AbstractVector{<:Real}; support::Tuple{Real,Real}=(-Inf
     return select_kappa(lower, upper; kappas, rtol, support, holdout)
 end
 
+"""
+    klcv(x, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)), resolution=nothing,
+         holdout=:location) -> KLCV::T
+    klcv(lower, upper, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)), holdout=:location) -> KLCV::T
+
+The Kullback–Leibler cross-validation score `KLCV(κ) = -(1/N) Σᵢ wᵢ ln Q̂_{κ,-i}(xᵢ)` of the
+constant scale `κ`, the quantity [`select_kappa`](@ref) minimizes; the arguments and keywords
+mean what they do there, and with `resolution = δ > 0` or interval bounds each observation
+contributes the held-out log-probability of its interval. It is `NaN` when a held-out log
+density or probability is undefined at `κ`.
+"""
+function klcv(x::AbstractVector{<:Real}, κ::Real; support::Tuple{Real,Real}=(-Inf, Inf),
+              rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,
+              holdout::Symbol=:location)
+    if !_is_rounded(resolution)
+        xs, r, slo, shi = _scoring_sample(x, rtol, support, resolution === nothing)
+        return _score_at(_klcv, xs, r, slo, shi, _score_scale(κ, eltype(xs)); holdout)
+    end
+    isempty(x) && throw(ArgumentError("cannot score κ for zero observations"))
+    T = float(eltype(x))
+    lower, upper = _lattice_bounds(x, T(resolution), support)
+    return klcv(lower, upper, κ; rtol, support, holdout)
+end
+
 # Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
 # search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
 # nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
@@ -2938,6 +3001,15 @@ end
 function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
                           support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false)
     _check_kappa_grid(κs)
+    xs, r, slo, shi = _scoring_sample(x, rtol, support, checkties)
+    T = eltype(xs)
+    score(κ) = (v = _score_at(scorefun, xs, r, slo, shi, κ; holdout); isfinite(v) ? v : typemax(T))
+    return _minimize_on_grid(score, κs, T)
+end
+
+# The validated, sorted sample a constant-scale score is evaluated on, in the working float type
+# of the data, `rtol` and finite support bounds, together with `rtol` and the bounds in that type.
+function _scoring_sample(x::AbstractVector{<:Real}, rtol::Real, support::Tuple{Real,Real}, checkties::Bool)
     _check_rtol(rtol)
     a, b = _check_support_bounds(support)
     T = float(promote_type(eltype(x), typeof(rtol), _support_eltype(a), _support_eltype(b)))
@@ -2945,9 +3017,17 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVect
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
     checkties && _check_ties(xs)
-    r = T(rtol)
-    score(κ) = (v = scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout); isfinite(v) ? v : typemax(T))
-    return _minimize_on_grid(score, κs, T)
+    return xs, T(rtol), slo, shi
+end
+
+# `scorefun` at the constant scale κ, on the nodes merged at tolerance `r/κ`.
+_score_at(scorefun, xs, r, slo, shi, κ; holdout::Symbol=:location) =
+    scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout)
+
+# A scale passed to a score function, converted to the working type `T`.
+function _score_scale(κ::Real, ::Type{T}) where {T}
+    isfinite(κ) && κ > 0 || throw(ArgumentError("κ must be finite and positive, got $κ"))
+    return T(κ)
 end
 
 function _check_kappa_grid(κs)
