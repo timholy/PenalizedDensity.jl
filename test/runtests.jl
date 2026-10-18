@@ -1,4 +1,5 @@
 using PenalizedDensity
+using PenalizedDensity: select_kappa_cv, select_kappa_ms
 using DensityInterface: DensityInterface, DensityKind, HasDensity
 import Distributions, StatsBase
 using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
@@ -227,7 +228,7 @@ end
     @testset "λ ≈ N near the optimal κ (Eq. 10 asymptotics)" begin
         Random.seed!(1)
         x = randn(400)
-        κ = select_kappa_ms(x; κs=exp.(range(log(0.05), log(20); length=40)))
+        κ = select_kappa_ms(x; kappas=exp.(range(log(0.05), log(20); length=40)))
         d = DensityEstimate(x, κ)
         @test 0.75 < d.λ / length(x) < 1.25    # paper: λ ≈ N
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
@@ -254,8 +255,8 @@ end
         κ = select_kappa_ms(x)                                       # data-scaled default grid
         @test κ > 0
         # Golden-section refinement makes the result independent of the bracketing grid.
-        κ10  = select_kappa_ms(x; κs = exp.(range(log(0.5), log(60); length = 10)))
-        κ200 = select_kappa_ms(x; κs = exp.(range(log(0.5), log(60); length = 200)))
+        κ10  = select_kappa_ms(x; kappas = exp.(range(log(0.5), log(60); length = 10)))
+        κ200 = select_kappa_ms(x; kappas = exp.(range(log(0.5), log(60); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
         @test κ ≈ κ200 rtol = 1e-3
         # The returned κ is a local minimum of |dS/dln κ|.
@@ -303,8 +304,8 @@ end
         κ = select_kappa_cv(x)
         @test κ > 0
         # Golden-section refinement ⇒ independent of the bracketing grid.
-        κ10  = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 10)))
-        κ200 = select_kappa_cv(x; κs = exp.(range(log(0.3), log(40); length = 200)))
+        κ10  = select_kappa_cv(x; kappas = exp.(range(log(0.3), log(40); length = 10)))
+        κ200 = select_kappa_cv(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
         # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
@@ -374,14 +375,14 @@ end
         @test select_kappa_cv(OffsetArray(x, -750)) == κ
     end
 
-    @testset "select_kappa_kl: likelihood (KL) scale" begin
+    @testset "select_kappa: likelihood (KL) scale" begin
         Random.seed!(11)
         x = randn(1500)
-        κ = select_kappa_kl(x)
+        κ = select_kappa(x)
         @test κ > 0
         # Golden-section refinement ⇒ independent of the bracketing grid.
-        κ10  = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 10)))
-        κ200 = select_kappa_kl(x; κs = exp.(range(log(0.3), log(40); length = 200)))
+        κ10  = select_kappa(x; kappas = exp.(range(log(0.3), log(40); length = 10)))
+        κ200 = select_kappa(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
         # KLCV score: the mean negative leave-one-out log-likelihood built from the analytic
@@ -412,7 +413,7 @@ end
         span = xh[end] - xh[1]
         gridh = exp.(range(log(0.5 / span), log(5 * length(xh) / span); length = 41))
         κ_exact = gridh[argmin([klcv_refit(xh, wh, κ) for κ in gridh])]
-        @test select_kappa_kl(xh) ≈ κ_exact rtol = 0.2
+        @test select_kappa(xh) ≈ κ_exact rtol = 0.2
         for κ0 in (0.5, 1.0)
             @test PenalizedDensity._klcv(xh, wh, κ0) ≈ klcv_refit(xh, wh, κ0) rtol = 5e-3
         end
@@ -427,10 +428,10 @@ end
         @test kl(κ) < kl(select_kappa_ms(x))
 
         # Tracks the least-squares (MISE) scale to leading order.
-        @test select_kappa_kl(x) ≈ select_kappa_cv(x) rtol = 0.5
+        @test select_kappa(x) ≈ select_kappa_cv(x) rtol = 0.5
 
         # Generic indexing: OffsetArray input gives an identical result.
-        @test select_kappa_kl(OffsetArray(x, -750)) == κ
+        @test select_kappa(OffsetArray(x, -750)) == κ
     end
 
     @testset "amplitude² == density" begin
@@ -631,7 +632,7 @@ end
         # N(0, 1) — moments and an equiprobable-bin χ² against the standard normal.
         Random.seed!(77)
         xtr = randn(1000)
-        df = DensityEstimate(xtr, select_kappa_kl(xtr))
+        df = DensityEstimate(xtr, select_kappa(xtr))
         u = rand(5000)
         y = gaussianize(df, quantile(df, u))
         m = mean(y); v = var(y)
@@ -708,7 +709,7 @@ end
         Random.seed!(202)
         xb = clamp.(0.5 .+ 0.18 .* randn(400), 1e-3, 1 - 1e-3)
         adaptive = DensityEstimate(randn(400) .^ 2 .+ 0.1 .* randn(400),
-                                   select_kappa_adaptive(randn(400) .^ 2))
+                                   select_kappa(randn(400) .^ 2, Adaptive()))
         fits = (("bounded [0,1]",     DensityEstimate(xb, 8.0; support = (0.0, 1.0))),
                 ("one-sided [0,Inf)", DensityEstimate(xb, 8.0; support = (0.0, Inf))),
                 ("one-sided (-Inf,1]",DensityEstimate(xb, 8.0; support = (-Inf, 1.0))),
@@ -757,7 +758,7 @@ end
         # Distributional: draws from a bounded fit Gaussianize to N(0, 1).
         Random.seed!(303)
         u = rand(4000)
-        du = DensityEstimate(u, select_kappa_kl(u); support = (0.0, 1.0))
+        du = DensityEstimate(u, select_kappa(u); support = (0.0, 1.0))
         y = gaussianize(du, u)
         @test abs(mean(y)) < 0.05 && abs(var(y) - 1) < 0.07
         counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
@@ -914,7 +915,7 @@ end
         klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol)
 
         @testset "AdaptiveScale evaluates c·(p̂/ḡ)^α" begin
-            κ0 = select_kappa_kl(chisq1)
+            κ0 = select_kappa(chisq1)
             p = DensityEstimate(chisq1, κ0)
             k = AdaptiveScale(3.0, 0.5, p)
             lgbar = mean(log(p(xi)) for xi in chisq1)     # ln of the geometric mean of p̂
@@ -949,12 +950,12 @@ end
         end
 
         @testset "adaptivity is used only when it wins" begin
-            κ = select_kappa_adaptive(chisq1; window=nothing)
+            κ = select_kappa(chisq1, Adaptive(; window=nothing))
             @test κ isa AdaptiveScale
             @test κ.α > 0
             # The selector's own guarantee: the chosen scale beats the constant one on the
             # score that chose it.
-            @test klcv_scale(chisq1, κ) < klcv_const(chisq1, select_kappa_kl(chisq1))
+            @test klcv_scale(chisq1, κ) < klcv_const(chisq1, select_kappa(chisq1))
 
             d = DensityEstimate(chisq1, κ)
             @test length(d.κ) == length(d.x) - 1
@@ -969,26 +970,26 @@ end
             # so the α = 0 candidate wins and a plain scalar comes back, keeping the fast path
             # and the goodness-of-fit machinery.
             u = sort!(rand(Xoshiro(5), 3000))
-            κu = select_kappa_adaptive(u; window=nothing)
+            κu = select_kappa(u, Adaptive(; window=nothing))
             @test κu isa Real
             @test DensityEstimate(u, κu).κ isa Real
             @test chisq_reference(DensityEstimate(u, κu)) isa ChisqReference
         end
 
         @testset "alphas and pilot are honored" begin
-            κ = select_kappa_adaptive(chisq1; window=nothing, alphas=(1.0,))
+            κ = select_kappa(chisq1, Adaptive(; window=nothing, alphas=(1.0,)))
             @test κ isa AdaptiveScale && κ.α == 1.0
-            # pilot_selector: any callable returning a positive scale from the sample.
-            κms = select_kappa_adaptive(chisq1; window=nothing, alphas=(0.5,), pilot_selector=select_kappa_ms)
+            # pilot: any callable returning a positive scale from the sample.
+            κms = select_kappa(chisq1, Adaptive(; window=nothing, alphas=(0.5,), pilot=select_kappa_ms))
             @test κms isa AdaptiveScale
             @test κms.pilot.κ == select_kappa_ms(chisq1)
             # Offset input is merged and sorted like any other vector.
-            @test select_kappa_adaptive(OffsetVector(chisq1, -1500); window=nothing) isa AdaptiveScale
+            @test select_kappa(OffsetVector(chisq1, -1500), Adaptive(; window=nothing)) isa AdaptiveScale
         end
 
         @testset "per-observation leave-one-out log densities" begin
             loo(x, k) = PenalizedDensity._loo_logdensities(x, k, rtol, -Inf, Inf)
-            κ0 = select_kappa_kl(chisq1)
+            κ0 = select_kappa(chisq1)
             p = DensityEstimate(chisq1, κ0)
             ka = AdaptiveScale(8.0, 0.75, p)
             tied = round.(chisq1; digits=2)          # sorted, and heavily tied
@@ -1015,9 +1016,9 @@ end
 
         @testset "one-standard-error rule" begin
             # nse = 0 is the minimum-score choice, and the gain is the score difference.
-            κa = select_kappa_adaptive(chisq1; window=nothing, nse=0)
+            κa = select_kappa(chisq1, Adaptive(; window=nothing, nse=0))
             @test κa isa AdaptiveScale
-            κ0 = select_kappa_kl(chisq1)
+            κ0 = select_kappa(chisq1)
             gain, se = PenalizedDensity._adaptive_gain(chisq1, κ0, κa, rtol, -Inf, Inf)
             @test gain ≈ klcv_const(chisq1, κ0) - klcv_scale(chisq1, κa) atol=1e-12
             @test gain > 0 && se > 0
@@ -1025,23 +1026,23 @@ end
             # A smooth density where the best exponent edges out the constant scale by far less
             # than one standard error: nse = 0 takes the adaptive scale, nse = 1 the constant.
             xn = sort!(randn(Xoshiro(3), 500))
-            κn0 = select_kappa_adaptive(xn; window=nothing, nse=0)
+            κn0 = select_kappa(xn, Adaptive(; window=nothing, nse=0))
             @test κn0 isa AdaptiveScale
-            κn = select_kappa_adaptive(xn; window=nothing)
-            @test κn isa Real && κn == select_kappa_kl(xn)
+            κn = select_kappa(xn, Adaptive(; window=nothing))
+            @test κn isa Real && κn == select_kappa(xn)
             gain, se = PenalizedDensity._adaptive_gain(xn, κn, κn0, rtol, -Inf, Inf)
             @test 0 < gain < se
             @test gain ≈ klcv_const(xn, κn) - klcv_scale(xn, κn0) atol=1e-12
 
             # A divergent edge: adaptivity wins by several standard errors.
             xc = sort!(randn(Xoshiro(2), 250) .^ 2)
-            κc = select_kappa_adaptive(xc; window=nothing)
+            κc = select_kappa(xc, Adaptive(; window=nothing))
             @test κc isa AdaptiveScale
-            gain, se = PenalizedDensity._adaptive_gain(xc, select_kappa_kl(xc), κc, rtol, -Inf, Inf)
+            gain, se = PenalizedDensity._adaptive_gain(xc, select_kappa(xc), κc, rtol, -Inf, Inf)
             @test gain > 3se
-            @test select_kappa_adaptive(xc; window=nothing, nse=Inf) isa Real
+            @test select_kappa(xc, Adaptive(; window=nothing, nse=Inf)) isa Real
 
-            @test_throws "nse must be nonnegative" select_kappa_adaptive(xc; nse=-1)
+            @test_throws "nse must be nonnegative" select_kappa(xc, Adaptive(; nse=-1))
         end
 
         @testset "the c search brackets its minimum" begin
@@ -1091,11 +1092,11 @@ end
         end
 
         @testset "input validation" begin
-            @test_throws "at least one exponent" select_kappa_adaptive(chisq1; alphas=())
-            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(0.0, 0.5))
-            @test_throws "must be positive" select_kappa_adaptive(chisq1; alphas=(-1.0,))
-            @test_throws "rtol must be nonnegative" select_kappa_adaptive(chisq1; rtol=-1.0)
-            @test_throws "pilot_selector must return a positive scale" select_kappa_adaptive(chisq1; pilot_selector=_ -> 0.0)
+            @test_throws "at least one exponent" select_kappa(chisq1, Adaptive(; alphas=()))
+            @test_throws "must be positive" select_kappa(chisq1, Adaptive(; alphas=(0.0, 0.5)))
+            @test_throws "must be positive" select_kappa(chisq1, Adaptive(; alphas=(-1.0,)))
+            @test_throws "rtol must be nonnegative" select_kappa(chisq1, Adaptive(); rtol=-1.0)
+            @test_throws "pilot must return a positive scale" select_kappa(chisq1, Adaptive(; pilot=_ -> 0.0))
             p = DensityEstimate(chisq1, 10.0)
             @test_throws "exponent α must be positive" AdaptiveScale(1.0, 0.0, p)
             @test_throws "scale c must be positive" AdaptiveScale(0.0, 1.0, p)
@@ -1167,13 +1168,13 @@ end
         end
 
         @testset "selection" begin
-            κ = select_kappa_adaptive(xb; window=WindowRule())
+            κ = select_kappa(xb, Adaptive(; window=WindowRule()))
             @test κ isa WindowScale
             @test κ.γ == 0.75
             @test κ(3.0) > κ(0.0)
             # The rule's guarantee: the window candidate's penalized score beats the score of
             # the scale the power family returns, with nse = 0 by default.
-            κp = select_kappa_adaptive(xb; window=nothing, nse=0)
+            κp = select_kappa(xb, Adaptive(; window=nothing, nse=0))
             sp = κp isa Real ? klcv_const(xbs, κp) : klcv_scale(xbs, κp)
             @test klcv_scale(xbs, κ) + 0.11 * 0.75 / sqrt(1000) < sp
             d = DensityEstimate(xb, κ)
@@ -1181,33 +1182,33 @@ end
             @test cdf(d, Inf) == 1
 
             # An infinite penalty leaves the power family's choice, made with nse = 0.
-            κinf = select_kappa_adaptive(xb; window=WindowRule(k=Inf))
+            κinf = select_kappa(xb, Adaptive(; window=WindowRule(k=Inf)))
             @test typeof(κinf) == typeof(κp)
             @test κp isa Real ? κinf == κp : (κinf.c, κinf.α) == (κp.c, κp.α)
-            κinf1 = select_kappa_adaptive(xb; window=WindowRule(k=Inf), nse=1)
-            κp1 = select_kappa_adaptive(xb; window=nothing)
+            κinf1 = select_kappa(xb, Adaptive(; window=WindowRule(k=Inf), nse=1))
+            κp1 = select_kappa(xb, Adaptive(; window=nothing))
             @test typeof(κinf1) == typeof(κp1)
 
             # The window rule is the default, for point and interval data alike.
-            κd = select_kappa_adaptive(xb)
+            κd = select_kappa(xb, Adaptive())
             @test κd isa WindowScale && (κd.c, κd.x, κd.logb) == (κ.c, κ.x, κ.logb)
             xr = round.(xb; digits=1)
-            κrd = select_kappa_adaptive(xr; resolution=0.1)
-            κrw = select_kappa_adaptive(xr; resolution=0.1, window=WindowRule())
+            κrd = select_kappa(xr, Adaptive(); resolution=0.1)
+            κrw = select_kappa(xr, Adaptive(; window=WindowRule()); resolution=0.1)
             @test κrd isa WindowScale && (κrd.c, κrd.x, κrd.logb) == (κrw.c, κrw.x, κrw.logb)
 
             # Other settings are honored.
-            @test select_kappa_adaptive(xb; window=WindowRule(gamma=0.5, k=0)).γ == 0.5
+            @test select_kappa(xb, Adaptive(; window=WindowRule(gamma=0.5, k=0))).γ == 0.5
 
             # Generic input: offset axes and views select the same scale.
             for xg in (OffsetVector(xb, -400), view([xb; xb], 1:1000))
-                κg = select_kappa_adaptive(xg; window=WindowRule())
+                κg = select_kappa(xg, Adaptive(; window=WindowRule()))
                 @test κg isa WindowScale && κg.c == κ.c && κg.x == κ.x && κg.logb == κ.logb
             end
 
             # A bounded domain: the shape comes from the sample, the score from the domain.
             xe = -log.(1 .- (0.5:999.5) ./ 1000)
-            κe = select_kappa_adaptive(xe; window=WindowRule(), support=(0.0, Inf))
+            κe = select_kappa(xe, Adaptive(; window=WindowRule()); support=(0.0, Inf))
             de = DensityEstimate(xe, κe; support=(0.0, Inf))
             @test cdf(de, Inf) ≈ 1
         end
@@ -1226,10 +1227,10 @@ end
             # intervals with an infinite bound are left out.
             @test PD._spread_intervals([0.0, 2.0, 5.0], [1.0, 2.0, Inf], [4.0, 2.0, 3.0]) ==
                   [0.125, 0.375, 0.625, 0.875, 2.0, 2.0]
-            κpt = select_kappa_adaptive(xb; window=WindowRule())
+            κpt = select_kappa(xb, Adaptive(; window=WindowRule()))
             # Rounding far below every window's size leaves the rule as on the exact sample.
             δ = 0.001
-            κf = select_kappa_adaptive(round.(xb ./ δ) .* δ; resolution=δ, window=WindowRule())
+            κf = select_kappa(round.(xb ./ δ) .* δ, Adaptive(; window=WindowRule()); resolution=δ)
             @test κf isa WindowScale
             @test κf.c ≈ κpt.c rtol=0.01
             ts = range(-2.5, 3.5; length=301)
@@ -1237,18 +1238,18 @@ end
             # At a coarser increment the window candidate still resolves the narrow bump.
             δ = 0.1
             xr = round.(xb ./ δ) .* δ
-            κr = select_kappa_adaptive(xr; resolution=δ, window=WindowRule())
+            κr = select_kappa(xr, Adaptive(; window=WindowRule()); resolution=δ)
             @test κr isa WindowScale && κr(3.0) > 2 * κr(0.0)
             # (`resolution` builds the bounds by its own arithmetic; they agree to roundoff.)
-            @test select_kappa_adaptive(xr .- δ / 2, xr .+ δ / 2; window=WindowRule()).c ≈ κr.c rtol=1e-8
+            @test select_kappa(xr .- δ / 2, xr .+ δ / 2, Adaptive(; window=WindowRule())).c ≈ κr.c rtol=1e-8
             d = IntervalDensityEstimate(xr .- δ / 2, xr .+ δ / 2, κr)
             @test cdf(d, Inf) ≈ 1
             # An infinite penalty leaves the power family's choice, made with nse = 0.
-            κi = select_kappa_adaptive(xr; resolution=δ, window=WindowRule(k=Inf))
-            κp = select_kappa_adaptive(xr; window=nothing, resolution=δ, nse=0)
+            κi = select_kappa(xr, Adaptive(; window=WindowRule(k=Inf)); resolution=δ)
+            κp = select_kappa(xr, Adaptive(; window=nothing, nse=0); resolution=δ)
             @test typeof(κi) == typeof(κp) && κi.c == κp.c
             # Censored observations enter the score but not the window shape.
-            κc = select_kappa_adaptive([xr .- δ / 2; 5.0; 5.0], [xr .+ δ / 2; Inf; Inf]; window=WindowRule())
+            κc = select_kappa([xr .- δ / 2; 5.0; 5.0], [xr .+ δ / 2; Inf; Inf], Adaptive(; window=WindowRule()))
             @test κc isa WindowScale && last(κc.x) < maximum(xr) + δ / 2 < 5
         end
     end
@@ -1363,7 +1364,7 @@ end
     @testset "goodness of fit: exact reference at a varying scale" begin
         # A constant callable takes the piecewise path and lands on the scalar path's answer.
         xg = randn(Xoshiro(11), 500)
-        κ = select_kappa_kl(xg)
+        κ = select_kappa(xg)
         rs = chisq_reference(DensityEstimate(xg, κ))
         rc = chisq_reference(DensityEstimate(xg, t -> κ))
         @test rc.tri.dv ≈ rs.tri.dv rtol = 1e-10
@@ -1376,7 +1377,7 @@ end
         # orders of magnitude — every quantity the reference is built from is propagated in
         # scaled form precisely so this does not overflow.
         xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
-        da = DensityEstimate(xa, select_kappa_adaptive(xa; window=nothing))
+        da = DensityEstimate(xa, select_kappa(xa, Adaptive(; window=nothing)))
         @test maximum(da.κ) / minimum(da.κ) > 1e4
         ra = chisq_reference(da)
         chis = fieldmc_chisq(da; nsamp=40_000, seed=3)
@@ -1389,7 +1390,7 @@ end
         # The default selector's window scale on a narrow bump beside a broad mode.
         rng = Xoshiro(7)
         xw = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:400]
-        dw = DensityEstimate(xw, select_kappa_adaptive(xw))
+        dw = DensityEstimate(xw, select_kappa(xw, Adaptive()))
         @test dw.κ isa AbstractVector
         rw = chisq_reference(dw)
         chw = fieldmc_chisq(dw; nsamp=40_000, seed=3)
@@ -1446,7 +1447,7 @@ end
         ki = kappa_interval(x)
         @test ki.lo < ki.κ < ki.hi
         # h = ½ point agrees with the minimum-sensitivity scale within a small factor.
-        κms = select_kappa_ms(x; κs = exp.(range(log(0.05), log(50); length = 60)))
+        κms = select_kappa_ms(x; kappas = exp.(range(log(0.05), log(50); length = 60)))
         @test 0.5 < ki.κ / κms < 2.0
         # A wider band brackets a narrower one around the same central κ.
         wide = kappa_interval(x; level = 0.6)
@@ -1595,7 +1596,7 @@ end
     @testset "held-out entropy and negentropy" begin
         Random.seed!(17)
         x = 1.2 .* randn(400) .+ 0.5
-        κ = select_kappa_kl(x)
+        κ = select_kappa(x)
         d = DensityEstimate(x, κ)
         ye = 1.2 .* randn(150) .+ 0.5          # independent evaluation batch
 
@@ -1833,10 +1834,10 @@ end
         @test_throws "κ must be positive" DensityEstimate([1.0], -1.0)
         @test_throws ArgumentError DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws "rtol must be nonnegative" DensityEstimate([1.0], 1.0; rtol=-1.0)
-        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws "κs must be sorted and positive" select_kappa_ms([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; κs=[1.0, 2.0])  # need ≥ 3
-        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_ms([1.0, 2.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_kappa_ms([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; kappas=[1.0, 2.0])  # need ≥ 3
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_ms([1.0, 2.0]; kappas=[1.0, 2.0])
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=0.0)
         @test_throws "level must be in (0, 1)" kappa_interval([1.0, 2.0]; level=0.0)
         @test_throws ArgumentError kappa_interval([1.0, 2.0]; level=1.0)
@@ -1846,26 +1847,26 @@ end
         @test_throws ArgumentError kappa_interval([3.0, 3.0, 3.0])    # all coincident
         @test_throws "need at least two distinct points to select κ" kappa_interval([3.0, 3.0, 3.0])
 
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws "κs must be sorted and positive" select_kappa_cv([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
-        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_cv([1.0, 2.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_kappa_cv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_cv([1.0, 2.0]; kappas=[1.0, 2.0])   # need ≥ 3
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_cv([1.0, 2.0]; kappas=[1.0, 2.0])
         @test_throws ArgumentError select_kappa_cv([3.0])                        # need ≥ 2 distinct
         @test_throws "need at least two distinct points to select κ" select_kappa_cv([3.0])
 
-        @test_throws ArgumentError select_kappa_kl([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws "κs must be sorted and positive" select_kappa_kl([1.0, 2.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_kl([1.0, 2.0]; κs=[1.0, 2.0])   # need ≥ 3
-        @test_throws "need at least 3 values in κs to bracket the minimum" select_kappa_kl([1.0, 2.0]; κs=[1.0, 2.0])
-        @test_throws ArgumentError select_kappa_kl([3.0])                        # need ≥ 2 distinct
-        @test_throws "need at least two distinct points to select κ" select_kappa_kl([3.0])
+        @test_throws ArgumentError select_kappa([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_kappa([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa([1.0, 2.0]; kappas=[1.0, 2.0])   # need ≥ 3
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa([1.0, 2.0]; kappas=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa([3.0])                        # need ≥ 2 distinct
+        @test_throws "need at least two distinct points to select κ" select_kappa([3.0])
     end
 
     @testset "error model: NaN throws, non-convergence throws ConvergenceError" begin
         # NaN observations, in every form that takes data.
         @test_throws ArgumentError DensityEstimate([0.0, NaN, 1.0], 1.0)
         @test_throws "observations must not be NaN" DensityEstimate([0.0, NaN, 1.0], 1.0)
-        @test_throws "observations must not be NaN" select_kappa_kl([0.0, NaN, 1.0, 2.0])
+        @test_throws "observations must not be NaN" select_kappa([0.0, NaN, 1.0, 2.0])
         @test_throws "observations must not be NaN" IntervalDensityEstimate([0.0, NaN, 1.0], 1.0; resolution=1.0)
 
         # NaN evaluation points, for every evaluator and every kind of fit; ±Inf keep their
@@ -2110,7 +2111,7 @@ end
                 @test PenalizedDensity._klcv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._klcv(xs, w, κ0)
                 @test PenalizedDensity._lscv(xs, w, κ0, κ0, κ0, -Inf, Inf) === PenalizedDensity._lscv(xs, w, κ0)
             end
-            @test select_kappa_kl(x) == select_kappa_kl(x; support=(-Inf, Inf))
+            @test select_kappa(x) == select_kappa(x; support=(-Inf, Inf))
             @test select_kappa_cv(x) == select_kappa_cv(x; support=(-Inf, Inf))
         end
 
@@ -2161,7 +2162,7 @@ end
                 x = sort(xgen(rng))
                 lo, hi = support
                 nodes, w = PenalizedDensity._merge_presorted(x, 0.0)
-                κsel = select_kappa_kl(x; support)
+                κsel = select_kappa(x; support)
                 for κ0 in (κsel * 0.5, κsel, κsel * 1.5)
                     a_kl = PenalizedDensity._klcv(nodes, w, κ0, κ0, κ0, lo, hi)
                     b_kl = klcv_refit_b(nodes, w, κ0, lo, hi)
@@ -2175,8 +2176,8 @@ end
 
         @testset "selector: bounded vs unbounded κ on a hard-edge family" begin
             x = -log.(1 .- (0.5:1999.5) ./ 2000)   # exponential, a jump edge at the left
-            κ_unb = select_kappa_kl(x)
-            κ_bnd = select_kappa_kl(x; support=(0.0, Inf))
+            κ_unb = select_kappa(x)
+            κ_bnd = select_kappa(x; support=(0.0, Inf))
             @test κ_bnd != κ_unb
             @test κ_bnd < κ_unb    # the boundary itself represents the edge, so cross-validation
                                     # asks for less compensating smoothing, not more
@@ -2187,21 +2188,21 @@ end
                                         # unbounded selection, on the bounded fit's own score
         end
 
-        @testset "select_kappa_kl / select_kappa_cv: input validation" begin
-            @test_throws DomainError select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
-            @test_throws "support must satisfy a < b" select_kappa_kl([0.2, 0.5, 0.8]; support=(0.5, 0.5))
-            @test_throws DomainError select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
-            @test_throws "lies outside the support" select_kappa_kl([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+        @testset "select_kappa / select_kappa_cv: input validation" begin
+            @test_throws DomainError select_kappa([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws "support must satisfy a < b" select_kappa([0.2, 0.5, 0.8]; support=(0.5, 0.5))
+            @test_throws DomainError select_kappa([0.2, 0.5, 1.5]; support=(0.0, 1.0))
+            @test_throws "lies outside the support" select_kappa([0.2, 0.5, 1.5]; support=(0.0, 1.0))
             @test_throws DomainError select_kappa_cv([0.2, 0.5, 0.8]; support=(0.5, 0.5))
             @test_throws DomainError select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
             @test_throws "lies outside the support" select_kappa_cv([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
         end
 
-        @testset "generic indexing: OffsetVector through select_kappa_kl(; support)" begin
+        @testset "generic indexing: OffsetVector through select_kappa(; support)" begin
             Random.seed!(53)
             x = rand(300)
-            κ = select_kappa_kl(x; support=(0.0, 1.0))
-            κo = select_kappa_kl(OffsetArray(x, -150); support=(0.0, 1.0))
+            κ = select_kappa(x; support=(0.0, 1.0))
+            κo = select_kappa(OffsetArray(x, -150); support=(0.0, 1.0))
             @test κo == κ
         end
     end
@@ -2237,7 +2238,7 @@ end
 
     @testset "AdaptiveScale composition" begin
         x = -log.(1 .- (0.5:999.5) ./ 1000)
-        κ = select_kappa_adaptive(x)
+        κ = select_kappa(x, Adaptive())
         d = DensityEstimate(x, κ; support=(0.0, Inf))
         @test d.lo == 0.0 && d.hi == Inf
         left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
@@ -2327,7 +2328,7 @@ end
         end
         # Composed with adaptive κ.
         xa = sort!(randn(Xoshiro(9), 300) .^ 2)
-        da = DensityEstimate(xa, select_kappa_adaptive(xa; support=(0.0, Inf)); support=(0.0, Inf))
+        da = DensityEstimate(xa, select_kappa(xa, Adaptive(); support=(0.0, Inf)); support=(0.0, Inf))
         @test green_identity(da) ≈ 1 rtol = 1e-5
     end
 
@@ -2371,7 +2372,7 @@ end
         # which no unbounded or spatially-varying-κ fit could do.
         Random.seed!(63)
         x = sort(rand(400) .* 0.6 .+ 0.2)
-        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, 1.0)); support=(0.0, 1.0))
+        d = DensityEstimate(x, select_kappa(x; support=(0.0, 1.0)); support=(0.0, 1.0))
         r = chisq_reference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=11)
         @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
@@ -2384,7 +2385,7 @@ end
     @testset "field Monte Carlo: bounded exponential (one wall)" begin
         Random.seed!(64)
         x = sort(-log.(1 .- rand(400)))
-        d = DensityEstimate(x, select_kappa_kl(x; support=(0.0, Inf)); support=(0.0, Inf))
+        d = DensityEstimate(x, select_kappa(x; support=(0.0, Inf)); support=(0.0, Inf))
         r = chisq_reference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=12)
         @test expected_chisq(r) ≈ mean(chis) rtol = 0.01
@@ -2397,7 +2398,7 @@ end
     @testset "field Monte Carlo: bounded fit with adaptive κ" begin
         Random.seed!(65)
         x = sort!(randn(Xoshiro(66), 300) .^ 2)
-        κ = select_kappa_adaptive(x; window=nothing, support=(0.0, Inf))
+        κ = select_kappa(x, Adaptive(; window=nothing); support=(0.0, Inf))
         d = DensityEstimate(x, κ; support=(0.0, Inf))
         @test maximum(d.κ) / minimum(d.κ) > 1e4
         r = chisq_reference(d)
@@ -2410,12 +2411,12 @@ end
     end
 end
 
-@testset "select_kappa_adaptive: fixed support" begin
+@testset "select_kappa(x, Adaptive()): fixed support" begin
     @testset "runs on a bounded domain and composes into a normalized fit" begin
         # Exponential on its natural support: runs, and the returned scale composes into a
         # normalized bounded fit.
         x = -log.(1 .- rand(Xoshiro(70), 500))
-        κ = select_kappa_adaptive(x; support=(0.0, Inf))
+        κ = select_kappa(x, Adaptive(); support=(0.0, Inf))
         d = DensityEstimate(x, κ; support=(0.0, Inf))
         @test d.lo == 0.0 && d.hi == Inf
         left, El = quadgk(d, 0.0, d.x[1]; rtol=1e-8)
@@ -2428,7 +2429,7 @@ end
         # normalize; which α wins (possibly 0, the boundary already having fixed the edge) is
         # not asserted.
         xu = rand(Xoshiro(71), 500)
-        κu = select_kappa_adaptive(xu; support=(0.0, 1.0))
+        κu = select_kappa(xu, Adaptive(); support=(0.0, 1.0))
         @test κu isa Union{Real,AdaptiveScale,WindowScale}
         du = DensityEstimate(xu, κu; support=(0.0, 1.0))
         @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
@@ -2437,10 +2438,10 @@ end
     end
 
     @testset "input validation" begin
-        @test_throws DomainError select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
-        @test_throws "support must satisfy a < b" select_kappa_adaptive([0.2, 0.5, 0.8]; support=(0.5, 0.5))
-        @test_throws DomainError select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
-        @test_throws "lies outside the support" select_kappa_adaptive([-0.5, 0.5, 0.8]; support=(0.0, 1.0))
+        @test_throws DomainError select_kappa([0.2, 0.5, 0.8], Adaptive(); support=(0.5, 0.5))
+        @test_throws "support must satisfy a < b" select_kappa([0.2, 0.5, 0.8], Adaptive(); support=(0.5, 0.5))
+        @test_throws DomainError select_kappa([-0.5, 0.5, 0.8], Adaptive(); support=(0.0, 1.0))
+        @test_throws "lies outside the support" select_kappa([-0.5, 0.5, 0.8], Adaptive(); support=(0.0, 1.0))
     end
 end
 
@@ -2461,8 +2462,8 @@ end
             r = select_support(x)
             @test r.support == (-Inf, Inf)
             # Structural, not coincidental: when neither side wins, the returned κ *is* the
-            # plain `select_kappa_kl(x)` call, not merely close to it.
-            @test r.κ === select_kappa_kl(x)
+            # plain `select_kappa(x)` call, not merely close to it.
+            @test r.κ === select_kappa(x)
         end
     end
 
@@ -2478,7 +2479,7 @@ end
             # The selected (κ, support) fit beats the plain unbounded selection on the same
             # KLCV score that chooses both.
             klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
-            κunb = select_kappa_kl(x)
+            κunb = select_kappa(x)
             klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
             @test klsel < klunb
         end
@@ -2495,7 +2496,7 @@ end
             @test 0 < xs[1] - r.support[1] < 20 * spL
             @test 0 < r.support[2] - xs[end] < 20 * spR
             klsel = PenalizedDensity._support_klcv(xs, 1e-6, r.κ, r.support...)
-            κunb = select_kappa_kl(x)
+            κunb = select_kappa(x)
             klunb = PenalizedDensity._support_klcv(xs, 1e-6, κunb, -Inf, Inf)
             @test klsel < klunb
         end
@@ -2510,10 +2511,10 @@ end
     end
 
     @testset "input validation" begin
-        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws "κs must be sorted and positive" select_support([1.0, 2.0, 3.0]; κs=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
-        @test_throws "need at least 3 values in κs to bracket the minimum" select_support([1.0, 2.0, 3.0]; κs=[1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_support([1.0, 2.0, 3.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; kappas=[1.0, 2.0])
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_support([1.0, 2.0, 3.0]; kappas=[1.0, 2.0])
         @test_throws ArgumentError select_support([1.0, 2.0, 3.0]; rtol=-1.0)
         @test_throws "rtol must be nonnegative" select_support([1.0, 2.0, 3.0]; rtol=-1.0)
     end
@@ -2527,12 +2528,7 @@ end
         @test_throws "select_support has no form for rounded (interval) data" select_support(x; resolution=0.1)
         r = select_support(x; resolution=0)
         @test r.support[1] <= minimum(x) && isfinite(r.support[1]) && r.support[2] == Inf
-        @test r.κ == select_kappa_kl(x; resolution=0, support=r.support)
-        rcv = select_support(x; kappa=select_kappa_cv, resolution=0)
-        @test rcv.κ == select_kappa_cv(x; resolution=0, support=rcv.support)
-        # Without `resolution`, `kappa` is called with only the documented keywords.
-        kl_only(x; κs, rtol, support=(-Inf, Inf)) = select_kappa_kl(x; κs, rtol, support)
-        @test select_support(y; kappa=kl_only) == select_support(y)
+        @test r.κ == select_kappa(x; resolution=0, support=r.support)
     end
 
     @testset "_edge_spacing and _select_gap failure paths" begin
@@ -2573,9 +2569,9 @@ end
 
     @testset "efficiency (reported, not asserted — see the test log)" begin
         xbig = randn(Xoshiro(74), 50_000)
-        t1 = @elapsed select_kappa_kl(xbig)
+        t1 = @elapsed select_kappa(xbig)
         t2 = @elapsed select_support(xbig)
-        @info "select_support efficiency at N=50000" t_select_kappa_kl=t1 t_select_support=t2 ratio=t2 / t1
+        @info "select_support efficiency at N=50000" t_select_kappa=t1 t_select_support=t2 ratio=t2 / t1
         @test isfinite(t2)   # the search completes; the timing itself is reported, not gated
     end
 end

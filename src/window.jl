@@ -4,8 +4,8 @@
 """
     WindowRule(; gamma=0.75, k=0.11, z=4, nmin=30)
 
-Settings of the window candidate in [`select_kappa_adaptive`](@ref)`(x; window)`, whose
-default is `WindowRule()`.
+Settings of the window candidate of [`Adaptive`](@ref)`(; window)`, whose default is
+`WindowRule()`.
 
 The candidate is the scale `κ(x) = c·(1/ĥ(x))^gamma` (a [`WindowScale`](@ref)), where `ĥ(x)` is
 the smallest half-width at which a window centered on `x` holds at least `nmin` observations
@@ -14,7 +14,7 @@ deviations; `c` is chosen by the same cross-validation score as the other candid
 window candidate is chosen only if its score plus the penalty `k·gamma/√N`, for `N`
 observations, is below the score of the scale the power family would return. The penalty
 offsets the optimism of a held-out score whose scale was estimated from the held-out point
-itself; see the extended help of [`select_kappa_adaptive`](@ref).
+itself; see the extended help of [`select_kappa`](@ref select_kappa(::AbstractVector{<:Real}, ::Adaptive)).
 
 `gamma` and `z` must be positive, `k` nonnegative, and `nmin` at least 2.
 """
@@ -46,7 +46,7 @@ A spatially varying smoothing scale
     κ(t) = c · exp(γ · s(t)),
 
 where `s` interpolates the values `logb` linearly on the sorted grid `x` and is held constant
-beyond it. [`select_kappa_adaptive`](@ref) constructs one with `s = ln(1/ĥ)` from the window
+beyond it. [`select_kappa`](@ref)`(x, Adaptive())` constructs one with `s = ln(1/ĥ)` from the window
 rule (see [`WindowRule`](@ref)), shifted to mean zero over the sample, so that `c` is the
 scale at a point of typical window size. Like [`AdaptiveScale`](@ref), the result is callable
 and is passed straight to [`DensityEstimate`](@ref) as the smoothing scale.
@@ -158,7 +158,7 @@ function _window_shape(xs::Vector{T}, z::Real, nmin::Integer) where {T}
         throw(ArgumentError("the window rule needs at least two distinct observations"))
     W = _WindowMoments(xs)
     grid = sort!(unique!([collect(range(first(xs), last(xs); length=_WINDOW_GRID));
-                          [quantile(xs, p; sorted=true) for p in range(0, 1; length=_WINDOW_GRID + 1)]]))
+                          [quantile(xs, p; sorted=true) for p in range(zero(T), one(T); length=_WINDOW_GRID + 1)]]))
     logb = T[-log(_window_halfwidth(W, t, T(z), Int(nmin))) for t in grid]
     s = WindowScale(one(T), one(T), grid, logb)
     m = mean(_window_shape_at(s, t) for t in xs)

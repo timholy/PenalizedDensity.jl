@@ -1229,18 +1229,16 @@ function _interval_klcv(L::_IntervalLayout{T}; holdout::Symbol=:location) where 
     return -s / n
 end
 
-function select_kappa_kl(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
-                         κs::Union{AbstractVector{<:Real},Nothing}=nothing,
-                         rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
-                         support::Tuple{Real,Real}=(-Inf, Inf), holdout::Symbol=:location)
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    a, b = support
-    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
-    axes(lower) == axes(upper) ||
-        throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
-    grid = κs === nothing ? _default_interval_κs(lower, upper) : κs
-    _check_kappa_grid(grid)
-    T = float(promote_type(eltype(lower), eltype(upper), eltype(grid), typeof(rtol),
+function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
+                      support::Tuple{Real,Real}=(-Inf, Inf),
+                      rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
+                      holdout::Symbol=:location,
+                      kappas::AbstractVector{<:Real}=_default_interval_κs(lower, upper))
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
+    _check_bounds_axes(lower, upper)
+    _check_kappa_grid(kappas)
+    T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol),
                            _support_eltype(a), _support_eltype(b)))
     r, slo, shi = T(rtol), T(a), T(b)
     lu, uu, counts = _tally_intervals(lower, upper, T)
@@ -1249,8 +1247,11 @@ function select_kappa_kl(lower::AbstractVector{<:Real}, upper::AbstractVector{<:
         v = _unless_unresolvable(() -> _interval_klcv(L; holdout), T(NaN))
         return isfinite(v) ? v : typemax(T)
     end
-    return _minimize_on_grid(score, grid, T)
+    return _minimize_on_grid(score, kappas, T)
 end
+
+_check_bounds_axes(lower, upper) = axes(lower) == axes(upper) ? nothing :
+    throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
 
 # The distinct (lower, upper) pairs, sorted, with the number of observations sharing each.
 # Rounded data have far fewer distinct intervals than observations, and a selector lays out the
@@ -1373,9 +1374,8 @@ function IntervalDensityEstimate(lower::AbstractVector{<:Real}, upper::AbstractV
                                  support::Tuple{Real,Real}=(-Inf, Inf),
                                  rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                                  stats=nothing)
-    rtol >= 0 || throw(ArgumentError("rtol must be nonnegative, got $rtol"))
-    a, b = support
-    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
     T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol), _kappa_eltype(κ, lower, upper),
                            _support_eltype(a), _support_eltype(b)))
     κ isa Real && !(κ > 0 && isfinite(κ)) && throw(ArgumentError("κ must be finite and positive, got $κ"))
@@ -1739,25 +1739,18 @@ function _interval_loo_obs(lower, upper, counts, κ, rtol::T, lo::T, hi::T) wher
     return ℓ
 end
 
-function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real};
-                               alphas=(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5),
-                               pilot_selector=nothing,
-                               window::Union{WindowRule,Nothing}=WindowRule(),
-                               nse::Real=window === nothing ? 1 : 0,
-                               rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
-                               support::Tuple{Real,Real}=(-Inf, Inf))
-    _check_adaptive_args(alphas, nse, rtol)
-    a, b = support
-    a < b || throw(DomainError((a, b), "support must satisfy a < b, got support=($a, $b)"))
-    axes(lower) == axes(upper) ||
-        throw(DimensionMismatch("lower and upper bounds must have the same axes, got $(axes(lower)) and $(axes(upper))"))
-    T = float(promote_type(eltype(lower), eltype(upper), eltype(alphas), typeof(rtol),
+function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, adaptive::Adaptive;
+                      support::Tuple{Real,Real}=(-Inf, Inf),
+                      rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))))
+    _check_rtol(rtol)
+    a, b = _check_support_bounds(support)
+    _check_bounds_axes(lower, upper)
+    T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol),
                            _support_eltype(a), _support_eltype(b)))
     r, slo, shi = T(rtol), T(a), T(b)
 
-    κ0 = T(pilot_selector === nothing ? select_kappa_kl(lower, upper) :
-                                         pilot_selector(lower, upper))
-    κ0 > 0 || throw(ArgumentError("pilot_selector must return a positive scale, got $κ0"))
+    κ0 = T(adaptive.pilot === nothing ? select_kappa(lower, upper) : adaptive.pilot(lower, upper))
+    κ0 > 0 || throw(ArgumentError("pilot must return a positive scale, got $κ0"))
     lu, uu, counts = _tally_intervals(lower, upper, T)
     L = _interval_layout(lu, uu, κ0, r, slo, shi; counts)
     p = _interval_fit(L, κ0)
@@ -1766,8 +1759,8 @@ function select_kappa_adaptive(lower::AbstractVector{<:Real}, upper::AbstractVec
     score(κfun) = _interval_score(lu, uu, counts, κfun, r, slo, shi)
     gain_se(κa) = _mean_se(_interval_loo_obs(lu, uu, counts, κa, r, slo, shi) .-
                            _interval_loo_obs(lu, uu, counts, κ0, r, slo, shi), counts)
-    κp, sp = _select_power(score, gain_se, p, κ0, const_score, alphas, nse)
-    window === nothing && return κp
-    return _choose_window(score, _spread_intervals(lu, uu, counts), κ0, κp, sp, window;
+    κp, sp = _select_power(score, gain_se, p, κ0, const_score, adaptive.alphas, adaptive.nse)
+    adaptive.window === nothing && return κp
+    return _choose_window(score, _spread_intervals(lu, uu, counts), κ0, κp, sp, adaptive.window;
                           N=length(lower))
 end

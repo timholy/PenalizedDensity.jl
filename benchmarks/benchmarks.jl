@@ -38,7 +38,7 @@ kd_fixed(x, grid) = pdf(InterpKDE(kde(x; bandwidth = H)), grid)
 sj_fixed(x, grid) = density(x, H, grid)
 ke_fixed(x, grid) = vec(kde!(x, [H])(reshape(collect(grid), 1, :)))
 
-pd_auto(x, grid) = (κ = select_kappa_kl(x; rtol = 1e-3);      # KL cross-validation (see shootout)
+pd_auto(x, grid) = (κ = select_kappa(x; rtol = 1e-3);      # KL cross-validation (see shootout)
                     DensityEstimate(x, κ; rtol = 1e-3).(grid))
 kd_auto(x, grid) = pdf(InterpKDE(kde(x)), grid)                 # default (Silverman) bandwidth
 sj_auto(x, grid) = density(x, bwsj(x), grid)                    # Sheather–Jones bandwidth
@@ -160,10 +160,10 @@ end
 # alongside the oracle κ that minimises L1 on a scan — the best the estimator can do at any
 # fixed scale. The selector whose error sits closest to the oracle wins.
 const SELECTORS = [
-    ("select_kappa_ms (min-sensitivity)", x -> select_kappa_ms(x; rtol = 1e-3)),
+    ("select_kappa_ms (min-sensitivity)", x -> PenalizedDensity.select_kappa_ms(x; rtol = 1e-3)),
     ("kappa_interval (half-entropy)",  x -> kappa_interval(x; rtol = 1e-3).κ),
-    ("select_kappa_cv (LSCV/MISE)",    x -> select_kappa_cv(x; rtol = 1e-3)),
-    ("select_kappa_kl (KL)",           x -> select_kappa_kl(x; rtol = 1e-3)),
+    ("select_kappa_cv (LSCV/MISE)",    x -> PenalizedDensity.select_kappa_cv(x; rtol = 1e-3)),
+    ("select_kappa (KL)",           x -> select_kappa(x; rtol = 1e-3)),
 ]
 
 function selector_shootout(; N = 2_000, trials = 25, κscan = range(0.5, 40; length = 80))
