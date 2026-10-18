@@ -45,18 +45,26 @@ subtype supports:
   [`gaussianize_logjacobian`](@ref).
 
 The pointwise functions take one point at a time, and a fit acts as a scalar in broadcasting:
-`cdf.(d, xs)` evaluates the CDF at each element of `xs`. The node cumulatives the mass functions
-need are assembled when the fit is constructed, so evaluating at a point costs a binary search
-over the nodes plus a constant amount of work.
+`cdf.(d, xs)` evaluates the CDF at each element of `xs`.
 
 The goodness-of-fit statistic ([`chisq`](@ref), [`ChisqReference`](@ref)) and
 [`logdensity_node_gradient`](@ref) are defined for [`DensityEstimate`](@ref) only.
+
+Fits also work with DensityInterface.jl, Distributions.jl and StatsBase.jl (see the extended
+help). Loading Distributions.jl makes the unqualified names `cdf` and `entropy` ambiguous, and
+loading StatsBase.jl does the same for `entropy`; either qualified name gives the same result.
+
+# Extended help
 
 Every subtype has the fields `d.x` (the sorted, distinct nodes), `d.ψ` (the normalized
 amplitude at the nodes) and `d.κ` (the smoothing scale: one number, or a vector with one rate
 per cell between consecutive nodes). Other fields are specific to each subtype.
 
-# Interoperability
+The node cumulatives the mass functions need are assembled when the fit is constructed, so
+evaluating a pointwise function costs a binary search over the nodes plus a constant amount of
+work.
+
+## Interoperability
 
 Every subtype implements [DensityInterface.jl](https://github.com/JuliaMath/DensityInterface.jl)
 as an object that *has* a density (`DensityKind(d) == HasDensity()`, as for a Distributions.jl
@@ -68,8 +76,7 @@ When Distributions.jl is loaded, `Distributions.cdf`, `Distributions.pdf` and
 [`logdensity`](@ref); `quantile` is already shared with Distributions through `Statistics`.
 When StatsBase.jl is loaded, `StatsBase.entropy(d)` agrees with [`entropy`](@ref)`(d)`. The
 held-out `entropy(d, xeval)` has no StatsBase counterpart, because StatsBase's two-argument
-`entropy(p, b)` takes a logarithm base. With both packages loaded, the unqualified names `cdf`
-and `entropy` are ambiguous, and either qualified name gives the same result.
+`entropy(p, b)` takes a logarithm base.
 """
 abstract type AbstractDensityEstimate end
 
@@ -131,7 +138,7 @@ point must lie in `[a, b]` (checked at fit time; a violation, or `a ≥ b`, thro
 
 Repeated points, and points closer than `rtol / κ(x)` (i.e. within a fraction `rtol` of
 the local smoothing length), are merged into one node carrying the count as its integer
-weight. Without merging, the tridiagonal system of the fit can be nearly singular.
+weight.
 
 The returned object is callable: `d(x)` evaluates the estimated density `Q̂(x)` at any real
 `x` and can be broadcast over arrays. Use [`amplitude`](@ref) for `ψ(x)`.
@@ -181,7 +188,8 @@ support it.
 Between sorted data points `ψ` solves `ψ'' = κ² ψ`, i.e. it is a sum of rising and
 falling exponentials, and decays as `e^{-κ|x|}` in the tails. The nodal amplitudes
 `ψ(xᵢ)` satisfy a symmetric tridiagonal system whose solution is the minimizer of a
-strictly convex potential; normalization is then a rescaling.
+strictly convex potential; normalization is then a rescaling. Without the merging of close
+points into one node, this system can be nearly singular.
 
 At a finite support endpoint the density is left free rather than pinned to zero (a natural, or
 Neumann, boundary condition: `ψ'(a) = 0`). The wall changes only the outermost interval on
@@ -467,20 +475,13 @@ end
     merge_samples(x, κ; rtol=cbrt(eps(float(eltype(x))))) -> (; nodes, weights, nodeindex)
 
 Merge the sample `x` into the nodes and weights that `DensityEstimate(x, κ; rtol)` fits, and
-report which node each sample joined.
-
-The sorted sample is split into runs, each starting at the smallest sample not yet assigned.
-A run collects every following sample within `rtol/κ` of its first member, where `κ` is the
-scale at that first member; `κ` may be a positive number or a callable `κ(x)`, as for
-[`DensityEstimate`](@ref). Each run becomes one node located at its first member, with
-weight equal to the number of samples in the run.
+report which node each sample joined. `κ` may be a positive number or a callable `κ(x)`, as
+for [`DensityEstimate`](@ref).
 
 - `nodes`: the sorted, distinct node locations, as `d.x` of the fit.
 - `weights`: the number of samples merged into each node, as `d.w` of the fit.
 - `nodeindex`: an integer array with the axes of `x`; sample `x[j]` was merged into node
-  `nodes[nodeindex[j]]`. A node lies at the value of its run's first member, so the samples
-  with `x[j] == nodes[nodeindex[j]]` (that member and any exact ties to it) are the ones
-  whose values set the node's position.
+  `nodes[nodeindex[j]]`.
 
 `nodes` and `weights` have the float type that `DensityEstimate(x, κ; rtol)` uses on the
 unbounded line. A NaN or ±Inf in `x` throws an `ArgumentError`.
@@ -499,6 +500,15 @@ julia> m.nodeindex
  1
  2
 ```
+
+# Extended help
+
+The sorted sample is split into runs, each starting at the smallest sample not yet assigned.
+A run collects every following sample within `rtol/κ` of its first member, where `κ` is the
+scale at that first member. Each run becomes one node located at its first member, with
+weight equal to the number of samples in the run. So the samples with
+`x[j] == nodes[nodeindex[j]]` (that member and any exact ties to it) are the ones whose values
+set the node's position.
 """
 function merge_samples(x::AbstractVector{R}, κ; rtol::Real=cbrt(eps(float(R)))) where {R<:Real}
     _check_rtol(rtol)
@@ -557,16 +567,18 @@ end
 The symmetric positive-definite tridiagonal matrix `M` of the roughness penalty on the
 amplitude `ψ` at sorted, distinct nodes `x` with constant scale `κ`: the penalty
 `∫ (ψ'(t)² + κ² ψ(t)²) dt`, minimized between and beyond the nodes for given nodal amplitudes
-`ψ`, is `κ * dot(ψ, M * ψ)`. A finite `lo` or `hi` is a support wall with a natural (zero-slope) boundary
-condition; an infinite one is an exponentially decaying tail.
-
-For the gap `hₖ = x[k+1] - x[k]`, the off-diagonal entry is `-csch(κ hₖ)`, and the diagonal
-entry at each node sums `coth(κ hₖ)` over its adjacent gaps, plus `tanh(κ Δ)` for the
-distance `Δ` from an end node to its wall (`1` for an unbounded side).
+`ψ`, is `κ * dot(ψ, M * ψ)`. A finite `lo` or `hi` is a support wall with a natural
+(zero-slope) boundary condition; an infinite one is an exponentially decaying tail.
 
 `x` must be 1-based, because `M[i, j]` couples `x[i]` and `x[j]`. The arguments are promoted
 to a common floating-point type; an infinite `lo` or `hi` does not take part in the promotion,
 so `Float32` nodes and scale give a `Float32` operator.
+
+# Extended help
+
+For the gap `hₖ = x[k+1] - x[k]`, the off-diagonal entry is `-csch(κ hₖ)`, and the diagonal
+entry at each node sums `coth(κ hₖ)` over its adjacent gaps, plus `tanh(κ Δ)` for the
+distance `Δ` from an end node to its wall (`1` for an unbounded side).
 """
 function roughness_operator(x::AbstractVector{<:Real}, κ::Real, lo::Real=-Inf, hi::Real=Inf)
     T = float(promote_type(eltype(x), typeof(κ), _support_eltype(lo), _support_eltype(hi)))
@@ -984,8 +996,8 @@ end
     mean(d::AbstractDensityEstimate)
 
 Mean `∫ x Q̂(x) dx` of the fitted density, computed from the nodal amplitudes cell by cell (in
-closed form, or by quadrature that is exact to roundoff) plus the exponential or bounded tails. See also
-[`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
+closed form, or by quadrature that is exact to roundoff) plus the exponential or bounded tails.
+See also [`var`](@ref Statistics.var) and [`std`](@ref Statistics.std).
 
 # Examples
 
@@ -1608,9 +1620,9 @@ cdf(d::AbstractDensityEstimate, x::Real) = _cdf_mass(d, x) / d.total
     cdf(d::AbstractDensityEstimate, x)
 
 Cumulative distribution function of the fitted density, `F(x) = ∫_a^x Q̂(t) dt` with `Q̂ = ψ²`
-and `a` the fit's left support endpoint (`-Inf` unless the fit was given a finite `support`),
-evaluated without adaptive quadrature. `F` is nondecreasing, with `F(x) == 0` for `x ≤ a` and
-`F(x) == 1` for `x ≥ b`, where `b` is the right support endpoint.
+and `a` the fit's left support endpoint (`-Inf` unless the fit was given a finite `support`).
+`F` is nondecreasing, with `F(x) == 0` for `x ≤ a` and `F(x) == 1` for `x ≥ b`, where `b` is
+the right support endpoint.
 
 See [`quantile`](@ref Statistics.quantile) for the inverse.
 
@@ -1627,8 +1639,9 @@ julia> quantile(d, 0.5)
 
 # Extended help
 
-For a [`DensityEstimate`](@ref), the tails (or, on a finite support, the two boundary segments)
-are pure exponentials or `cosh` arcs; on each inter-node interval `ψ'' = κ²ψ` makes
+`F` is evaluated without adaptive quadrature. For a [`DensityEstimate`](@ref), the tails (or,
+on a finite support, the two boundary segments) are pure exponentials or `cosh` arcs; on each
+inter-node interval `ψ'' = κ²ψ` makes
 `ψ'² - κ²ψ²` constant, which yields the exact antiderivative of the hyperbolic interpolant. An
 [`IntervalDensityEstimate`](@ref) uses the same antiderivative on its hyperbolic cells and
 16-point Gauss–Legendre quadrature on its trigonometric ones, where `ψ²` is a trigonometric
@@ -1648,6 +1661,8 @@ Quantile function of the fitted density, the inverse of [`cdf`](@ref):
 `quantile(d, 1) == b` (the fit's support endpoints, `-Inf`/`Inf` unless the fit was given a
 finite `support`); `q` outside `[0, 1]` (including `NaN`) throws a `DomainError`. Extends
 `Statistics.quantile`.
+
+# Extended help
 
 In an unbounded tail the inversion is in closed form; on interior intervals, and on a finite
 boundary segment (transcendental there), a Newton iteration on the closed-form CDF, bracketed
@@ -1887,12 +1902,7 @@ end
 Gaussianizing transport of the fitted density: `y = Φ⁻¹(F(x))`, where `F = `[`cdf`](@ref)`(d, ·)`
 and `Φ` is the standard normal CDF. If `X` is distributed with density `d`, then
 `gaussianize(d, X)` is distributed `N(0, 1)`; the map is strictly increasing wherever the
-density is positive.
-
-On an unbounded side the composition is evaluated in log space beyond the extreme node
-(`ln F` is linear in `x` in the exponential tail), so `y` stays finite and accurate
-arbitrarily far into the tail instead of saturating to `±Inf` where `F` would round to 0 or 1.
-`gaussianize(d, ±Inf) == ±Inf`, and `NaN` throws a `DomainError`.
+density is positive. `NaN` throws a `DomainError`.
 
 A finite `support` (see [`DensityEstimate`](@ref)) and a per-interval `κ` are both supported.
 On a finite support the walls map to infinity: `gaussianize(d, x) == -Inf` for `x` at or below
@@ -1911,21 +1921,31 @@ julia> y = gaussianize(d, 1.0);
 julia> ungaussianize(d, y) ≈ 1.0
 true
 ```
+
+# Extended help
+
+On an unbounded side the composition is evaluated in log space beyond the extreme node
+(`ln F` is linear in `x` in the exponential tail), so `y` stays finite and accurate
+arbitrarily far into the tail instead of saturating to `±Inf` where `F` would round to 0 or 1.
+`gaussianize(d, ±Inf) == ±Inf`.
 """
 gaussianize(d::AbstractDensityEstimate, x::Real) = _gaussianize(d, x)
 
 """
     ungaussianize(d::AbstractDensityEstimate, y)
 
-Inverse of [`gaussianize`](@ref): `x = F⁻¹(Φ(y))` with `F⁻¹ = `[`quantile`](@ref Statistics.quantile)`(d, ·)`,
-so that `ungaussianize(d, gaussianize(d, x)) ≈ x`. If `Y ~ N(0, 1)`, then
-`ungaussianize(d, Y)` is distributed with density `d`, so mapping standard normal variates
-through this function samples from the fit.
+Inverse of [`gaussianize`](@ref): `x = F⁻¹(Φ(y))`
+with `F⁻¹ = `[`quantile`](@ref Statistics.quantile)`(d, ·)`, so that
+`ungaussianize(d, gaussianize(d, x)) ≈ x`. If `Y ~ N(0, 1)`, then `ungaussianize(d, Y)` is
+distributed with density `d`, so mapping standard normal variates through this function samples
+from the fit. `NaN` throws a `DomainError`.
+
+# Extended help
 
 To avoid cancellation, for `y > 0` the complement `1 - Φ(y)` is computed directly rather than
-`Φ(y)`, and deep tails run in log space through the closed-form
-exponential-tail inverse, so large `|y|` maps to the corresponding finite `x` rather than
-saturating to `±Inf`. `ungaussianize(d, ±Inf) == ±Inf`, and `NaN` throws a `DomainError`.
+`Φ(y)`, and deep tails run in log space through the closed-form exponential-tail inverse, so
+large `|y|` maps to the corresponding finite `x` rather than saturating to `±Inf`.
+`ungaussianize(d, ±Inf) == ±Inf`.
 """
 ungaussianize(d::AbstractDensityEstimate, y::Real) = _ungaussianize(d, y)
 
@@ -1939,14 +1959,18 @@ of the transport,
 
 where `Q̂` is the fitted density and `φ` the standard normal density. Thus
 `logjac = ln(dy/dx)`, the change-of-variables term that makes `ln φ(y) + logjac` equal
-`ln Q̂(x)`. In an unbounded tail the difference is
-evaluated in a cancellation-free closed form (both terms grow like `y²/2`), so `logjac`
-stays accurate arbitrarily far out. Past a finite `support` wall the density is zero and
-`logjac == -Inf` (the map is constant there); inside a boundary segment the density is finite,
-so `logjac` is finite and grows toward the wall as the map stretches it to infinity.
+`ln Q̂(x)`. Past a finite `support` wall the density is zero and `logjac == -Inf` (the map is
+constant there).
 
 Broadcasting, `r = gaussianize_logjacobian.(d, xs)`, returns an array of `(; y, logjac)`
 pairs; `first.(r)` and `last.(r)` unpack it. The plain derivative `dy/dx` is `exp(logjac)`.
+
+# Extended help
+
+In an unbounded tail the difference `ln Q̂(x) - ln φ(y)` is evaluated in a cancellation-free
+closed form (both terms grow like `y²/2`), so `logjac` stays accurate arbitrarily far out.
+Inside a boundary segment of a finite `support` the density is finite, so `logjac` is finite
+and grows toward the wall as the map stretches it to infinity.
 """
 gaussianize_logjacobian(d::AbstractDensityEstimate, x::Real) = _gaussianize_logjac(d, x)
 
@@ -1959,9 +1983,13 @@ Classical action `S[ψ_cl]` (Eq. 10) of the fitted density,
 
 where `wᵢ` counts the point observations at `xᵢ`, and, for an
 [`IntervalDensityEstimate`](@ref), `rⱼ` counts the observations in interval `Bⱼ` and
-`Pⱼ = ∫_Bⱼ Q̂ dx` is the fitted probability of `Bⱼ`; `N = Σ wᵢ + Σ rⱼ`. At the fit the
-roughness term `∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the action to this
-form. Used by [`select_kappa_sensitivity`](@ref).
+`Pⱼ = ∫_Bⱼ Q̂ dx` is the fitted probability of `Bⱼ`; `N = Σ wᵢ + Σ rⱼ`. Used by
+[`select_kappa_sensitivity`](@ref).
+
+# Extended help
+
+At the fit the roughness term `∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the
+action to the form above.
 """
 action(d::AbstractDensityEstimate)
 
@@ -1981,15 +2009,19 @@ density `Q̂`,
 where `wᵢ` counts the point observations at `xᵢ`, and, for an
 [`IntervalDensityEstimate`](@ref), `rⱼ` counts the observations in interval `Bⱼ`;
 `N = Σ wᵢ + Σ rⱼ`. Evaluating `ln Q̂` at the data rather than integrating it over the whole
-line is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at small `N`: for the
-one-point fit (a Laplace density with rate `2κ`), `Ĥ = -ln κ` against the fit's exact entropy
-`H(Q̂) = 1 - ln κ`.
+line is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at small `N`. See
+[`negentropy`](@ref).
+
+# Extended help
+
+As an example of the small-`N` bias, for the one-point fit (a Laplace density with rate `2κ`),
+`Ĥ = -ln κ` against the fit's exact entropy `H(Q̂) = 1 - ln κ`.
 
 An interval observation contributes the fit's mean of `ln Q̂` over its interval, the expected
 value of the `ln Q̂(xᵢ)` its unrecorded value would have contributed. As an interval shrinks to
 a point this becomes the point term, so an interval fit to point observations only has the
 same `Ĥ` as `DensityEstimate(x, κ)`. A censored observation is handled the same way; on an
-unbounded tail `⟨ln Q̂⟩ = ln Q̂(x_edge) - 1` exactly. See [`negentropy`](@ref).
+unbounded tail `⟨ln Q̂⟩ = ln Q̂(x_edge) - 1` exactly.
 """
 entropy(d::AbstractDensityEstimate)
 
@@ -2010,9 +2042,12 @@ where `σ²` is the fit's variance [`var`](@ref Statistics.var)`(d)` (computed f
 amplitudes, for any scale profile and support) and `Ĥ` is [`entropy`](@ref)`(d)`. `J ≥ 0` in
 the large-sample limit (the Gaussian maximizes entropy at fixed variance), but the plug-in `Ĥ`
 can move a finite-sample estimate slightly off zero even when the underlying density is
-Gaussian. `J` is invariant under `x ↦ a·x + b` (with `κ ↦ κ/|a|` for the corresponding fit,
-per the package's scale equivariance): both terms shift by `ln|a|` under the rescaling and
-cancel.
+Gaussian.
+
+# Extended help
+
+`J` is invariant under `x ↦ a·x + b` (with `κ ↦ κ/|a|` for the corresponding fit, per the
+package's scale equivariance): both terms shift by `ln|a|` under the rescaling and cancel.
 """
 function negentropy(d::AbstractDensityEstimate)
     T = eltype(d)
@@ -2075,12 +2110,16 @@ Held-out negentropy of the fitted density `d`, scored at independent points `xev
 
 where `Ĥ =` [`entropy`](@ref)`(d, xeval)` and `s²` is the empirical (maximum-likelihood,
 i.e. population) variance of `xeval`. The Gaussian reference uses the moments of `xeval`
-rather than those of the fitted density; with that choice `½ ln(2π e s²) = -(1/M) Σⱼ ln 𝒩(xevalⱼ)`
-is itself a held-out expectation, so `Ĵ` is the mean held-out log-likelihood ratio of the fit
-against its matched Gaussian. It is invariant under `xeval ↦ a·xeval + b` together with the
-`κ ↦ κ/|a|` rescaling of the fit (both terms shift by `ln|a|` and cancel). `xeval` must
-contain at least two distinct points, or the Gaussian reference is undefined and an
-`ArgumentError` is thrown.
+rather than those of the fitted density. `xeval` must contain at least two distinct points,
+or the Gaussian reference is undefined and an `ArgumentError` is thrown.
+
+# Extended help
+
+Because the Gaussian reference uses the moments of `xeval`,
+`½ ln(2π e s²) = -(1/M) Σⱼ ln 𝒩(xevalⱼ)` is itself a held-out expectation, so `Ĵ` is the mean
+held-out log-likelihood ratio of the fit against its matched Gaussian. `Ĵ` is invariant under
+`xeval ↦ a·xeval + b` together with the `κ ↦ κ/|a|` rescaling of the fit (both terms shift by
+`ln|a|` and cancel).
 """
 function negentropy(d::AbstractDensityEstimate, xeval::AbstractVector)
     T = eltype(d)
@@ -2098,12 +2137,15 @@ Derivative of the log fitted density with respect to the evaluation coordinate,
     ∂ ln Q̂(x) / ∂x = 2 ψ'(x) / ψ(x),
 
 in closed form on the cell enclosing `x`, so the cost is `O(1)` per point with no linear
-solve. The ratio is formed without evaluating `ψ`, so it stays finite where the density
-underflows: on an unbounded tail with decay rate `k` it is `±2k`. Outside a finite support,
-where `ln Q̂ ≡ -Inf`, the result is `NaN`. The log density has a kink at each node `d.x[k]`
-(`ψ'` jumps there); at a node the result is the one-sided derivative from within the
-enclosing interval. See [`logdensity_node_gradient`](@ref) for the gradient with respect to
-the node positions.
+solve. Outside a finite support, where `ln Q̂ ≡ -Inf`, the result is `NaN`. See
+[`logdensity_node_gradient`](@ref) for the gradient with respect to the node positions.
+
+# Extended help
+
+The ratio is formed without evaluating `ψ`, so it stays finite where the density underflows:
+on an unbounded tail with decay rate `k` it is `±2k`. The log density has a kink at each node
+`d.x[k]` (`ψ'` jumps there); at a node the result is the one-sided derivative from within the
+enclosing interval.
 """
 function logdensity_eval_gradient(d::AbstractDensityEstimate, x::Real)
     _check_not_nan(x)
@@ -2129,10 +2171,8 @@ the held-out points `xeval`:
 
     g[i] = ∂/∂x_i  Σⱼ weightsⱼ · ln Q̂(xevalⱼ),
 
-computed by the implicit-function adjoint of the fit. Moving a node perturbs the fitted
-amplitude everywhere through the field equation `M ψ = w ⊘ ψ`; the adjoint reuses the fit's
-Hessian `∇²F = M + diag(wᵢ/ψᵢ²)` and handles the whole evaluation batch with one extra
-tridiagonal solve, so the cost is `O(N + M)` for `N` nodes and `M` evaluation points.
+computed by the implicit-function adjoint of the fit at a cost of `O(N + M)` for `N` nodes and
+`M` evaluation points.
 
 `weights` defaults to all ones (the plain sum `Σⱼ ln Q̂(xevalⱼ)`); pass `fill(1/M, M)` for the
 mean. Weights must have the axes of `xeval`, or a `DimensionMismatch` is thrown; a `NaN` in
@@ -2145,6 +2185,12 @@ with respect to the evaluation point.
 The fit must have a constant `κ` and an unbounded support; a per-interval `κ` or a finite
 `support` throws an `ArgumentError`. It is defined for point data only: the nodes of an
 [`IntervalDensityEstimate`](@ref) are fixed interval endpoints, not movable sample points.
+
+# Extended help
+
+Moving a node perturbs the fitted amplitude everywhere through the field equation
+`M ψ = w ⊘ ψ`; the adjoint reuses the fit's Hessian `∇²F = M + diag(wᵢ/ψᵢ²)` and handles the
+whole evaluation batch with one extra tridiagonal solve.
 """
 function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector,
                                   weights=nothing) where {T}
@@ -2274,9 +2320,7 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 Reference distribution of the goodness-of-fit statistic [`chisq`](@ref) for the fit `d`,
 following Holy 1997 (Eqs. 16–18). The statistic is a quadratic form in the Gaussian
 fluctuation field of the Laplace approximation about the fit, so its law is a generalized
-chi-squared; this law is exact for that field at finite `N`. Construction costs `O(N)`, and
-the object stores `O(N)` data (a symmetric tridiagonal matrix and a rank-one constraint
-vector) from which its density and tail probabilities are computed.
+chi-squared; this law is exact for that field at finite `N`. Construction costs `O(N)`.
 
 Build one per fit and reuse it across evaluations of [`pvalue`](@ref), [`chisq_ccdf`](@ref)
 and [`chisq_pdf`](@ref), for any number of trial densities tested against the fit. These
@@ -2293,6 +2337,9 @@ be distribution-free.
 Defined for point data only; there is no form for an [`IntervalDensityEstimate`](@ref).
 
 # Extended help
+
+The object stores `O(N)` data (a symmetric tridiagonal matrix and a rank-one constraint
+vector) from which its density and tail probabilities are computed.
 
 With a spatially varying `κ` the nodal precision of the fluctuation field is `2λ` times the
 same tridiagonal operator the fit assembles, whatever the scale. With a finite `support` the
@@ -2620,12 +2667,16 @@ _wald_pdf(μ::T, z::Real) where {T} =
 Density of the reference χ² distribution at `z`; it is `0` for `z ≤ 0` and at `z = Inf`, and
 `NaN` throws a `DomainError`. `method=:exact` (default) is the finite-`N` generalized-χ² law
 of `ref`. `method=:largeN` is the inverse-Gaussian (Wald) density of the large-`N` limit
-(Eq. 26),
+(Eq. 26), parameterized by the exact mean [`mean`](@ref Statistics.mean)`(ref)`. `rtol` and
+`atol` are as in [`chisq_ccdf`](@ref), including the `ConvergenceError`.
+
+# Extended help
+
+The `method=:largeN` density is
 
     P(z) = ⟨χ²⟩ / √(2π z³) · exp[⟨χ²⟩ - z/2 - ⟨χ²⟩²/(2z)],
 
-with `⟨χ²⟩ =` [`mean`](@ref Statistics.mean)`(ref)` the exact mean. `rtol` and `atol` are as
-in [`chisq_ccdf`](@ref), including the `ConvergenceError`.
+with `⟨χ²⟩ =` [`mean`](@ref Statistics.mean)`(ref)` the exact mean.
 """
 function chisq_pdf(r::ChisqReference{T}, z::Real; method::Symbol=:exact, rtol=sqrt(eps(T)), atol=sqrt(eps(T))) where {T}
     _check_chisq_args(z, method)
@@ -2728,11 +2779,13 @@ This criterion resolves *information* and over-resolves smooth densities; to tar
 estimation error, use [`select_kappa`](@ref) (or [`select_kappa_lscv`](@ref)). For rounded
 data, pass the rounding increment to `select_kappa` as `resolution`.
 
-This selector takes no `support` keyword: the entropy asymptotics behind minimum sensitivity
-are derived for the unbounded line and do not generalize to a finite domain, so it always
-fits (and returns a scale for) the unbounded problem. It also has no form for interval data.
+This selector takes no `support` keyword: it always fits (and returns a scale for) the
+unbounded problem. It also has no form for interval data.
 
 # Extended help
+
+There is no `support` keyword because the entropy asymptotics behind minimum sensitivity are
+derived for the unbounded line and do not generalize to a finite domain.
 
 The derivative `dS/d ln κ` is evaluated analytically and minimized over `κ` by a golden-section
 search, bracketed by the grid `kappas`. The result is a convention rather than a unique
@@ -2933,17 +2986,19 @@ Choose the smoothing scale by least-squares cross-validation: return the `κ` mi
 
 an unbiased estimate, up to the `κ`-independent `∫Q²`, of the integrated squared error
 `∫(Q̂_κ - Q)²`, where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. Its
-minimizer therefore targets minimum mean integrated squared error (MISE). This generally
-selects a coarser scale than [`select_kappa_sensitivity`](@ref) (minimum sensitivity), which
-resolves information rather than squared error and tends to over-resolve smooth densities.
+minimizer therefore targets minimum mean integrated squared error (MISE).
 
 `support`, `kappas`, `rtol` and `holdout` mean what they do for [`select_kappa`](@ref).
 `resolution` may be `nothing` (check for ties) or `0` (accept the values as exact points); a
-positive `resolution` throws an `ArgumentError`. This criterion has no interval form, because
-when only the interval of each observation is known the cross term has no unbiased estimate;
-for rounded data use `select_kappa` with `resolution` set to the rounding increment.
+positive `resolution` throws an `ArgumentError`. This criterion has no interval form; for
+rounded data use `select_kappa` with `resolution` set to the rounding increment.
 
 # Extended help
+
+LSCV generally selects a coarser scale than [`select_kappa_sensitivity`](@ref) (minimum
+sensitivity), which resolves information rather than squared error and tends to over-resolve
+smooth densities. There is no interval form because, when only the interval of each
+observation is known, the cross term has no unbiased estimate.
 
 Both terms are evaluated analytically in `O(N)`: `∫Q̂²` in closed form over the exponential
 segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from the same leave-one-out expansion
@@ -3022,13 +3077,7 @@ the repeated values. Interval observations are always left out one at a time.
 `kappas` is the grid that brackets the search. By default (`kappas = nothing`) it is a
 geometric range scaled to the data's extent, extended past either end when the minimum falls
 there. A grid passed as `kappas` must be sorted and positive, with at least three values, and is
-searched as given: a minimum on its first or last value throws a `ConvergenceError`. For
-interval data the default grid never extends past the `κ` at which `κ` times the widest
-interval reaches 4096, beyond which the fit cannot be computed accurately; a minimum there is
-returned as the selected scale, since the fit is then at its histogram limit. When both ends of
-`support` are finite, the default grid never extends below `κ = 0.1/(hi - lo)`, where the fit is
-already close to the uniform density on the support; a minimum there is returned as the
-selected scale.
+searched as given: a minimum on its first or last value throws a `ConvergenceError`.
 
 [`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
 of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and
@@ -3048,10 +3097,17 @@ Each leave-one-out density `Q̂_{-i}(xᵢ)` comes from a one-step leave-one-out 
 in the dropped point's weight: a Newton step whose length is set so the deleted node's own
 stationarity condition holds exactly. This tracks a full refit closely and, unlike a linear
 step, responds to over-fitting; no per-point refitting is needed, and the score costs `O(N)`.
-For an interval observation, the refit is approximated by minimizing over the interval's own nodal values with
-its term in the likelihood exact and the rest of the problem replaced by its quadratic model,
-which stays accurate when the deletion empties the interval. The score is minimized by a
-golden-section search over `ln κ`, bracketed by the grid `kappas`.
+For an interval observation, the refit is approximated by minimizing over the interval's own
+nodal values with its term in the likelihood exact and the rest of the problem replaced by its
+quadratic model, which stays accurate when the deletion empties the interval. The score is
+minimized by a golden-section search over `ln κ`, bracketed by the grid `kappas`.
+
+For interval data the default `kappas` grid never extends past the `κ` at which `κ` times the
+widest interval reaches 4096, beyond which the fit cannot be computed accurately; a minimum
+there is returned as the selected scale, since the fit is then at its histogram limit. When
+both ends of `support` are finite, the default grid never extends below `κ = 0.1/(hi - lo)`,
+where the fit is already close to the uniform density on the support; a minimum there is
+returned as the selected scale.
 """
 function select_kappa(x::AbstractVector{<:Real}; support::Tuple{Real,Real}=(-Inf, Inf),
                       rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,
@@ -3220,6 +3276,8 @@ the smoothing scale.
 Dividing by `ḡ` puts `c` on the same footing as a constant scale: where `p̂` equals its
 geometric mean, `κ(x) = c`. The exponent `α > 0` sets how strongly the scale follows the
 density: larger `α` resolves the peaks more finely and smooths the tails more heavily.
+
+# Extended help
 
 The scale is floored at `1e-6 c` to prevent underflow of `(p̂/ḡ)^α` where the pilot density
 is negligible; the floor is far below any scale the rule would otherwise choose.
@@ -3508,10 +3566,7 @@ of the score. The settings `alphas`, `window`, `nse` and `pilot` are those of `a
 There is no `holdout` keyword: every score, including the pilot's, uses `holdout = :location`.
 `support` is fixed across every candidate `α`/`c`, and both the pilot density and every
 candidate are fitted and cross-validated on it. With `resolution = δ > 0` the scale is selected
-for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`, with the pilot an interval fit
-and every candidate scored by the held-out log-probabilities of the observations' intervals.
-With `resolution = δ > 0` or the `(lower, upper)` form, the windows are computed from the
-observations spread evenly over their intervals (see the extended help).
+for [`IntervalDensityEstimate`](@ref)`(x, κ; resolution=δ)`.
 
 To choose `support` as well, call [`select_support`](@ref) first, pass its `support` here, and
 fit `DensityEstimate(x, κ; support)` with the scale this returns.
@@ -3605,7 +3660,9 @@ interval, and the window statistics are computed from these locations; exact obs
 where they are, and observations with an infinite bound (censored) enter the score but not the
 shape. Within a window this gives the sums of `u` and `u²` expected if each observation were
 spread uniformly over its interval, while the counts in different intervals keep their sampling
-noise. The scores are the interval-likelihood KLCV scores, and `N` counts all observations.
+noise. The pilot is an interval fit, every candidate is scored by the held-out
+log-probabilities of the observations' intervals (the interval-likelihood KLCV scores), and `N`
+counts all observations.
 
 `pilot` is a scale-selection method, and is called on the sample alone with no notion of
 `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
@@ -3815,8 +3872,7 @@ When neither side wins, the support is `(-Inf, Inf)` and the returned `κ` equal
 
 `kappas` and `rtol` mean what they do for [`select_kappa`](@ref): the grid bracketing the κ
 search (by default extended as needed), and the node-merging tolerance (a fraction of the local
-smoothing length). The κ searched at each finite-boundary candidate stays within the range of
-the grid the unbounded search used.
+smoothing length).
 
 More than 1% repeated values throw an `ArgumentError`, as for [`select_kappa`](@ref), unless
 `resolution = 0` is given, which treats the values as exact points. `select_support` has no
@@ -3850,14 +3906,15 @@ A finite candidate on one side is a gap `Δ > 0`, the distance *outward* from th
 point on that side (`a = x₁ - Δ` on the left, `b = x_N + Δ` on the right), searched by
 golden-section on `ln Δ` over a bracket of `[5, 100]` times the mean spacing of the ten data
 points nearest that edge (extensible outward, never inward). The lower end is a hard floor:
-closer than a few edge spacings, a natural boundary reflects the nearest interior points back onto the extreme point
-and inflates its leave-one-out likelihood on any sample, whether or not the density has an
-edge. This is a property of the reflecting boundary condition, also seen in brute-force
-leave-one-out refits, so gaps below the floor are excluded. `κ` is re-selected at every gap
+closer than a few edge spacings, a natural boundary reflects the nearest interior points back
+onto the extreme point and inflates its leave-one-out likelihood on any sample, whether or not
+the density has an edge. This is a property of the reflecting boundary condition, also seen
+in brute-force leave-one-out refits, so gaps below the floor are excluded. `κ` is re-selected at every gap
 candidate, because the two are coupled at a hard edge (the optimal `κ` can fall to a fraction
 of its unbounded value once a wall is added). Candidates are searched from the widest gap to
 the narrowest, and since `κ*` moves continuously with the gap, each candidate's `κ` search is
-confined to a narrow window about the previous candidate's optimum.
+confined to a narrow window about the previous candidate's optimum. The κ searched at each
+finite-boundary candidate stays within the range of the grid the unbounded search used.
 
 The full constant-scale search of [`select_kappa`](@ref) runs at two points only: once at the
 start, to seed the unbounded arm's competing score and the first (and widest) gap candidate's
