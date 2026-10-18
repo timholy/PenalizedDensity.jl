@@ -46,18 +46,17 @@ lscv_unbounded(n, w, κs, κL, κR; kw...) = PenalizedDensity._lscv(n, w, κs, �
 int_quartic(d) = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
 
 # Direct Monte-Carlo of the field-theoretic χ² (Holy 1997, Eq. 16): sample the fluctuation
-# field δψ from the constrained Gaussian and evaluate χ²(δψ). This is the ground truth the
-# exact reference distribution must reproduce, at a constant or a varying scale alike, on ℝ or
-# on a bounded support.
+# field δψ from the constrained Gaussian and evaluate χ²(δψ). The exact reference distribution
+# must reproduce these samples at a constant or a varying scale, on ℝ or on a bounded support.
 #
 # The field's precision is L = 2λ𝒜 + 2Σ(wᵢ/ψᵢ²)δ(x-xᵢ), 𝒜u = -(κ(x)⁻²u′)′ + u, discretized
 # conservatively: each cell of the grid contributes (2λ/κ²)(Δδψ)²/h to the gradient energy
 # and 2λ·h to the mass. The grid contains every node, so κ is single-valued on each cell and
-# the point sources land on grid points exactly. A finite `d.lo`/`d.hi` terminates the grid
-# there instead of padding into a decaying tail; the conservative stencil already has no term
-# coupling a grid edge to anything past it, so ending the grid exactly at the wall *is* the
-# natural (Neumann) boundary condition, not an approximation to it. Nothing here shares an
-# assembly, a Green's function, or a recursion with the package. Returns the χ² samples.
+# the point sources land on grid points exactly. A finite `d.lo`/`d.hi` ends the grid there
+# instead of padding into a decaying tail; the conservative stencil has no term coupling a grid
+# edge to anything past it, so ending the grid at the wall imposes the natural (Neumann)
+# boundary condition exactly. The discretization shares no assembly, Green's function, or
+# recursion with the package. Returns the χ² samples.
 function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     x, ψ, λ = d.x, d.ψ, d.λ
     κ(k) = k == 0 ? d.κL : k > length(d.x) - 1 ? d.κR : PenalizedDensity._kappa(d.κ, k)
@@ -98,7 +97,7 @@ function fieldmc_chisq(d; nsamp=40_000, per_len=50, pad=12.0, seed=1)
     return chis
 end
 
-# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity pins to 1 for any scale, bounded or not (it needs only
+# 4 Σᵢ wᵢ bᵢ/ψᵢ, which Green's identity makes equal to 1 for any scale, bounded or not (it needs only
 # Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1). A wrong nodal precision or a wrong α breaks it.
 function green_identity(d)
     m = PenalizedDensity._node_alpha(d.x, d.ψ, d.κ, d.κL, d.κR, d.λ, d.lo, d.hi)
@@ -168,7 +167,7 @@ end
         # The threshold is rtol/κ: here 1e-3/2 = 5e-4.
         @test length(DensityEstimate([0.0, 1e-4, 1.0], 2.0; rtol=1e-3).x) == 2
         @test length(DensityEstimate([0.0, 1e-3, 1.0], 2.0; rtol=1e-3).x) == 3
-        # The default rtol > 0 merges points far below the resolution (numerical hygiene).
+        # The default rtol > 0 merges points far below the resolution.
         @test length(DensityEstimate([0.0, 1e-9, 1.0], 1.0).x) == 2
         # Merging points closer than the resolution is lossless.
         Random.seed!(5)
@@ -222,17 +221,15 @@ end
         @test_throws ArgumentError merge_samples([0.0, NaN], 1.0)
     end
 
-    @testset "solver is robust and allocates O(N), not O(N·iterations)" begin
-        # Dense samples drive adjacent-node spacings toward zero, which sharply
-        # ill-conditions the tridiagonal Newton system; the fit must still converge
-        # and normalise, with memory proportional to N rather than N × iterations.
-        # rtol=0 exercises the raw solver without the near-coincident-point merge.
+    @testset "solver converges on dense samples and allocates O(N)" begin
+        # Dense samples make adjacent-node spacings small and ill-condition the tridiagonal
+        # Newton system. rtol=0 disables merging of near-coincident points.
         Random.seed!(4)
         x = randn(20_000)
         d = DensityEstimate(x, 3.0; rtol=0.0)
         @test all(isfinite, d.ψ) && all(>(0), d.ψ)
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
-        # Stationarity of the normalized amplitude: Mψ = (κ/λ) w ./ ψ (Eq. field equation).
+        # Stationarity of the normalized amplitude: Mψ = (κ/λ) w ./ ψ.
         M = PenalizedDensity.roughness_operator(d.x, d.κ)
         resid = M * d.ψ .- (d.κ / d.λ) .* d.w ./ d.ψ
         @test maximum(abs, resid) < 1e-6 * maximum(abs, M * d.ψ)
@@ -249,28 +246,26 @@ end
         st = PenalizedDensity.SolveStats()
         x = randn(MersenneTwister(11), 300)
         d = DensityEstimate(x, 4.0; stats=st)
-        # A well-conditioned fit converges cleanly on the correction tolerance, and
-        # the collected fit is identical to the uninstrumented one — the collector
-        # must not perturb the solve.
+        # A well-conditioned fit stops on the correction tolerance, and collecting stats
+        # does not change the fit.
         @test st.iterations >= 1
         @test st.reason === :tolerance
         @test st.final_step <= eps(Float64)^(3//4)
         @test 0 < st.final_alpha <= 1
         @test d.ψ == DensityEstimate(x, 4.0).ψ
 
-        # Near-coincident nodes at rtol=0 ill-condition the solve: it stops short of the
-        # correction tolerance, held up by roundoff rather than meeting it.
+        # Near-coincident nodes at rtol=0 ill-condition the solve, and roundoff stops it short
+        # of the correction tolerance.
         st0 = PenalizedDensity.SolveStats()
         DensityEstimate(randn(MersenneTwister(7), 4_000), 3.0; rtol=0.0, stats=st0)
         @test st0.iterations >= 1
         @test st0.reason in (:floor, :steplength)
         @test st0.final_step > eps(Float64)^(3//4)
 
-        # Nearly coincident nodes make the operator's entries (up to ~2e5 here) far larger
-        # than the objective they nearly cancel to, so F's rounding noise is orders of
-        # magnitude above eps·|F|. The Armijo test must measure the noise by the size of
-        # F's terms; measured by |F|, it rejects every step once the predicted decrease is
-        # below the true noise and the solve stops with the amplitudes still wrong by ~1e-6.
+        # Nearly coincident nodes give operator entries (up to ~2e5 here) far larger than the
+        # objective they nearly cancel to, so F's rounding noise far exceeds eps·|F|. The Armijo
+        # test must scale its noise allowance by the size of F's terms; scaled by |F|, it
+        # rejects every step and leaves the amplitudes wrong by ~1e-6.
         x = -log.(1 .- rand(Xoshiro(0x9a6a4425a4e3843c), 1000))
         xs = sort(x)
         κ, lo = 2.0855457048506127, xs[1] - 0.004565539700564811
@@ -428,16 +423,15 @@ end
         κ200 = select_kappa_lscv(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
-        # ∫Q̂² term: the analytic closed form matches numerical quadrature, including the
-        # near-coincident points (small θ) that defeat a naive csch⁴ form.
+        # ∫Q̂² term: the closed form matches quadrature, including near-coincident points
+        # (small θ), where a direct csch⁴ form loses accuracy.
         d = DensityEstimate(x, 4.0)
         ∫Q2 = int_quartic(d)
         g = range(d.x[1] - 15 / d.κ, d.x[end] + 15 / d.κ; length = 400_001)
         @test ∫Q2 ≈ sum(d(t)^2 for t in g) * step(g) rtol = 1e-4
 
-        # LSCV score: the analytic one-step leave-one-out matches brute-force refitting.
-        # The refit is the exact leave-one-out — wᵢ decremented, a singleton node dropped —
-        # the estimand the analytic step approximates.
+        # LSCV score: the analytic one-step leave-one-out matches the exact leave-one-out refit
+        # (wᵢ decremented, or a singleton node dropped).
         xs = sort(x); w = ones(length(xs))
         function lscv_refit(nodes, weights, κ)
             cross = 0.0
@@ -457,10 +451,8 @@ end
             @test lscv_unbounded(xs, w, κ0) ≈ lscv_refit(xs, w, κ0) rtol = 5e-4
         end
 
-        # The nonlinear step is exercised on the tied branch (wᵢ > 1) too: rounding to
-        # 0.05σ collapses the sample onto high-multiplicity nodes, and the analytic score
-        # still matches the decrement refit — LSCV's density-weighted cross term is
-        # accurate even where the log-scale KLCV would not be.
+        # Tied branch (wᵢ > 1): rounding to 0.05σ gives high-multiplicity nodes, and the
+        # analytic score matches the decrement refit.
         nt, wt = PenalizedDensity._merge_presorted(sort(round.(x ./ 0.05) .* 0.05), 1e-8)
         @test maximum(wt) > 5
         for κ0 in (1.5, 4.0)
@@ -505,11 +497,9 @@ end
         κ200 = select_kappa(x; kappas = exp.(range(log(0.3), log(40); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
 
-        # KLCV score: the mean negative leave-one-out log-likelihood built from the analytic
-        # one-step leave-one-out densities matches one built by brute-force refitting. The
-        # tolerance is looser than the LSCV analog above because taking the log gives every node
-        # equal weight, including tail nodes where the expansion is least accurate, whereas LSCV's
-        # cross term downweights them by the density value.
+        # KLCV score from the analytic one-step leave-one-out densities matches the refit. The
+        # tolerance is looser than for LSCV: the log weights every node equally, including tail
+        # nodes where the expansion is least accurate, while LSCV weights them by the density.
         xs = sort(x); w = ones(length(xs))
         function klcv_refit(nodes, weights, κ)
             s = 0.0
@@ -523,12 +513,10 @@ end
             @test klcv_unbounded(xs, w, κ0) ≈ klcv_refit(xs, w, κ0) rtol = 1e-3
         end
 
-        # The nonlinear step's payoff is selection on high-leverage data: on a small, skewed
-        # sample the analytic KLCV minimizes at the scale an exact leave-one-out grid search
-        # picks, and matches the refit tightly near that optimum. A first-order expansion
-        # under-penalizes over-fitting here and selects a far too rough scale. (The analytic and
-        # exact scores can diverge far out in the over-fit tail, where a single collapsing node
-        # dominates the log-score, but that is well right of any selected scale.)
+        # On a small, skewed sample the analytic KLCV minimizes near the scale an exact
+        # leave-one-out grid search picks, and matches the refit near that optimum; a first-order
+        # expansion would select a far too rough scale here. (At much larger κ, where one
+        # collapsing node dominates the log-score, the two scores diverge.)
         xh = sort(exp.(randn(MersenneTwister(3), 25))); wh = ones(length(xh))
         span = xh[end] - xh[1]
         gridh = exp.(range(log(0.5 / span), log(5 * length(xh) / span); length = 41))
@@ -715,8 +703,8 @@ end
             for y in (-2.0, -0.5, 0.0, 1.0, 2.0)
                 @test ungaussianize(d, y) ≈ quantile(d, Φ(y)) atol = 1e-10
             end
-            # y-side round trip, from the bulk to far beyond linear-space Φ (|y| > 38.6
-            # underflows Φ; the log-space tail forms carry it without saturation).
+            # y-side round trip, from the bulk to far beyond where Φ underflows (|y| > 38.6),
+            # through the log-space tail forms.
             for y in vcat(-37.5:2.5:37.5, [-300.0, -50.0, 50.0, 300.0])
                 @test gaussianize(d, ungaussianize(d, y)) ≈ y rtol = 1e-11 atol = 1e-11
             end
@@ -817,10 +805,8 @@ end
         Φ(t) = PenalizedDensity._Φ(t)
         φ(t) = exp(-t^2 / 2) / sqrt(2π)
 
-        # A fit is Gaussianized correctly when Φ(gaussianize) reproduces its own cdf, the map
-        # inverts, and ln φ(y) + logjac = ln Q̂(x) — the change of variables. These held only for
-        # the unbounded, scalar-κ fit; they must now hold for a finite support and a
-        # per-interval κ as well, over the interior *and* the boundary segments.
+        # Φ(gaussianize) reproduces the cdf, the map inverts, and ln φ(y) + logjac = ln Q̂(x),
+        # for a finite support and a per-interval κ, over the interior and the boundary segments.
         Random.seed!(202)
         xb = clamp.(0.5 .+ 0.18 .* randn(400), 1e-3, 1 - 1e-3)
         adaptive = DensityEstimate(randn(400) .^ 2 .+ 0.1 .* randn(400),
@@ -848,9 +834,8 @@ end
                 for t in range(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo); length = 41)
                     (; y, logjac) = gaussianize_logjacobian(d, t)
                     @test y == gaussianize(d, t)
-                    # The cdf behind y is a quadrature at rtol = √eps, so the identity
-                    # cannot hold tighter than that; most points land near 1e-10, a few
-                    # near the quadrature tolerance itself.
+                    # The cdf behind y is a quadrature at rtol = √eps, which bounds the
+                    # accuracy of this identity.
                     @test log(φ(y)) + logjac ≈ log(d(t)) rtol = 1e-7
                 end
                 # Monotone across the support.
@@ -858,14 +843,14 @@ end
             end
         end
 
-        # Out-of-support convention for a compact support: honest ±Inf, and the inverse maps a
-        # saturated Gaussian back to the wall.
+        # Outside a compact support the map is ±Inf, and the inverse maps a saturated Gaussian
+        # back to the wall.
         db = DensityEstimate(xb, 8.0; support = (0.0, 1.0))
         @test gaussianize(db, -0.05) == -Inf && gaussianize(db, 1.05) == Inf
         @test gaussianize_logjacobian(db, -0.05).logjac == -Inf
         @test gaussianize_logjacobian(db, 1.05).logjac == -Inf
         @test ungaussianize(db, -50.0) == 0.0 && ungaussianize(db, 50.0) == 1.0
-        # A one-sided support keeps the honest exponential tail on the unbounded side.
+        # A one-sided support keeps the exponential tail on the unbounded side.
         dr = DensityEstimate(xb, 8.0; support = (0.0, Inf))
         @test gaussianize(dr, -0.05) == -Inf
         @test isfinite(gaussianize(dr, 5.0)) && gaussianize(dr, Inf) == Inf
@@ -883,7 +868,7 @@ end
     @testset "generic indexing: OffsetArray input" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
         d = DensityEstimate(x, 1.1)
-        do_ = DensityEstimate(OffsetArray(x, -3), 1.1)   # 0-based-ish axes
+        do_ = DensityEstimate(OffsetArray(x, -3), 1.1)   # offset axes
         @test do_.x == d.x
         @test do_.ψ ≈ d.ψ
         @test do_(0.7) ≈ d(0.7)
@@ -1039,7 +1024,7 @@ end
             @test cdf(a, -Inf) == 0 && cdf(a, Inf) == 1
             @test quadgk(a, -Inf, a.x[1], 0.0, a.x[end], Inf; rtol=1e-10)[1] ≈ 1 atol=1e-8
             @test amplitude(a, 0.3)^2 == a(0.3)
-            # cdf and quantile still invert each other on a varying scale.
+            # cdf and quantile invert each other on a varying scale.
             qs = 0.001:0.017:0.999
             @test cdf.(a, quantile.(a, collect(qs))) ≈ qs atol=1e-12
         end
@@ -1139,8 +1124,8 @@ end
             # Where the scale equals c, the pilot density equals its geometric mean.
             @test k(chisq1[argmin(abs.(log.(p.(chisq1)) .- lgbar))]) ≈ 3.0 rtol=1e-3
 
-            # The batch path the selector uses must agree with the scalar rule exactly: it
-            # walks the pilot's nodes once instead of searching for each position.
+            # The selector's batch path, one walk over the pilot's nodes, agrees exactly with
+            # the scalar rule.
             ts = sort!(vcat(chisq1[1:50:end], range(1e-4, 9.0; length=97)))
             @test PenalizedDensity._kappa_sorted(k, ts, Float64) == k.(ts)
 
@@ -1150,9 +1135,9 @@ end
             @test p(far) == 0
             @test k(far) == k.κmin == 1e-6 * k.c
 
-            # A shallow exponent keeps the rule off its floor even where the pilot density
-            # has underflowed, which is the only regime that can tell the scalar and batch
-            # paths apart: both must read the log-density, not the density.
+            # A shallow exponent keeps the rule off its floor where the pilot density has
+            # underflowed; there the scalar and batch paths agree only if both use the
+            # log-density.
             ks = AdaptiveScale(3.0, 5e-3, p)
             deep = last(chisq1) .+ [40.0, 45.0, 50.0]
             @test all(t -> p(t) == 0, deep)
@@ -1163,12 +1148,11 @@ end
                   "AdaptiveScale(c=3.0, α=0.5) over a pilot with $(length(p.x)) nodes"
         end
 
-        @testset "adaptivity is used only when it wins" begin
+        @testset "an adaptive scale is selected only when it scores better" begin
             κ = select_kappa(chisq1, Adaptive(; window=nothing))
             @test κ isa AdaptiveScale
             @test κ.α > 0
-            # The selector's own guarantee: the chosen scale beats the constant one on the
-            # score that chose it.
+            # The chosen scale scores better than the constant one.
             @test klcv_scale(chisq1, κ) < klcv_const(chisq1, select_kappa(chisq1))
 
             d = DensityEstimate(chisq1, κ)
@@ -1180,9 +1164,8 @@ end
             @test extrema(d.κ)[2] / extrema(d.κ)[1] > 100
             @test cdf(d, Inf) == 1
 
-            # Uniform data has no density contrast to exploit — κ ∝ p̂^α is already constant —
-            # so the α = 0 candidate wins and a plain scalar comes back, keeping the fast path
-            # and the goodness-of-fit machinery.
+            # For uniform data κ ∝ p̂^α is already constant, so the α = 0 candidate is selected
+            # and a scalar is returned.
             u = sort!(rand(Xoshiro(5), 3000))
             κu = select_kappa(u, Adaptive(; window=nothing))
             @test κu isa Real
@@ -1260,8 +1243,7 @@ end
         end
 
         @testset "the c search brackets its minimum" begin
-            # Driven by synthetic scores: the searches take the objective as an argument, so
-            # their geometry is testable without a density pathological enough to force it.
+            # Synthetic scores, passed as the objective, exercise the bracketing directly.
             sel(score, c0) = PenalizedDensity._select_c(score, c0)
 
             # A minimum already inside the opening bracket is refined in place.
@@ -1300,10 +1282,10 @@ end
             # Non-finite scores are stepped over, never chosen, whichever sign they carry.
             @test mog(κ -> κ < 1 ? NaN : (log(κ) - log(3.0))^2, κs) ≈ 3.0 rtol=1e-6
             @test mog(κ -> κ > 10 ? -Inf : (log(κ) - log(3.0))^2, κs) ≈ 3.0 rtol=1e-6
-            # A grid with no finite score is an error, not a silently returned scale.
+            # A grid with no finite score is an error.
             @test_throws PenalizedDensity.ConvergenceError mog(_ -> NaN, κs)
             @test_throws "no κ in kappas" mog(_ -> Inf, κs)
-            # Reachable through the public API: ten coincident points and one other merge to two
+            # Through the public API: ten coincident points and one other merge to two
             # nodes, where no κ yields a finite leave-one-out score.
             @test_throws "no κ in kappas" select_kappa(vcat(fill(0.0, 10), [100.0]); resolution=0)
             # A minimum at either end of a given grid is an error.
@@ -1346,11 +1328,11 @@ end
         end
 
         @testset "an unresolvable candidate scores NaN" begin
-            # A κ profile spanning many orders of magnitude can drive the factorization to an
-            # exact zero pivot. That candidate is unresolvable, not a failure of the search.
+            # A κ profile spanning many orders of magnitude can give the factorization an exact
+            # zero pivot; that candidate scores NaN.
             zero_pivot(args...) = throw(ZeroPivotException(3))
             @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol, -Inf, Inf))
-            # Any other failure is a bug and must not be swallowed.
+            # Any other exception propagates.
             other(args...) = throw(DomainError(1.0, "something else went wrong"))
             @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol, -Inf, Inf)
             # Too few nodes to fit: scored NaN before the scorefun is ever reached.
@@ -1434,8 +1416,7 @@ end
             @test_throws "the grid is empty" WindowScale(1.0, 1.0, Float64[], Float64[])
         end
 
-        # A narrow bump beside a broad mode, with its peak above the mode's: the window rule's
-        # target case.
+        # A narrow bump beside a broad mode, with its peak above the mode's.
         rng = Xoshiro(7)
         xb = [rand(rng) < 0.8 ? randn(rng) : 3 + 0.15randn(rng) for _ in 1:1000]
         xbs = sort(xb)
@@ -1456,8 +1437,8 @@ end
             @test κ isa WindowScale
             @test κ.γ == 0.75
             @test κ(3.0) > κ(0.0)
-            # The rule's guarantee: the window candidate's penalized score beats the score of
-            # the scale the power family returns, with nse = 0 by default.
+            # The window candidate's penalized score is below the score of the scale the power
+            # family returns, with nse = 0 by default.
             κp = select_kappa(xb, Adaptive(; window=nothing, nse=0))
             sp = κp isa Real ? klcv_const(xbs, κp) : klcv_scale(xbs, κp)
             @test klcv_scale(xbs, κ) + 0.11 * 0.75 / sqrt(1000) < sp
@@ -1552,11 +1533,11 @@ end
 
     @testset "goodness of fit: large-N (Eq. 26) reference" begin
         d = DensityEstimate([-1.0, 0.0, 0.0, 1.0], 1.0)
-        # :largeN is the Wald inverse-Gaussian(mean μ, shape μ²) at the exact mean μ = tr A.
         r = ChisqReference(d)
         μ = mean(r)
         @test μ > 0
-        # method=:largeN is the inverse-Gaussian(mean μ, shape μ²): normalized, with mean μ.
+        # method=:largeN is the Wald inverse-Gaussian(mean μ, shape μ²) at the exact mean
+        # μ = tr A: normalized, with mean μ.
         zs = range(1e-5, 40μ; length=4_000_001)
         p = chisq_pdf.(Ref(r), zs; method=:largeN)
         trap(f) = (sum(f) - (f[1] + f[end]) / 2) * step(zs)
@@ -1607,8 +1588,8 @@ end
         @test all(≥(0), chisq_pdf.(Ref(r), grid))
         h = 1e-3
         @test -(chisq_ccdf(r, μ + h) - chisq_ccdf(r, μ - h)) / 2h ≈ chisq_pdf(r, μ) rtol = 1e-4
-        # A five-node fit with a small κ: the real-axis density integrand decays only
-        # algebraically, so the density must still match -d(ccdf)/dz, in the bulk and both tails.
+        # A five-node fit with a small κ, where the real-axis density integrand decays only
+        # algebraically: the density matches -d(ccdf)/dz in the bulk and both tails.
         x5 = -log.(rand(Xoshiro(5), 5))
         r5 = ChisqReference(DensityEstimate(x5, 0.2select_kappa(x5); support=(minimum(x5) - 0.5, maximum(x5) + 0.5)))
         μ5 = mean(r5)
@@ -1617,13 +1598,13 @@ end
             fd = -(chisq_ccdf(r5, z + h5; rtol=1e-10, atol=1e-12) - chisq_ccdf(r5, z - h5; rtol=1e-10, atol=1e-12)) / 2h5
             @test chisq_pdf(r5, z) ≈ fd rtol = 1e-4 atol = 1e-8
         end
-        # An unconverged inversion integral is an error, not a returned value.
+        # An unconverged inversion integral throws.
         @test_throws PenalizedDensity.ConvergenceError chisq_pdf(r5, 2μ5; rtol=0, atol=1e-300)
         @test_throws "chisq_pdf: the inversion integral at z = " chisq_pdf(r5, 2μ5; rtol=0, atol=1e-300)
         @test_throws "chisq_ccdf: the inversion integral at z = " chisq_ccdf(r5, 2μ5; rtol=0, atol=1e-300)
         @test_throws "chisq_ccdf: the inversion integral at z = 2.0 did not converge (error estimate 0.001, tolerance 1.0e-5)" PenalizedDensity._check_quadrature("chisq_ccdf", 2.0, 0.5, 1e-3, 0.0, 1e-5)
         @test PenalizedDensity._check_quadrature("chisq_ccdf", 2.0, 0.5, 1e-4, 0.0, 1e-5) === nothing
-        # At the median the tail integral is ~0; evaluation must still terminate.
+        # At the median the tail integral is ~0; evaluation terminates.
         a, b = 0.5μ, 2μ
         for _ in 1:60
             m = (a + b) / 2
@@ -1685,10 +1666,9 @@ end
         @test mean(rc) ≈ mean(rs) rtol = 1e-10
         @test chisq_ccdf(rc, mean(rc)) ≈ chisq_ccdf(rs, mean(rs)) rtol = 1e-10
 
-        # The decisive test: the exact law reproduces a direct Monte-Carlo of the fluctuation
-        # field. A hard-edge family under the plug-in selector, whose realized rates span five
-        # orders of magnitude — every quantity the reference is built from is propagated in
-        # scaled form precisely so this does not overflow.
+        # The exact law reproduces a direct Monte-Carlo of the fluctuation field for a hard-edge
+        # family under the plug-in selector. Its realized rates span five orders of magnitude,
+        # which the reference handles by building every quantity in scaled form.
         xa = sort!(randn(Xoshiro(3), 300).^2)                 # χ²₁: divergent edge at 0
         da = DensityEstimate(xa, select_kappa(xa, Adaptive(; window=nothing)))
         @test maximum(da.κ) / minimum(da.κ) > 1e4
@@ -1724,8 +1704,8 @@ end
         @test green_identity(ds) ≈ 1 rtol = 1e-5
 
         # ∬ψ_cl G₀ ψ_cl and the nodal α agree with a conservative finite-difference solve of
-        # 𝒜α = ψ_cl/(2λ) on a node-aligned grid: an independent route, with no Green's
-        # function in it. It converges to the closed forms at the discretization's O(δ²).
+        # 𝒜α = ψ_cl/(2λ) on a node-aligned grid, which uses no Green's function. It converges
+        # to the closed forms at the discretization's O(δ²).
         errs = map((100, 400)) do per
             x, ψ, λ = ds.x, ds.ψ, ds.λ
             κ(k) = k == 0 ? ds.κL : k > length(x) - 1 ? ds.κR : PenalizedDensity._kappa(ds.κ, k)
@@ -1772,9 +1752,9 @@ end
         @test entropy(d) ≈ -log(κ)
         @test negentropy(d) ≈ log(2π * ℯ / (2κ^2)) / 2 - entropy(d)
 
-        # Brute-force reference: quadrature entropy and negentropy from the fitted density
-        # itself (not the plug-in estimator), to isolate the closed-form mean/variance and
-        # the -∫Q ln Q dx integral from any small-sample plug-in bias.
+        # Reference: quadrature entropy and negentropy of the fitted density rather than the
+        # plug-in estimator, which separates the closed-form mean/variance and -∫Q ln Q dx
+        # from small-sample plug-in bias.
         function quad_entropy(d)
             lo, hi = d.x[1] - 20 / d.κ, d.x[end] + 20 / d.κ
             integrate(t -> (q = d(t); q > 0 ? -q * log(q) : 0.0), lo, hi)
@@ -1804,8 +1784,8 @@ end
         end
         @test issorted(negs; rev=true)
 
-        # Affine invariance: x ↦ a·x + b with κ ↦ κ/|a| is the corresponding fit (package's
-        # scale equivariance), and negentropy is invariant under it, for a > 0 and a < 0.
+        # Affine invariance: x ↦ a·x + b with κ ↦ κ/|a| maps the fit onto itself, and
+        # negentropy is invariant under it, for a > 0 and a < 0.
         Random.seed!(9)
         x = 1.7 .* randn(2_000) .+ 0.3
         κ0 = select_kappa_sensitivity(x)
@@ -1943,7 +1923,7 @@ end
 
     @testset "evaluation-point log-density gradient" begin
         # ∂ln Q̂(y)/∂y = 2ψ'(y)/ψ(y), against central finite differences away from the
-        # nodes (where ψ' — and hence the log-density slope — has a kink), across κ regimes.
+        # nodes (where ψ', and hence the log-density slope, has a kink), across κ regimes.
         nodes = [-1.3, -0.4, 0.2, 0.5, 1.1, 2.0]
         for κ in (0.3, 1.5, 8.0, 40.0)
             d = DensityEstimate(nodes, κ)
@@ -2097,8 +2077,7 @@ end
         x = randn(200)
         κ = 1.5
         d = DensityEstimate(x, κ)
-        # Far enough out that ψ itself is zero in double precision, which is the
-        # regime a log-density exists to serve.
+        # Far enough out that ψ is zero in Float64.
         far = [d.x[1] - 1500.0, d.x[1] - 700.0, d.x[end] + 700.0, d.x[end] + 1500.0]
         ℓ = PenalizedDensity._logdensity_sorted(d, sort(far))
         @test all(isfinite, ℓ)
@@ -2115,7 +2094,7 @@ end
                   2 * (log(d.ψ[end]) - d.κR * (t - d.x[end]))
         end
 
-        # Where the density has not underflowed the two routes must agree.
+        # Where the density has not underflowed the two routes agree.
         near = sort(d.x[1] .- [0.5, 2.0, 5.0])
         @test PenalizedDensity._logdensity_sorted(d, near) ≈ 2 .* log.(amplitude.(d, near))
     end
@@ -2131,8 +2110,8 @@ end
         @test all(isfinite, logdensity.(d, mid))
 
         # Deep inside the gap each arc is a pure exponential decay from its own node,
-        # ψ ≈ ψ_k e^{-κ(x - x_k)} + ψ_{k+1} e^{-κ(x_{k+1} - x)}, which pins the value
-        # without reference to the sinh recurrence.
+        # ψ ≈ ψ_k e^{-κ(x - x_k)} + ψ_{k+1} e^{-κ(x_{k+1} - x)}, which gives the value
+        # independently of the sinh recurrence.
         for t in mid
             k = searchsortedlast(xs, t)
             @test logdensity(d, t) ≈ 2 * logaddexp(log(d.ψ[k]) - κ * (t - xs[k]),
@@ -2148,7 +2127,7 @@ end
         ts = collect(range(d.x[1] - 3, d.x[end] + 3; length = 500))
         @test logdensity.(d, ts) ≈ 2 .* log.(amplitude.(d, ts))
 
-        # The scalar path and the sorted-batch sweep are two routes to one quantity.
+        # The scalar path and the sorted-batch sweep agree exactly.
         far = sort(vcat(ts, d.x[1] .- [1e4, 1500.0], d.x[end] .+ [1500.0, 1e4]))
         @test logdensity.(d, far) == PenalizedDensity._logdensity_sorted(d, far)
 
@@ -2264,7 +2243,7 @@ end
             @test gaussianize(d, -Inf) == -Inf && gaussianize(d, Inf) == Inf
         end
         @test_throws "the evaluation point must not be NaN" logdensity_eval_gradient(fits[1], NaN)
-        # Past a finite wall the conventions are the compact-support ones, not errors.
+        # Past a finite wall the compact-support conventions apply, without throwing.
         db = fits[2]
         @test db(-2.5) == 0 && logdensity(db, -2.5) == -Inf
         @test gaussianize(db, -2.5) == -Inf && gaussianize(db, 3.5) == Inf
@@ -2343,10 +2322,9 @@ end
 end
 
 @testset "bounded support (natural/Neumann boundary)" begin
-    # Independent reference fit: assembled from scratch with `tanh`/`sech` and `coth`/`csch`
-    # (Base's hyperbolic functions, not the package's e^{-2θ}-based stable forms), sharing no
-    # arithmetic with the bounded-support code under test. Mirrors the standalone derivation
-    # the closed forms below were checked against.
+    # Independent reference fit, assembled with Base's `tanh`/`sech` and `coth`/`csch` rather
+    # than the package's e^{-2θ}-based stable forms, sharing no arithmetic with the
+    # bounded-support code under test.
     _tail_diag_ref(κ, Δ) = isfinite(Δ) ? tanh(κ * Δ) : 1.0
     function _tail_mass_ref(ψ1, κ, Δ)
         isfinite(Δ) || return ψ1^2 / (2κ)
@@ -2384,7 +2362,7 @@ end
         return (; x = nodes, w = weights, ψ, κ, a, b)
     end
 
-    @testset "unbounded regression" begin
+    @testset "an infinite support reproduces the unbounded fit" begin
         Random.seed!(41)
         x = randn(1500)
         for κ in (0.7, 6.0)
@@ -2414,9 +2392,7 @@ end
     end
 
     @testset "_norm_sq_gram matches _norm_sq on a bounded fit" begin
-        # No caller yet threads a finite support into `_norm_sq_gram` (its only consumer,
-        # `_loo_density`, stays unbounded-only), but its generalized tail terms must already be
-        # self-consistent: Z = ψᵀGψ, and Z itself must agree with `_norm_sq`.
+        # With a finite support, Z = ψᵀGψ and Z agrees with `_norm_sq`.
         Random.seed!(47)
         x = sort(rand(30) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, 7.0; support=(0.0, 1.0))
@@ -2454,8 +2430,8 @@ end
     end
 
     @testset "derivatives of the interval mass coefficients" begin
-        # Against the closed coth/csch forms evaluated in BigFloat, where their cancellation
-        # costs nothing, over widths from near-coincident nodes to isolated points.
+        # Against the closed coth/csch forms evaluated in BigFloat, where cancellation does not
+        # limit accuracy, over widths from near-coincident nodes to isolated points.
         dθref(θ) = (cs = csch(θ); ct = coth(θ); (cs^2 * (θ * ct - 1), cs * (2ct - θ * (ct^2 + cs^2)) / 2))
         function dκref(θ)
             cs, ct = csch(θ), coth(θ)
@@ -2538,7 +2514,7 @@ end
     end
 
     @testset "cross-validation on a bounded fit" begin
-        @testset "unbounded regression" begin
+        @testset "an infinite support reproduces the unbounded selection" begin
             Random.seed!(51)
             x = randn(800)
             @test select_kappa(x) == select_kappa(x; support=(-Inf, Inf))
@@ -2550,9 +2526,8 @@ end
             x = sort(rand(300))
             d = DensityEstimate(x, 25.0; support=(0.0, 1.0))
             Q2 = PenalizedDensity._int_quartic(d.x, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi)
-            # Sum scale-matched sub-segments (node-to-node plus the two boundary segments)
-            # rather than one quadgk spanning the whole support, per the harness's spike-forest
-            # discipline: a single call can converge to a misleadingly small error estimate.
+            # Quadrature over each node-to-node and boundary segment: a single quadgk call over
+            # the whole support can return a misleadingly small error estimate.
             total = quadgk(t -> d(t)^2, d.lo, d.x[1]; rtol=1e-13)[1]
             for k in 1:length(d.x)-1
                 total += quadgk(t -> d(t)^2, d.x[k], d.x[k+1]; rtol=1e-13)[1]
@@ -2561,7 +2536,7 @@ end
             @test Q2 ≈ total rtol = 1e-10
         end
 
-        @testset "brute-force validation of the leave-one-out expansion" begin
+        @testset "leave-one-out expansion matches refits" begin
             function klcv_refit_b(nodes, weights, κ, lo, hi)
                 s = 0.0
                 for i in eachindex(nodes)
@@ -2583,8 +2558,8 @@ end
             # Exponential (a hard left edge) and uniform (both edges hard), N a few hundred, at
             # several κ including each family's own KLCV-selected scale. KLCV's equal per-node
             # weighting under the log is most sensitive to sparse tail nodes, so it gets the looser
-            # bound; on the uniform fit the score itself is ≈ 0 (Q ≈ 1, so ln Q̂ ≈ 0), where an
-            # absolute tolerance replaces a meaningless relative one.
+            # bound; on the uniform fit the score itself is ≈ 0 (Q ≈ 1, so ln Q̂ ≈ 0), so it gets
+            # an absolute tolerance.
             for (name, xgen, support) in (
                     ("exponential", rng -> -log.(1 .- rand(rng, 300)), (0.0, Inf)),
                     ("uniform",     rng -> rand(rng, 300),              (0.0, 1.0)))
@@ -2626,13 +2601,11 @@ end
             κ_unb = select_kappa(x)
             κ_bnd = select_kappa(x; support=(0.0, Inf))
             @test κ_bnd != κ_unb
-            @test κ_bnd < κ_unb    # the boundary itself represents the edge, so cross-validation
-                                    # asks for less compensating smoothing, not more
+            @test κ_bnd < κ_unb    # the wall represents the edge, so no large κ is needed to sharpen it
             nodes, w = PenalizedDensity._merge_presorted(sort(x), 0.0)
             klcv_bnd = PenalizedDensity._klcv(nodes, w, κ_bnd, κ_bnd, κ_bnd, 0.0, Inf)
             klcv_unb = PenalizedDensity._klcv(nodes, w, κ_unb, κ_unb, κ_unb, 0.0, Inf)
-            @test klcv_bnd < klcv_unb   # the bounded fit at its own selection beats it at the
-                                        # unbounded selection, on the bounded fit's own score
+            @test klcv_bnd < klcv_unb   # on the bounded score, the bounded selection scores better
         end
 
         @testset "select_kappa / select_kappa_lscv: input validation" begin
@@ -2707,7 +2680,7 @@ end
             db = bigfit(d)
             k = argmax(diff(d.x))           # the wide cell between the heavy and far nodes
             xs = range(d.x[k], d.x[k+1]; length=102)[2:end-1]
-            # gaussianize feeds Φ⁻¹ the smaller tail mass; it must carry full relative precision.
+            # gaussianize passes the smaller tail mass to Φ⁻¹, at full relative precision.
             for x in xs
                 mlo, mhi, mlob, mhib = cdfm(d, x), ccdfm(d, x), cdfm(db, big(x)), ccdfm(db, big(x))
                 m, mb = mlo <= mhi ? (mlo, mlob) : (mhi, mhib)
@@ -2765,7 +2738,7 @@ end
         @test do_(0.7) ≈ d(0.7)
     end
 
-    @testset "stress: extreme and vanishing boundary gaps" begin
+    @testset "extreme and vanishing boundary gaps" begin
         # θ_L ≈ 500: far past where raw cosh/sinh would overflow.
         d = DensityEstimate([0.0, 1.0], 1.0; support=(-500.0, 501.0))
         @test all(isfinite, d.ψ) && isfinite(d.λ)
@@ -2803,7 +2776,7 @@ end
 end
 
 @testset "goodness of fit: exact reference on a bounded fit" begin
-    @testset "unbounded regression" begin
+    @testset "an infinite support reproduces the unbounded reference" begin
         Random.seed!(60)
         x = randn(150)
         d = DensityEstimate(x, select_kappa_sensitivity(x))
@@ -2823,9 +2796,8 @@ end
     end
 
     @testset "Green's identity on bounded fits" begin
-        # 4Σᵢwᵢbᵢ/ψᵢ = 1 needs only Lψ_cl = 4Σ(wᵢ/ψᵢ)δ(x-xᵢ) and ∫ψ_cl² = 1 (see `green_identity`
-        # above), so it exercises the bounded `_node_alpha`/`_operator` together on constant and
-        # one- and two-sided supports.
+        # 4Σᵢwᵢbᵢ/ψᵢ = 1 (see `green_identity`) checks the bounded `_node_alpha` and `_operator`
+        # together on one- and two-sided supports.
         for (name, xgen, κ, support) in (
                 ("uniform, both walls",   rng -> rand(rng, 300),                    15.0, (0.0, 1.0)),
                 ("exponential, one wall", rng -> -log.(1 .- rand(rng, 300)),        12.0, (0.0, Inf)),
@@ -2841,10 +2813,9 @@ end
         @test green_identity(da) ≈ 1 rtol = 1e-5
     end
 
-    @testset "FD ground truth: m and ∫ψα converge to the closed forms at O(δ²)" begin
-        # As the unbounded suite's analogous check above, but the grid now runs exactly from
-        # `d.lo` to `d.hi` instead of a padded tail: the conservative stencil's Neumann condition
-        # falls out of ending the grid there, per `fieldmc_chisq`'s comment.
+    @testset "finite differences: m and ∫ψα converge to the closed forms at O(δ²)" begin
+        # As in the unbounded check above, but the grid runs from `d.lo` to `d.hi`; ending the
+        # conservative stencil there imposes the Neumann condition (see `fieldmc_chisq`).
         Random.seed!(62)
         x = sort(rand(60) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, 6.0; support=(0.0, 1.0))
@@ -2876,9 +2847,9 @@ end
         @test all(first(errs) ./ last(errs) .> 10)
     end
 
-    @testset "field Monte Carlo: bounded uniform (both walls, flagship)" begin
-        # The flagship case: a natural boundary makes the flat field exactly representable,
-        # which no unbounded or spatially-varying-κ fit could do.
+    @testset "field Monte Carlo: bounded uniform (both walls)" begin
+        # With natural boundaries a flat density is exactly representable; on an unbounded
+        # support it is not, for any constant or varying scale.
         Random.seed!(63)
         x = sort(rand(400) .* 0.6 .+ 0.2)
         d = DensityEstimate(x, select_kappa(x; support=(0.0, 1.0)); support=(0.0, 1.0))
@@ -2921,9 +2892,8 @@ end
 end
 
 @testset "select_kappa(x, Adaptive()): fixed support" begin
-    @testset "runs on a bounded domain and composes into a normalized fit" begin
-        # Exponential on its natural support: runs, and the returned scale composes into a
-        # normalized bounded fit.
+    @testset "on a bounded domain the selected scale gives a normalized fit" begin
+        # Exponential on its natural support.
         x = -log.(1 .- rand(Xoshiro(70), 500))
         κ = select_kappa(x, Adaptive(); support=(0.0, Inf))
         d = DensityEstimate(x, κ; support=(0.0, Inf))
@@ -2934,8 +2904,7 @@ end
         @test max(El, Ei, Er) < 1e-6
         @test abs(left + interior + right - 1) < 1e-6
 
-        # Uniform on its true (0, 1) support: the composed fit must normalize. On this sample the
-        # power family wins.
+        # Uniform on its true (0, 1) support. On this sample the power family is selected.
         xu = rand(Xoshiro(71), 500)
         κu = select_kappa(xu, Adaptive(); support=(0.0, 1.0))
         @test κu isa AdaptiveScale
@@ -2954,9 +2923,8 @@ end
 end
 
 @testset "select_support: joint boundary and κ selection" begin
-    # A Student-t(5)-like heavy-tailed draw and a two-component mixture, built from `randn`
-    # alone (no extra test dependency): t5 as a normal over the root-mean-square of five more
-    # normals, the classical variance-mixture construction.
+    # A Student-t(5) draw built from `randn`: a normal over the root-mean-square of five more
+    # normals.
     _t5(rng) = randn(rng) / sqrt(sum(abs2, randn(rng, 5)) / 5)
 
     @testset "smooth families decline in every replicate" begin
@@ -2969,8 +2937,7 @@ end
             x = gen(Xoshiro(hash((:smoothsupport, name, seed))))
             r = select_support(x)
             @test r.support == (-Inf, Inf)
-            # Structural, not coincidental: when neither side wins, the returned κ *is* the
-            # plain `select_kappa(x)` call, not merely close to it.
+            # When neither side gets a wall, the returned κ is identical to `select_kappa(x)`.
             @test r.κ === select_kappa(x)
         end
     end
@@ -3040,21 +3007,19 @@ end
     end
 
     @testset "_edge_spacing and _select_gap failure paths" begin
-        # Fewer than two points near the edge: unreachable through select_support itself (its
-        # upstream κ selection already demands at least two distinct points), so exercised
-        # directly, as the `_select_c` failure paths above are.
+        # Fewer than two points near the edge, tested directly: through select_support the κ
+        # selection rejects such data first.
         @test_throws ArgumentError PenalizedDensity._edge_spacing([5.0], :left)
         @test_throws "need at least two distinct points to seed a boundary search" PenalizedDensity._edge_spacing([5.0], :left)
 
-        # Ten points coincide at the left edge: zero spacing to seed a search from. Reachable
-        # through the public API when many duplicates sit at one edge. The default `kappa`
-        # refuses such heavily tied data first; accepting them as exact points reaches the edge.
+        # Ten points coincide at the left edge, leaving zero spacing to seed a search. The tie
+        # check refuses such data first; with resolution=0 they reach the edge check.
         x = vcat(fill(0.0, 10), [100.0])
         @test_throws "repeat another value" select_support(x)
         @test_throws ArgumentError select_support(x; resolution=0)
         @test_throws "the 10 points nearest the left edge coincide" select_support(x; resolution=0)
 
-        # `_select_gap`'s own two failure paths, driven by synthetic scores as `_select_c`'s are.
+        # `_select_gap`'s two failure paths, with synthetic scores.
         @test_throws PenalizedDensity.ConvergenceError PenalizedDensity._select_gap(gap -> NaN, 1.0)
         @test_throws "no resolvable boundary gap" PenalizedDensity._select_gap(gap -> NaN, 1.0)
         @test_throws PenalizedDensity.ConvergenceError PenalizedDensity._select_gap(gap -> -gap, 1.0)
@@ -3075,12 +3040,12 @@ end
         @test r1.κ === r2.κ && r1.support === r2.support
     end
 
-    @testset "efficiency (reported, not asserted — see the test log)" begin
+    @testset "select_support timing (logged, not tested)" begin
         xbig = randn(Xoshiro(74), 50_000)
         t1 = @elapsed select_kappa(xbig)
         t2 = @elapsed select_support(xbig)
         @info "select_support efficiency at N=50000" t_select_kappa=t1 t_select_support=t2 ratio=t2 / t1
-        @test isfinite(t2)   # the search completes; the timing itself is reported, not gated
+        @test isfinite(t2)   # the search completes
     end
 end
 
