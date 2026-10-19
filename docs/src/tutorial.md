@@ -336,32 +336,32 @@ wrong(x) = exp(-((x - 0.5) / 2.5)^2 / 2) / (2.5 * sqrt(2π))   # a single broad 
 
 The true mixture yields a far smaller ``\chi^2`` than the mismatched single Gaussian.
 To judge significance, build the reference distribution of ``\chi^2`` for the fit once with
-[`chisq_reference`](@ref); by default it is evaluated as the finite-``N`` generalized
+[`ChisqReference`](@ref); by default it is evaluated as the finite-``N`` generalized
 chi-squared law. [`pvalue`](@ref) turns each statistic into a significance under it, and one
 reference serves any number of trial densities:
 
 ```@example tutorial
-ref = chisq_reference(d)
+ref = ChisqReference(d)
 (p_correct = round(pvalue(ref, chisq(d, truepdf)); digits = 3),
  p_incorrect = round(pvalue(ref, chisq(d, wrong)); digits = 6))
 ```
 
 The single Gaussian is decisively rejected; the true mixture is not. [`chisq_pdf`](@ref) and
 [`chisq_ccdf`](@ref) give the reference density and upper-tail probability, and
-[`expected_chisq`](@ref) its mean:
+[`mean`](@ref Statistics.mean)`(ref)` its exact mean:
 
 ```@example tutorial
-round(expected_chisq(ref); digits = 2)
+round(mean(ref); digits = 2)
 ```
 
 The reference law is exact for the Gaussian fluctuation field of the Laplace approximation
 about the fit, and `method = :exact` evaluates it at finite ``N``, taking no large-``N``
-limit. See [`chisq_reference`](@ref) for context and more information.
+limit. See [`ChisqReference`](@ref) for context and more information.
 
 The exact law is a per-call integral (Imhof inversion): accurate, but tens of milliseconds
 apiece. Passing `method = :largeN` selects instead the closed-form inverse-Gaussian (Wald)
 shape of the original paper's large-``N`` limit, parameterized by the mean
-[`expected_chisq`](@ref); it costs microseconds, so a large batch of trial densities against
+`mean(ref)`; it costs microseconds, so a large batch of trial densities against
 one fit is far cheaper. Anchored to that mean, it tracks the exact tail closely rather
 than overstating it:
 
