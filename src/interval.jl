@@ -1702,20 +1702,6 @@ function _cell_qlogq(d::IntervalDensityEstimate{T}, c::Int) where {T}
     return first(quadgk(f, d.x[c], d.x[c+1]; rtol, atol = rtol * _cell_mass(d, c)))
 end
 
-"""
-    entropy(d::IntervalDensityEstimate) -> Ĥ
-
-Plug-in estimate of the differential entropy `H(Q) = -∫ Q ln Q dx` of the fitted density,
-
-    Ĥ = -(1/N) [Σᵢ wᵢ ln Q(xᵢ) + Σⱼ rⱼ ⟨ln Q⟩_Bⱼ],   ⟨ln Q⟩_B = ∫_B Q ln Q dx / ∫_B Q dx,
-
-where `wᵢ` counts the point observations at `xᵢ`, `rⱼ` the observations in interval `Bⱼ`, and
-`N = Σ wᵢ + Σ rⱼ`. An interval observation contributes the fit's mean of `ln Q` over its
-interval, the expected value of the `ln Q(xᵢ)` its unrecorded value would have contributed. As
-an interval shrinks to a point this becomes the point term, so with point observations only
-`Ĥ` equals [`entropy`](@ref)`(DensityEstimate(x, κ))`. A censored observation is handled the
-same way; on an unbounded tail `⟨ln Q⟩ = ln Q(x_edge) - 1` exactly.
-"""
 function entropy(d::IntervalDensityEstimate{T}) where {T}
     s = zero(T)
     n = zero(T)
@@ -1731,18 +1717,6 @@ function entropy(d::IntervalDensityEstimate{T}) where {T}
     return -s / n
 end
 
-"""
-    action(d::IntervalDensityEstimate) -> S
-
-Classical action of the fitted density,
-
-    S = N - λ - Σᵢ wᵢ ln Q(xᵢ) - Σⱼ rⱼ ln Pⱼ,
-
-the interval counterpart of [`action`](@ref)`(::DensityEstimate)`: `wᵢ` counts the point
-observations at `xᵢ`, `rⱼ` the observations in interval `Bⱼ`, `Pⱼ = ∫_Bⱼ Q dx` is the fitted
-probability of `Bⱼ`, and `N = Σ wᵢ + Σ rⱼ`. At the fit the roughness term
-`∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the action to this form.
-"""
 function action(d::IntervalDensityEstimate{T}) where {T}
     total = d.total
     S = -d.λ

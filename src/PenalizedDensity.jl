@@ -1959,29 +1959,47 @@ pairs; `first.(r)` and `last.(r)` unpack it. The plain derivative `dy/dx` is `ex
 gaussianize_logjacobian(d::AbstractDensityEstimate, x::Real) = _gaussianize_logjac(d, x)
 
 """
-    action(d::DensityEstimate) -> S
+    action(d::AbstractDensityEstimate) -> S
 
-Classical action `S[ψ_cl] = N - λ - Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
-where `N = Σ wᵢ`. Used by [`select_kappa_sensitivity`](@ref).
+Classical action `S[ψ_cl]` (Eq. 10) of the fitted density,
+
+    S = N - λ - Σᵢ wᵢ ln Q(xᵢ) - Σⱼ rⱼ ln Pⱼ,
+
+where `wᵢ` counts the point observations at `xᵢ`, and, for an
+[`IntervalDensityEstimate`](@ref), `rⱼ` counts the observations in interval `Bⱼ` and
+`Pⱼ = ∫_Bⱼ Q dx` is the fitted probability of `Bⱼ`; `N = Σ wᵢ + Σ rⱼ`. At the fit the
+roughness term `∫ (λ/κ²)(ψ')² dx` equals `N - λ`, which is what reduces the action to this
+form. Used by [`select_kappa_sensitivity`](@ref).
 """
+action(d::AbstractDensityEstimate)
+
 function action(d::DensityEstimate)
     N = sum(d.w)
     return N - d.λ - sum(d.w .* log.(d.ψ.^2))
 end
 
 """
-    entropy(d::DensityEstimate) -> Ĥ
+    entropy(d::AbstractDensityEstimate) -> Ĥ
 
 Plug-in estimate of the differential entropy `H(Q) = -∫ Q ln Q dx` of the fitted density,
 
-    Ĥ = -(1/W) Σᵢ wᵢ ln Q(xᵢ) = -(2/W) Σᵢ wᵢ ln ψ(xᵢ),
+    Ĥ = -(1/N) [Σᵢ wᵢ ln Q(xᵢ) + Σⱼ rⱼ ⟨ln Q⟩_Bⱼ],   ⟨ln Q⟩_B = ∫_B Q ln Q dx / ∫_B Q dx,
 
-where `W = Σᵢ wᵢ`. Evaluating `ln Q` at the data rather than integrating it exactly avoids a
-second quadrature pass and is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at
-small `W`: for the one-point fit (a Laplace density with rate `2κ`), `Ĥ = -ln κ` against the
-exact `H = 1 - ln κ`. An [`IntervalDensityEstimate`](@ref) extends the sum to interval
-observations. See [`negentropy`](@ref).
+where `wᵢ` counts the point observations at `xᵢ`, and, for an
+[`IntervalDensityEstimate`](@ref), `rⱼ` counts the observations in interval `Bⱼ`;
+`N = Σ wᵢ + Σ rⱼ`. Evaluating `ln Q` at the data rather than integrating it over the whole
+line is consistent (`Ĥ → H(Q)` as the sample grows), but it is biased at small `N`: for the
+one-point fit (a Laplace density with rate `2κ`), `Ĥ = -ln κ` against the exact
+`H = 1 - ln κ`.
+
+An interval observation contributes the fit's mean of `ln Q` over its interval, the expected
+value of the `ln Q(xᵢ)` its unrecorded value would have contributed. As an interval shrinks to
+a point this becomes the point term, so an interval fit to point observations only has the
+same `Ĥ` as `DensityEstimate(x, κ)`. A censored observation is handled the same way; on an
+unbounded tail `⟨ln Q⟩ = ln Q(x_edge) - 1` exactly. See [`negentropy`](@ref).
 """
+entropy(d::AbstractDensityEstimate)
+
 function entropy(d::DensityEstimate)
     W = sum(d.w)
     return -2 * sum(d.w .* log.(d.ψ)) / W
