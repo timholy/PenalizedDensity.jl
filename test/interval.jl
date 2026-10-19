@@ -154,7 +154,7 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test di.λ ≈ d.λ rtol = 1e-12
             ts = range(-5, 5; length=101)
             @test di.(ts) ≈ d.(ts) rtol = 1e-11
-            @test cdf(di, ts) ≈ cdf(d, ts) rtol = 1e-11
+            @test cdf.(di, ts) ≈ cdf.(d, ts) rtol = 1e-11
             @test mean(di) ≈ mean(d) rtol = 1e-11
             @test var(di) ≈ var(d) rtol = 1e-11
             xe = randn(Xoshiro(4), 30)
@@ -164,11 +164,11 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test entropy(di, xe) ≈ entropy(d, xe) rtol = 1e-10
             @test negentropy(di, xe) ≈ negentropy(d, xe) rtol = 1e-8
             tin = filter(t -> support[1] < t < support[2], ts)
-            @test logdensity_eval_gradient(di, tin) ≈ logdensity_eval_gradient(d, tin) rtol = 1e-10
-            y = gaussianize(d, tin)
-            @test gaussianize(di, tin) ≈ y rtol = 1e-12
-            @test ungaussianize(di, y) ≈ ungaussianize(d, y) rtol = 1e-12
-            @test gaussianize_logjacobian(di, tin).logjac ≈ gaussianize_logjacobian(d, tin).logjac rtol = 1e-12
+            @test logdensity_eval_gradient.(di, tin) ≈ logdensity_eval_gradient.(d, tin) rtol = 1e-10
+            y = gaussianize.(d, tin)
+            @test gaussianize.(di, tin) ≈ y rtol = 1e-12
+            @test ungaussianize.(di, y) ≈ ungaussianize.(d, y) rtol = 1e-12
+            @test last.(gaussianize_logjacobian.(di, tin)) ≈ last.(gaussianize_logjacobian.(d, tin)) rtol = 1e-12
         end
     end
 
@@ -236,18 +236,18 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             edges = [lo; breaks; hi]
             @test sum(quadgk(d, edges[i], edges[i+1]; rtol=1e-12)[1] for i in 1:length(edges)-1 if edges[i] < edges[i+1]) ≈ 1 rtol = 1e-10
             xs = range(first(d.x) - 1, last(d.x) + 1; length=301)
-            F = cdf(d, xs)
+            F = cdf.(d, xs)
             @test issorted(F)
             @test cdf(d, lo) == 0 && cdf(d, hi) == 1
             for x in xs[1:50:end]
                 @test F[findfirst(==(x), xs)] ≈ quadgk(d, lo, x; rtol=1e-12)[1] atol = 1e-9
             end
             qs = [1e-8, 0.01, 0.3, 0.5, 0.77, 0.999, 1 - 1e-9]
-            @test cdf(d, quantile(d, qs)) ≈ qs rtol = 1e-9
+            @test cdf.(d, quantile.(d, qs)) ≈ qs rtol = 1e-9
             @test quantile(d, 0.0) == lo && quantile(d, 1.0) == hi
             inside = filter(x -> lo < x < hi, xs)
-            @test logdensity(d, inside) ≈ log.(d.(inside))
-            @test amplitude(d, inside) .^ 2 ≈ d.(inside)
+            @test logdensity.(d, inside) ≈ log.(d.(inside))
+            @test amplitude.(d, inside) .^ 2 ≈ d.(inside)
             @test amplitude(d, inside[1])^2 ≈ d(inside[1])
         end
         d = IntervalDensityEstimate(rounded_intervals(; support=(-1.625, 2.125))..., 3.0; support=(-1.625, 2.125))
@@ -327,7 +327,7 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
             @test PenalizedDensity._log_geomean(d) == -entropy(d)
             @test negentropy(d) ≈ log(2π * ℯ * var(d)) / 2 - entropy(d) rtol = 1e-12
             @test negentropy(d, xe) ≈ log(2π * ℯ * var(xe; corrected=false)) / 2 - entropy(d, xe) rtol = 1e-12
-            @test entropy(d, xe) ≈ -mean(logdensity(d, xe)) rtol = 1e-12
+            @test entropy(d, xe) ≈ -mean(logdensity.(d, xe)) rtol = 1e-12
             # The action from its definition: the roughness term (with ψ' by central differences)
             # plus the likelihood terms. Skipped on the finely rounded fit, whose thousands of
             # cells make the differenced quadrature slow.
@@ -396,14 +396,14 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         for (name, d) in pairs(fits)
             lo, hi = max(d.lo, d.x[1] - 3), min(d.hi, d.x[end] + 3)
             ts = range(lo + 1e-3, hi - 1e-3; length=401)
-            y = gaussianize(d, ts)
+            y = gaussianize.(d, ts)
             @test issorted(y)
-            @test ungaussianize(d, y) ≈ ts rtol = 1e-12
-            @test Distributions.cdf.(Distributions.Normal(), y) ≈ cdf(d, ts) rtol = 1e-12
-            lj = gaussianize_logjacobian(d, ts)
-            @test lj.y == y
-            fd = log.((gaussianize(d, ts .+ h) .- gaussianize(d, ts .- h)) ./ (2h))
-            @test lj.logjac ≈ fd rtol = 1e-6
+            @test ungaussianize.(d, y) ≈ ts rtol = 1e-12
+            @test Distributions.cdf.(Distributions.Normal(), y) ≈ cdf.(d, ts) rtol = 1e-12
+            lj = gaussianize_logjacobian.(d, ts)
+            @test first.(lj) == y
+            fd = log.((gaussianize.(d, ts .+ h) .- gaussianize.(d, ts .- h)) ./ (2h))
+            @test last.(lj) ≈ fd rtol = 1e-6
             # Between the last two nodes the upper mass is assembled from the right.
             total = quadgk(d, d.lo, d.x..., d.hi; rtol=1e-14)[1]
             for t in range(d.x[end-1], d.x[end]; length=7)[2:end]
@@ -494,20 +494,20 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         end
         # Partial cell masses inside occupied cells with k² < 0 use Gauss–Legendre in Float32.
         @test any(<(0), d32.k2)
-        @test cdf(d32, Float32.(ts)) ≈ cdf(d64, ts) rtol = 1e-5
+        @test cdf.(d32, Float32.(ts)) ≈ cdf.(d64, ts) rtol = 1e-5
         lower, upper = rounded_intervals(extra=[0.0625, 3.0])
         d = IntervalDensityEstimate(lower, upper, 3.0)
         @test IntervalDensityEstimate(OffsetArray(lower, -7), OffsetArray(upper, -7), 3.0).ψ == d.ψ
         @test IntervalDensityEstimate(view(lower, :), view(upper, :), 3.0).ψ == d.ψ
         @test IntervalDensityEstimate(OffsetArray(x, 5), 3.0; resolution=0.1).ψ == d64.ψ
         q = OffsetArray([0.1, 0.2], 3)
-        @test axes(cdf(d, q)) == axes(q)
-        @test axes(quantile(d, q)) == axes(q)
-        @test axes(logdensity(d, q)) == axes(q)
-        @test axes(logdensity_eval_gradient(d, q)) == axes(q)
-        @test axes(gaussianize(d, q)) == axes(q)
-        @test axes(ungaussianize(d, q)) == axes(q)
-        @test axes(gaussianize_logjacobian(d, q).logjac) == axes(q)
+        @test axes(cdf.(d, q)) == axes(q)
+        @test axes(quantile.(d, q)) == axes(q)
+        @test axes(logdensity.(d, q)) == axes(q)
+        @test axes(logdensity_eval_gradient.(d, q)) == axes(q)
+        @test axes(gaussianize.(d, q)) == axes(q)
+        @test axes(ungaussianize.(d, q)) == axes(q)
+        @test axes(gaussianize_logjacobian.(d, q)) == axes(q)
         @test_throws DimensionMismatch IntervalDensityEstimate([0.0, 1.0], [1.0], 1.0)
     end
 
@@ -563,9 +563,12 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test nobs(IntervalDensityEstimate(xp, xp, 1.0)) == nobs(DensityEstimate(xp, 1.0)) == 4
         @test nobs(IntervalDensityEstimate(Float32[0, 1], Float32[0.5, 2], 1.0f0)) isa Float32
 
-        f = Any[getfield(d, n) for n in fieldnames(typeof(d))]
+        # The stored node cumulatives (the last three fields) are assembled, not passed.
+        f = Any[getfield(d, n) for n in fieldnames(typeof(d))[1:end-3]]
         IDE = typeof(d)
-        @test IDE(f...).ψ == d.ψ
+        d2 = IDE(f...)
+        @test d2.ψ == d.ψ
+        @test d2.F == d.F && d2.G == d.G && d2.total == d.total
         bad = copy(f); bad[2] = d.w[1:end-1]
         @test_throws "equal length" IDE(bad...)
         bad = copy(f); bad[4] = [d.k2; 0.0]
@@ -602,8 +605,7 @@ function held_out_refit(lower, upper, κ; support=(-Inf, Inf))
         d = IntervalDensityEstimate(lower[keep], upper[keep], κ; support)
         ia, ib = searchsortedfirst(d.x, a), searchsortedfirst(d.x, b)
         if ib <= length(d.x) && d.x[ia] == a && d.x[ib] == b     # interval still bounded by nodes
-            F, total = PenalizedDensity._node_cdf(d)
-            log(sum(c -> PenalizedDensity._cell_mass(d, c), ia:ib-1) / total)
+            log(sum(c -> PenalizedDensity._cell_mass(d, c), ia:ib-1) / d.total)
         else
             log(cdf(d, b) - cdf(d, a))
         end
@@ -774,9 +776,8 @@ end
             L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), -Inf, Inf)
             lp, _ = PenalizedDensity._interval_loo(L)
             d = IntervalDensityEstimate(lower[1:end-1], upper[1:end-1], κ)
-            _, total = PenalizedDensity._node_cdf(d)
             ref = 2log(d.ψ[end]) - log(2d.kR) - 2d.kR * (6.0 - d.x[end]) +
-                  log(-expm1(-2d.kR * 0.25)) - log(total)
+                  log(-expm1(-2d.kR * 0.25)) - log(d.total)
             @test lp[end] ≈ ref atol = 0.02
             @test isfinite(PenalizedDensity._interval_klcv(L))
             lo2 = [lower[1:end-1]; -4.0]
