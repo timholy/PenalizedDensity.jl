@@ -1622,10 +1622,10 @@ function _cell_mass(d::IntervalDensityEstimate{T}, c::Int) where {T}
     return n11 * (d.ψ[c]^2 + d.ψ[c+1]^2) + 2n12 * d.ψ[c] * d.ψ[c+1]
 end
 
-# ∫ψ² over [x_c, x] (fromleft) or [x, x_{c+1}] on interior cell c, meant for the half of the cell
-# nearer the node integrated from. Hyperbolic cells use the exact antiderivative; trigonometric
-# ones Gauss–Legendre quadrature, which is exact to roundoff because ψ² there is a
-# trigonometric polynomial of frequency below 2π over the cell.
+# ∫ψ² over [x_c, x] (fromleft) or [x, x_{c+1}] on interior cell c, for any x in the cell.
+# Hyperbolic cells use the exact antiderivative; trigonometric ones Gauss–Legendre quadrature,
+# which is exact to roundoff because ψ² there is a trigonometric polynomial of frequency below
+# 2π over the cell.
 function _cell_partial_mass(d::IntervalDensityEstimate{T}, c::Int, x::T, fromleft::Bool) where {T}
     x0, x1 = d.x[c], d.x[c+1]
     k2 = d.k2[c]
@@ -1650,13 +1650,22 @@ const _GAUSS16_F64 = gauss(Float64, 16)
 _gauss16(::Type{Float64}) = _GAUSS16_F64
 
 # Unnormalized mass below (`_cdf_mass_interior`) or above (`_ccdf_mass_interior`) x in interior
-# cell c, integrated from the nearer node so that its absolute error vanishes toward both nodes.
-_cdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T} =
-    x - d.x[c] <= d.x[c+1] - x ? d.F[c] + _cell_partial_mass(d, c, x, true) :
-                                 d.F[c+1] - _cell_partial_mass(d, c, x, false)
-_ccdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T} =
-    d.x[c+1] - x <= x - d.x[c] ? d.G[c+1] + _cell_partial_mass(d, c, x, false) :
-                                 d.G[c] - _cell_partial_mass(d, c, x, true)
+# cell c, integrated from the nearer node so that its absolute error vanishes toward both nodes,
+# and from the farther one when subtracting would cancel, as for `DensityEstimate`.
+function _cdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T}
+    F = d.F
+    x - d.x[c] <= d.x[c+1] - x && return F[c] + _cell_partial_mass(d, c, x, true)
+    m = F[c+1] - _cell_partial_mass(d, c, x, false)
+    (2 * F[c] >= F[c+1] || 2 * m >= F[c+1]) && return m
+    return F[c] + _cell_partial_mass(d, c, x, true)
+end
+function _ccdf_mass_interior(d::IntervalDensityEstimate{T}, c::Int, x::T) where {T}
+    G = d.G
+    d.x[c+1] - x <= x - d.x[c] && return G[c+1] + _cell_partial_mass(d, c, x, false)
+    m = G[c] - _cell_partial_mass(d, c, x, true)
+    (2 * G[c+1] >= G[c] || 2 * m >= G[c]) && return m
+    return G[c+1] + _cell_partial_mass(d, c, x, false)
+end
 
 """
     cdf(d::IntervalDensityEstimate, x)
