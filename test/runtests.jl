@@ -2096,9 +2096,37 @@ end
     @testset "error model: NaN throws, non-convergence throws ConvergenceError" begin
         # NaN observations, in every form that takes data.
         @test_throws ArgumentError DensityEstimate([0.0, NaN, 1.0], 1.0)
-        @test_throws "observations must not be NaN" DensityEstimate([0.0, NaN, 1.0], 1.0)
-        @test_throws "observations must not be NaN" select_kappa([0.0, NaN, 1.0, 2.0])
-        @test_throws "observations must not be NaN" IntervalDensityEstimate([0.0, NaN, 1.0], 1.0; resolution=1.0)
+        @test_throws "observations must be finite, got NaN" DensityEstimate([0.0, NaN, 1.0], 1.0)
+        @test_throws "observations must be finite, got NaN" select_kappa([0.0, NaN, 1.0, 2.0])
+        @test_throws "observations must be finite, got NaN" IntervalDensityEstimate([0.0, NaN, 1.0], 1.0; resolution=1.0)
+
+        # ±Inf point observations, in every form that takes points; ±Inf interval bounds are
+        # censoring and stay legal.
+        xinf = [-1.3, -0.2, 0.4, 0.9, 2.1, Inf]
+        msg = "observations must be finite, got Inf"
+        @test_throws ArgumentError DensityEstimate(xinf, 1.0)
+        @test_throws msg DensityEstimate(xinf, 1.0)
+        @test_throws "observations must be finite, got -Inf" DensityEstimate(-xinf, 1.0)
+        @test_throws msg DensityEstimate(xinf, 1.0; support=(-2.0, Inf))
+        @test_throws msg DensityEstimate(xinf, t -> 1 + t^2 / 4)
+        @test_throws msg DensityEstimate{Float32}(xinf, 1.0)
+        @test_throws "observation 1.0e300 overflows Float32" DensityEstimate{Float32}([0.0, 1.0, 1e300], 1.0)
+        @test_throws msg PenalizedDensity.merge_samples(xinf, 1.0)
+        @test_throws msg PenalizedDensity.merge_samples(xinf, t -> 1.0)
+        @test_throws msg select_kappa(xinf)
+        @test_throws msg select_kappa(xinf; kappas=[0.5, 1.0, 2.0])
+        @test_throws msg select_kappa(xinf, Adaptive())
+        @test_throws msg select_kappa([0.0, 1.0, 2.0, Inf], Adaptive(); resolution=1.0)
+        @test_throws msg PenalizedDensity.select_kappa_lscv(xinf)
+        @test_throws msg PenalizedDensity.select_kappa_sensitivity(xinf)
+        @test_throws msg PenalizedDensity.klcv(xinf, 1.0)
+        @test_throws msg PenalizedDensity.lscv(xinf, 1.0)
+        @test_throws msg select_support(xinf)
+        @test_throws msg IntervalDensityEstimate([0.0, 1.0, Inf], 1.0; resolution=1.0)
+        @test_throws msg select_kappa([0.0, 1.0, 2.0, Inf]; resolution=1.0)
+        @test_throws msg PenalizedDensity.klcv([0.0, 1.0, 2.0, Inf], 1.0; resolution=1.0)
+        @test_throws "point observation" IntervalDensityEstimate([0.0, Inf], [1.0, Inf], 1.0)
+        @test IntervalDensityEstimate([-Inf, 0.0, 1.0], [0.0, 1.0, Inf], 1.0) isa IntervalDensityEstimate
 
         # NaN evaluation points, for every evaluator and every kind of fit; ±Inf keep their
         # limits.
