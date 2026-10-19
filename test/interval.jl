@@ -824,8 +824,17 @@ end
         κgrid = grid[argmin(refit_score.(grid))]
         @test κgrid / 1.2 < κ < κgrid * 1.2
         # The default grid stays below the fit's accuracy limit.
-        @test maximum(PenalizedDensity._default_interval_κs(lower, upper)) * δr <= eps()^(-1 / 4) / 2
-        @test PenalizedDensity._default_interval_κs([0.0, 0.0, 1.0], [0.0, 1.0, Inf]) isa AbstractVector
+        κs, κmax = PenalizedDensity._default_interval_κs(lower, upper)
+        @test maximum(κs) <= κmax ≈ eps()^(-1 / 4) / (2δr)
+        @test first(PenalizedDensity._default_interval_κs([0.0, 0.0, 1.0], [0.0, 1.0, Inf])) isa AbstractVector
+        # A large sample rounded to a few cells is best fit by its histogram: the minimum sits
+        # at the accuracy limit, which the default grid accepts and a given grid reports.
+        zc = round.(4 .* rand(Xoshiro(3), 100_000))
+        lc, uc = PenalizedDensity._lattice_bounds(zc, 1.0, (-Inf, Inf))
+        κsc, κmaxc = PenalizedDensity._default_interval_κs(lc, uc)
+        κc = select_kappa(zc; resolution=1.0)
+        @test 0.9κmaxc < κc <= κmaxc
+        @test_throws "at the upper end of kappas" select_kappa(lc, uc; kappas=κsc)
         # Censored and mixed observations, through the bounds form.
         lc, uc = rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), cens=(1.375, 6), seed=4)
         @test 0 < select_kappa(lc, uc) < Inf

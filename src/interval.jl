@@ -1221,16 +1221,17 @@ function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Rea
                       support::Tuple{Real,Real}=(-Inf, Inf),
                       rtol::Real=cbrt(eps(float(promote_type(eltype(lower), eltype(upper))))),
                       holdout::Symbol=:location,
-                      kappas::AbstractVector{<:Real}=_default_interval_κs(lower, upper))
+                      kappas::Union{Nothing,AbstractVector{<:Real}}=nothing)
     _check_rtol(rtol)
     a, b = _check_support_bounds(support)
     _check_bounds_axes(lower, upper)
-    _check_kappa_grid(kappas)
+    κs, κmax = kappas === nothing ? _default_interval_κs(lower, upper) : (_check_kappa_grid(kappas), Inf)
     T = float(promote_type(eltype(lower), eltype(upper), typeof(rtol),
                            _support_eltype(a), _support_eltype(b)))
     r, slo, shi = T(rtol), T(a), T(b)
     lu, uu, counts = _tally_intervals(lower, upper, T)
-    return _minimize_on_grid(κ -> _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout), kappas, T)
+    return _minimize_on_grid(κ -> _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout), κs, T;
+                             extend=kappas === nothing, κmin=_kappa_floor(slo, shi), κmax)
 end
 
 function klcv(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ::Real;
@@ -1271,9 +1272,9 @@ function _tally_intervals(lower::AbstractVector, upper::AbstractVector, ::Type{T
     return lu, uu, counts
 end
 
-# Geometric κ grid for interval data: from one blob over the finite bounds up to one scale per
-# observation, stopping where κ times the widest finite interval reaches half the fit's accuracy
-# limit (`_check_resolvable`).
+# Geometric κ grid for interval data, from one blob over the finite bounds up to one scale per
+# observation, and the largest κ an extension of it may reach: where κ times the widest finite
+# interval reaches half the fit's accuracy limit (`_check_resolvable`). The grid stops there too.
 function _default_interval_κs(lower::AbstractVector, upper::AbstractVector)
     T = float(promote_type(eltype(lower), eltype(upper)))
     lo, hi = T(Inf), T(-Inf)
@@ -1287,9 +1288,9 @@ function _default_interval_κs(lower::AbstractVector, upper::AbstractVector)
     end
     span = hi - lo
     span > 0 || throw(ArgumentError("need at least two distinct finite bounds to select κ"))
-    κhi = 5 * length(lower) / span
-    wmax > 0 && (κhi = min(κhi, eps(T)^(-1 // 4) / (2wmax)))
-    return exp.(range(log(T(0.5) / span), log(κhi); length = 40))
+    κmax = wmax > 0 ? eps(T)^(-1 // 4) / (2wmax) : T(Inf)
+    κhi = min(5 * length(lower) / span, κmax)
+    return exp.(range(log(T(0.5) / span), log(κhi); length = 40)), κmax
 end
 
 # ---------------------------------------------------------------------------------------------

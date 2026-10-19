@@ -2660,15 +2660,6 @@ function _default_κs(x::AbstractVector{<:Real})
     return exp.(range(log(T(0.5) / span), log(5 * length(x) / span); length = 40))
 end
 
-# The default grid of `select_kappa(x; resolution, support)`: rounded values are fitted as
-# intervals, so they get the interval grid.
-function _default_κs(x::AbstractVector{<:Real}, resolution, support)
-    _is_rounded(resolution) || return _default_κs(x)
-    isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
-    T = float(eltype(x))
-    return _default_interval_κs(_lattice_bounds(x, T(resolution), support)...)
-end
-
 # Whether the selectors' `resolution` asks for the interval likelihood: `nothing` (exact points,
 # checked for ties) and `0` (exact points, unchecked) do not; a positive lattice spacing does.
 function _is_rounded(resolution)
@@ -2679,13 +2670,12 @@ function _is_rounded(resolution)
 end
 
 """
-    select_kappa_sensitivity(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
+    select_kappa_sensitivity(x; kappas=nothing, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
 the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. the `κ`
 minimizing [`action_sensitivity`](@ref)`(x, κ) = |dS/d ln κ|` (Fig. 1 of the paper). `kappas`
-must be sorted and positive, with at least three values to bracket the minimum, and defaults to
-a geometric range scaled to the data's extent.
+is the grid that brackets the search, as for [`select_kappa`](@ref).
 
 This criterion resolves *information* and over-resolves smooth densities; to target estimation error instead, use [`select_kappa`](@ref) (or
 [`select_kappa_lscv`](@ref)); for rounded data, pass the rounding increment to `select_kappa` as
@@ -2703,11 +2693,12 @@ optimum: `S` has no exact stationary point in `κ`, so the flattest point depend
 sensitivity in `ln κ`.
 """
 function select_kappa_sensitivity(x::AbstractVector{<:Real};
-                                  kappas::AbstractVector{<:Real}=_default_κs(x),
+                                  kappas::Union{Nothing,AbstractVector{<:Real}}=nothing,
                                   rtol::Real=cbrt(eps(float(eltype(x)))))
-    _check_kappa_grid(kappas)
+    κs = kappas === nothing ? _default_κs(x) : _check_kappa_grid(kappas)
     xs, r = _sensitivity_sample(x, rtol)
-    return _minimize_on_grid(κ -> _action_sensitivity(xs, r, κ), kappas, eltype(xs))
+    return _minimize_on_grid(κ -> _action_sensitivity(xs, r, κ), κs, eltype(xs);
+                             extend=kappas === nothing)
 end
 
 """
@@ -2885,7 +2876,7 @@ function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
 end
 
 """
-    select_kappa_lscv(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T)), support=(-Inf, Inf),
+    select_kappa_lscv(x; kappas=nothing, rtol=cbrt(eps(T)), support=(-Inf, Inf),
                       resolution=nothing, holdout=:location) -> κ
 
 Choose the smoothing scale by least-squares cross-validation: return the `κ` minimizing
@@ -2912,11 +2903,11 @@ segments, and each leave-one-out density `Q̂_{-i}(xᵢ)` from the same leave-on
 [`select_kappa`](@ref) uses, so no per-point refitting is needed. The score is minimized by a
 golden-section search over `ln κ`, bracketed by the grid `kappas`.
 """
-function select_kappa_lscv(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
+function select_kappa_lscv(x::AbstractVector{<:Real}; kappas::Union{Nothing,AbstractVector{<:Real}}=nothing,
                            rtol::Real=cbrt(eps(float(eltype(x)))), support::Tuple{Real,Real}=(-Inf, Inf),
                            resolution::Union{Real,Nothing}=nothing, holdout::Symbol=:location)
     _check_lscv_resolution(resolution, "select_kappa_lscv")
-    return _select_by_score(_lscv, x, kappas, rtol, support; holdout, checkties=resolution === nothing)
+    return first(_select_by_score(_lscv, x, kappas, rtol, support; holdout, checkties=resolution === nothing))
 end
 
 """
@@ -2943,9 +2934,9 @@ _check_lscv_resolution(resolution, fname) = _is_rounded(resolution) &&
 
 """
     select_kappa(x; support=(-Inf, Inf), rtol=cbrt(eps(T)), resolution=nothing,
-                 holdout=:location, kappas=<data-scaled grid>) -> κ::T
+                 holdout=:location, kappas=nothing) -> κ::T
     select_kappa(lower, upper; support=(-Inf, Inf), rtol=cbrt(eps(T)), holdout=:location,
-                 kappas=<data-scaled grid>) -> κ::T
+                 kappas=nothing) -> κ::T
 
 Choose a constant smoothing scale for [`DensityEstimate`](@ref)`(x, κ; support, rtol)` (or, for
 interval data, [`IntervalDensityEstimate`](@ref)) by Kullback–Leibler (likelihood)
@@ -2981,10 +2972,16 @@ default) all observations at the held-out value, `:observation` just one of them
 when every value is distinct. On tied data leaving out a single copy rewards density spikes at
 the repeated values. Interval observations are always left out one at a time.
 
-`kappas` is the grid that brackets the search. It must be sorted and positive, with at least
-three values, and defaults to a geometric range scaled to the data's extent. For interval data
-the default grid stops where `κ` times the widest interval reaches 4096, beyond which the fit is
-at its histogram limit and cannot be computed accurately.
+`kappas` is the grid that brackets the search. By default (`kappas = nothing`) it is a
+geometric range scaled to the data's extent, extended past either end when the minimum falls
+there. A grid passed as `kappas` must be sorted and positive, with at least three values, and is
+searched as given: a minimum on its first or last value throws a `ConvergenceError`. For
+interval data the default grid never extends past the `κ` at which `κ` times the widest
+interval reaches 4096, beyond which the fit cannot be computed accurately; a minimum there is
+returned as the selected scale, since the fit is then at its histogram limit. When both ends of
+`support` are finite, the default grid never extends below `κ = 0.1/(hi - lo)`, where the fit is
+already close to the uniform density on the support; a minimum there is returned as the
+selected scale.
 
 [`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
 of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and
@@ -3012,9 +3009,9 @@ golden-section search over `ln κ`, bracketed by the grid `kappas`.
 function select_kappa(x::AbstractVector{<:Real}; support::Tuple{Real,Real}=(-Inf, Inf),
                       rtol::Real=cbrt(eps(float(eltype(x)))), resolution::Union{Real,Nothing}=nothing,
                       holdout::Symbol=:location,
-                      kappas::AbstractVector{<:Real}=_default_κs(x, resolution, support))
+                      kappas::Union{Nothing,AbstractVector{<:Real}}=nothing)
     if !_is_rounded(resolution)
-        return _select_by_score(_klcv, x, kappas, rtol, support; holdout, checkties=resolution === nothing)
+        return first(_select_by_score(_klcv, x, kappas, rtol, support; holdout, checkties=resolution === nothing))
     end
     isempty(x) && throw(ArgumentError("cannot select κ for zero observations"))
     T = float(eltype(x))
@@ -3046,17 +3043,27 @@ function klcv(x::AbstractVector{<:Real}, κ::Real; support::Tuple{Real,Real}=(-I
     return klcv(lower, upper, κ; rtol, support, holdout)
 end
 
-# Minimize a per-κ score over ln κ, bracketed by the grid κs, on a domain fixed for the whole
-# search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
+# Minimize a per-κ score over ln κ, bracketed by the grid `kappas`, on a domain fixed for the
+# whole search. `scorefun(nodes, w, κ, κ, κ, lo, hi; holdout)` returns the score for the merged
 # nodes/weights at scale κ. A near-coincident pair left unmerged at very large κ can drive the fit
-# to a non-finite score, which `_minimize_on_grid` steps over.
-function _select_by_score(scorefun, x::AbstractVector{<:Real}, κs::AbstractVector{<:Real}, rtol::Real,
+# to a non-finite score, which `_search_grid` steps over. `kappas === nothing` searches the
+# extensible default grid. Returns `_search_grid`'s `(κ, κlo, κhi)`.
+function _select_by_score(scorefun, x::AbstractVector{<:Real}, kappas, rtol::Real,
                           support::Tuple{Real,Real}; holdout::Symbol=:location, checkties::Bool=false)
-    _check_kappa_grid(κs)
+    κs = kappas === nothing ? _default_κs(x) : _check_kappa_grid(kappas)
     xs, r, slo, shi = _scoring_sample(x, rtol, support, checkties)
     T = eltype(xs)
-    return _minimize_on_grid(κ -> _score_at(scorefun, xs, r, slo, shi, κ; holdout), κs, T)
+    return _search_grid(κ -> _score_at(scorefun, xs, r, slo, shi, κ; holdout), κs, T;
+                        extend=kappas === nothing, κmin=_kappa_floor(slo, shi))
 end
+
+const _FLAT_KAPPA_WIDTH = 0.1   # κ·(hi - lo) below which a fit on a finite support is flat
+
+# The lowest κ a default grid extends to on the support `(lo, hi)`. On a finite support the fit
+# tends to the uniform density as κ → 0; below this scale the differences between
+# cross-validation scores become comparable to the error of their leave-one-out expansions. On
+# a half-infinite or unbounded support there is no such limit.
+_kappa_floor(lo::T, hi::T) where {T} = isfinite(lo) && isfinite(hi) ? T(_FLAT_KAPPA_WIDTH) / (hi - lo) : zero(T)
 
 # The validated, sorted sample a constant-scale score is evaluated on, in the working float type
 # of the data, `rtol` and finite support bounds, together with `rtol` and the bounds in that type.
@@ -3081,21 +3088,50 @@ _score_scale(κ::Real, ::Type{T}) where {T} = _kappa_in(T, κ)
 function _check_kappa_grid(κs)
     issorted(κs) && all(>(0), κs) || throw(ArgumentError("kappas must be sorted and positive"))
     length(κs) >= 3 || throw(ArgumentError("need at least 3 values in kappas to bracket the minimum"))
-    return nothing
+    return κs
 end
 
-# Bracket the minimum of `score(κ)` on the fixed grid `κs`, then refine by golden section in
-# ln κ. Non-finite scores count as +∞; a grid with no finite score is an error.
-function _minimize_on_grid(score, κs, ::Type{T}) where {T}
+const _KGRID_EXT = 10   # grid steps added each time a default κ grid is extended
+
+# Bracket the minimum of `score(κ)` on the grid `κs`, then refine by golden section in ln κ.
+# Non-finite scores count as +∞; a grid with no finite score is an error. A minimum on the
+# first or last grid point is an error, unless `extend` is set (a default grid): the grid then
+# grows by `_KGRID_EXT` steps of its own spacing past that end, up to `_CSHIFTS` times, but
+# never below `κmin` or above `κmax`, where a minimum on the end point is accepted. Returns
+# `(κ, κlo, κhi)`, with `[κlo, κhi]` the range of the grid searched.
+function _search_grid(score, κs, ::Type{T}; extend::Bool=false, κmin::Real=zero(T),
+                      κmax::Real=T(Inf)) where {T}
     f = _lnscore(score, T)
-    lnκ = log.(T.(κs))
-    _, i = _grid_argmin(f, lnκ, T)
+    lnκ = T[log(T(κ)) for κ in κs]
+    scores, i = _grid_argmin(f, lnκ, T)
     i === nothing && throw(ConvergenceError("the smoothing scale search",
         "no κ in kappas (from $(first(κs)) to $(last(κs))) gives a finite score"))
+    lnmin, lnmax = log(T(κmin)), log(T(κmax))
+    for nshifts in 0:_CSHIFTS
+        atlo, athi = i == firstindex(lnκ), i == lastindex(lnκ)
+        (atlo || athi) || break
+        atlo && lnκ[i] <= lnmin && break
+        athi && lnκ[i] >= lnmax && break
+        extend || throw(ConvergenceError("the smoothing scale search",
+            "the minimum is at the $(atlo ? "lower" : "upper") end of kappas (κ = $(atlo ? first(κs) : last(κs))); " *
+            "extend kappas past it, or omit kappas to use the default grid"))
+        nshifts < _CSHIFTS || throw(ConvergenceError("the smoothing scale search",
+            "the minimum kept running off the default κ grid after $_CSHIFTS extensions " *
+            "(κ from $(exp(first(lnκ))) to $(exp(last(lnκ))))"))
+        h = (last(lnκ) - first(lnκ)) / (length(lnκ) - 1)
+        new = atlo ? unique!(max.(first(lnκ) .- h .* (_KGRID_EXT:-1:1), lnmin)) :
+                     unique!(min.(last(lnκ) .+ h .* (1:_KGRID_EXT), lnmax))
+        newscores = map(f, new)
+        lnκ = atlo ? vcat(new, lnκ) : vcat(lnκ, new)
+        scores = atlo ? vcat(newscores, scores) : vcat(scores, newscores)
+        i = argmin(scores)
+    end
     loκ = lnκ[max(i - 1, firstindex(lnκ))]
     hiκ = lnκ[min(i + 1, lastindex(lnκ))]
-    return exp(_golden_min(f, loκ, hiκ))
+    return exp(_golden_min(f, loκ, hiκ)), exp(first(lnκ)), exp(last(lnκ))
 end
+
+_minimize_on_grid(score, κs, ::Type{T}; kwargs...) where {T} = first(_search_grid(score, κs, T; kwargs...))
 
 # Fraction of repeated values above which the point-likelihood selectors refuse the sample.
 const _TIE_FRACTION = 0.01
@@ -3715,7 +3751,7 @@ _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
 
 """
-    select_support(x; rtol=cbrt(eps(T)), resolution=nothing, kappas=<data-scaled grid>)
+    select_support(x; rtol=cbrt(eps(T)), resolution=nothing, kappas=nothing)
         -> (; κ, support)
 
 Choose a domain `support = (a, b)` — either side possibly infinite — together with the
@@ -3734,7 +3770,9 @@ wins, the support is `(-Inf, Inf)` and the returned `κ` equals `select_kappa(x;
 exactly.
 
 `kappas` and `rtol` mean what they do for [`select_kappa`](@ref): the grid bracketing the κ
-search, and the node-merging tolerance (a fraction of the local smoothing length).
+search (by default extended as needed), and the node-merging tolerance (a fraction of the local
+smoothing length). The κ searched at each finite-boundary candidate stays within the range of
+the grid the unbounded search used.
 
 More than 1% repeated values throw an `ArgumentError`, as for [`select_kappa`](@ref), unless
 `resolution = 0` is given, which treats the values as exact points. `select_support` has no
@@ -3784,17 +3822,17 @@ from scratch, since `κ*` moves continuously with the gap.
 The full constant-scale search of [`select_kappa`](@ref) runs at two points only: once at the
 start, to seed the unbounded arm's competing score and the first (and widest) gap candidate's
 `κ` warm start; and once at the end, to refine `κ` at the winning support over the full
-`kappas` bracket (the chained inner searches above use a narrower window, for speed). When
+`kappas` grid (the chained inner searches above use a narrower window, for speed). When
 neither side wins, no refinement is made and the returned `κ` *is* the first search's result.
 """
 function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(eltype(x)))),
                         resolution::Union{Real,Nothing}=nothing,
-                        kappas::AbstractVector{<:Real}=_default_κs(x))
+                        kappas::Union{Nothing,AbstractVector{<:Real}}=nothing)
     _is_rounded(resolution) &&
         throw(ArgumentError("select_support has no form for rounded (interval) data; use " *
                             "select_kappa(x; resolution=$resolution), or resolution=0 to treat " *
                             "the values as exact points"))
-    _check_kappa_grid(kappas)
+    kappas === nothing || _check_kappa_grid(kappas)
     _check_rtol(rtol)
     T = float(promote_type(eltype(x), typeof(rtol)))
     xs = _sorted_sample(x, T)
@@ -3803,12 +3841,12 @@ function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(elt
     # reports coincident edge points as such, rather than as a κ grid with no finite score.
     _edge_spacing(xs, :left); _edge_spacing(xs, :right)
     r = T(rtol)
-    # The chained κ search never leaves the data-scaled range the full search draws from — see
-    # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
-    κ_bounds = (T(minimum(kappas)), T(maximum(kappas)))
     full_search(support) = _select_by_score(_klcv, xs, kappas, r, support)
 
-    κ_inf = full_search((T(-Inf), T(Inf)))
+    # The chained κ search never leaves the range of the grid the unbounded search used — see
+    # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
+    κ_inf, κlo, κhi = full_search((T(-Inf), T(Inf)))
+    κ_bounds = (T(κlo), T(κhi))
     score_cur = _support_klcv(xs, r, κ_inf, T(-Inf), T(Inf))
     lo, hi, κcur = T(-Inf), T(Inf), κ_inf
 
@@ -3822,7 +3860,7 @@ function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(elt
         hi, κcur = xs[end] + gapR, κR
     end
 
-    κ = isinf(lo) && isinf(hi) ? κ_inf : full_search((lo, hi))
+    κ = isinf(lo) && isinf(hi) ? κ_inf : first(full_search((lo, hi)))
     return (; κ, support=(lo, hi))
 end
 
