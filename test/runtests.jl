@@ -397,6 +397,14 @@ end
             k = findfirst(==(100.0), locs[2])
             @test nodes[locs[1][k]] == 0.5
             @test ℓ[k] ≈ logdensity(DensityEstimate(base, κ; support), 0.5) rtol = 1e-8
+            # The same with a distinct value merged into the tie group's node, which keeps it.
+            xs = sort([base; fill(0.5, 100); 0.5 + 1e-9])
+            nodes, w = PD._merge_presorted(xs, cbrt(eps()) / κ)
+            locs = PD._locations(xs, w)
+            _, ℓ = PD._loo_logdensity(nodes, w, κ, κ, κ, support...; locations=locs)
+            k = findfirst(==(100.0), locs[2])
+            @test count(==(locs[1][k]), locs[1]) == 2
+            @test ℓ[k] ≈ logdensity(DensityEstimate([base; 0.5 + 1e-9], κ; support), 0.5) atol = 1e-7
         end
         # Ten coincident points and one other: leaving out the ten copies refits on the single
         # remaining point, and stays finite where that held-out density underflows (κ·gap ≫ 1).
