@@ -579,8 +579,9 @@ end
         @test_throws DomainError cdf(d, NaN)
         @test_throws "the evaluation point must not be NaN" cdf(d, NaN)
         @test_throws DomainError quantile(d, -0.1)
-        @test_throws DomainError quantile(d, 1.1)
-        @test_throws DomainError quantile(d, NaN)
+        for q in (-0.1, 1.1, NaN)
+            @test_throws "quantile is defined only for probabilities 0 ≤ q ≤ 1" quantile(d, q)
+        end
 
         # Multi-node fits: the closed-form cdf matches quadrature of the density (nodes
         # passed as breakpoints so the quadrature resolves every narrow feature), across
@@ -1107,8 +1108,8 @@ end
             # :largeN is the Wald shape at the exact mean, so it too works at any scale.
             @test 0 ≤ chisq_ccdf(r, 1.0; method=:largeN) ≤ 1
             @test chisq_pdf(r, 1.0; method=:largeN) ≥ 0
-            @test 0 ≤ pvalue(r, chisq(a, a); method=:largeN) ≤ 1
-            @test 0 ≤ pvalue(r, chisq(a, a)) ≤ 1
+            @test 0 < pvalue(r, mean(r); method=:largeN) < 1
+            @test 0 < pvalue(r, mean(r)) < 1
             @test_throws "method must be :exact or :largeN" chisq_ccdf(r, 1.0; method=:bogus)
         end
 
@@ -1430,6 +1431,7 @@ end
             @test_throws "grid must be sorted" WindowScale(1.0, 1.0, [1.0, 0.0], [0.0, 0.0])
             @test_throws "must be finite" WindowScale(1.0, 1.0, [0.0, 1.0], [0.0, Inf])
             @test_throws DimensionMismatch WindowScale(1.0, 1.0, [0.0, 1.0], [0.0])
+            @test_throws "the grid is empty" WindowScale(1.0, 1.0, Float64[], Float64[])
         end
 
         # A narrow bump beside a broad mode, with its peak above the mode's: the window rule's
@@ -1544,7 +1546,8 @@ end
         Q(x) = exp(-x^2 / 2) / sqrt(2π)
         manual = 4 * sum(d.w[i] * (sqrt(Q(d.x[i])) / d.ψ[i] - 1)^2 for i in eachindex(d.x))
         @test chisq(d, Q) ≈ manual
-        @test_throws ArgumentError chisq(d, x -> -1.0)   # negative trial density
+        @test_throws ArgumentError chisq(d, x -> -1.0)
+        @test_throws "trial density Q must be nonnegative" chisq(d, x -> -1.0)
     end
 
     @testset "goodness of fit: large-N (Eq. 26) reference" begin
@@ -1881,8 +1884,10 @@ end
         @test eltype(rand(d32, 3)) === Float32
         @test rand!(Xoshiro(1), OffsetArray(zeros(5), -2), fits.unbounded) isa OffsetArray
         di = IntervalDensityEstimate(round.(x; digits=1), 2.0; resolution=0.1)
-        ys = rand(Xoshiro(5), di, 2_000)
+        ys = rand(Xoshiro(5), di, 20_000)
         @test eltype(ys) === Float64 && all(isfinite, ys)
+        u = sort!(cdf.(di, ys))
+        @test maximum(abs.(u .- (1:length(u)) ./ length(u))) < 0.015   # KS distance
         @test extrema(di) === (-Inf, Inf)
 
         # Held-out entropy is computed in the log domain: finite far into an unbounded tail
@@ -2191,6 +2196,16 @@ end
         @test_throws "need at least two distinct points to select κ" select_kappa([3.0])
     end
 
+    @testset "select_kappa on Float32 data" begin
+        x = randn(Xoshiro(3), 1000)
+        κ32 = select_kappa(Float32.(x))
+        @test κ32 isa Float32
+        # The default rtol, cbrt(eps(T)), is looser for Float32; at a common rtol the two
+        # types agree.
+        @test κ32 ≈ select_kappa(x; rtol=cbrt(eps(Float32))) rtol = 2e-3
+        @test select_kappa(Float32.(x); rtol=Float32(cbrt(eps()))) ≈ select_kappa(x) rtol = 0.02
+    end
+
     @testset "error model: NaN throws, non-convergence throws ConvergenceError" begin
         # NaN observations, in every form that takes data.
         @test_throws ArgumentError DensityEstimate([0.0, NaN, 1.0], 1.0)
@@ -2312,7 +2327,7 @@ end
             end
             @test Distributions.quantile(d, 0.3) == quantile(d, 0.3)
         end
-        for d in fits[1:3]
+        for d in fits
             @test StatsBase.entropy(d) == entropy(d)
         end
         # StatsBase's two-argument entropy takes a logarithm base, not evaluation points.
@@ -2919,12 +2934,11 @@ end
         @test max(El, Ei, Er) < 1e-6
         @test abs(left + interior + right - 1) < 1e-6
 
-        # Uniform on its true (0, 1) support: the machinery must run and the composed fit must
-        # normalize; which α wins (possibly 0, the boundary already having fixed the edge) is
-        # not asserted.
+        # Uniform on its true (0, 1) support: the composed fit must normalize. On this sample the
+        # power family wins.
         xu = rand(Xoshiro(71), 500)
         κu = select_kappa(xu, Adaptive(); support=(0.0, 1.0))
-        @test κu isa Union{Real,AdaptiveScale,WindowScale}
+        @test κu isa AdaptiveScale
         du = DensityEstimate(xu, κu; support=(0.0, 1.0))
         @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
         mass, _ = quadgk(du, 0.0, 1.0; rtol=1e-8)
