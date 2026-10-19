@@ -469,6 +469,19 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test_throws "pass the lattice spacing as `resolution`" IntervalDensityEstimate([0.0, 0.1], 1.0)
         @test_throws "resolution must be finite and positive" IntervalDensityEstimate([0.0, 0.1], 1.0; resolution=0)
         @test_throws "histogram limit" IntervalDensityEstimate(x, 1e6; resolution=0.1)
+        # A rounding cell must overlap the support's interior; one that straddles a wall is
+        # clipped.
+        for xo in ([-0.05, 0.25, 0.55, 0.95], [0.1, 0.5, 0.9, 1.5])
+            msg = "lies outside the support [0, 1]"
+            @test_throws DomainError IntervalDensityEstimate(xo, 1.0; resolution=0.1, support=(0, 1))
+            @test_throws msg IntervalDensityEstimate(xo, 1.0; resolution=0.1, support=(0, 1))
+            @test_throws msg select_kappa(xo; resolution=0.1, support=(0, 1))
+            @test_throws msg PenalizedDensity.klcv(xo, 1.0; resolution=0.1, support=(0, 1))
+            @test_throws msg select_kappa(xo, Adaptive(); resolution=0.1, support=(0, 1))
+        end
+        dw = IntervalDensityEstimate([0.0, 0.3, 0.6, 1.0], 1.0; resolution=0.1, support=(0, 1))
+        @test extrema(dw) == (0.0, 1.0)
+        @test cdf(dw, 0.0) == 0 && cdf(dw, 1.0) == 1
         # Large samples cost O(number of distinct bins).
         xbig = round.(randn(Xoshiro(2), 10^6); digits=1)
         @test IntervalDensityEstimate(xbig, 5.0; resolution=0.1) isa IntervalDensityEstimate{Float64,Float64}
