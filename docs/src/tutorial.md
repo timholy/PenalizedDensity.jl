@@ -406,6 +406,5 @@ times the distance to the nearest node exceeds about 745, `d(x)` underflows to z
 Two functions give derivatives of the log density:
 [`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,
 and [`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities
-with respect to the node positions, by an implicit-function adjoint that reuses the fit's
-factored Hessian in a single extra tridiagonal solve. Both are documented in the
-[API reference](@ref).
+with respect to the node positions, in ``O(N + M)`` for ``N`` nodes and ``M`` evaluation
+points.

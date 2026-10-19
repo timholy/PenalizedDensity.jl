@@ -12,11 +12,15 @@ the smallest half-width at which a window centered on `x` holds at least `nmin` 
 and its first or second moment departs from that of a uniform spread by at least `z` standard
 deviations; `c` is chosen by the same cross-validation score as the other candidates. The
 window candidate is chosen only if its score plus the penalty `k·gamma/√N`, for `N`
-observations, is below the score of the scale the power family would return. The penalty
-offsets the optimism of a held-out score whose scale was estimated from the held-out point
-itself; see the extended help of [`select_kappa`](@ref select_kappa(::AbstractVector{<:Real}, ::Adaptive)).
+observations, is below the score of the scale the power family would return.
 
 `gamma` and `z` must be positive, `k` nonnegative, and `nmin` at least 2.
+
+# Extended help
+
+The penalty offsets the optimism of a held-out score whose scale was estimated from the
+held-out point itself; see the extended help of
+[`select_kappa`](@ref select_kappa(::AbstractVector{<:Real}, ::Adaptive)).
 """
 struct WindowRule
     gamma::Float64   # exponent of 1/ĥ
@@ -50,6 +54,8 @@ beyond it. [`select_kappa`](@ref)`(x, Adaptive())` constructs one with `s = ln(1
 rule (see [`WindowRule`](@ref)), shifted to mean zero over the sample, so that `c` is the
 scale at a point of typical window size. Like [`AdaptiveScale`](@ref), the result is callable
 and can be passed to [`DensityEstimate`](@ref) as the smoothing scale.
+
+# Extended help
 
 The scale is floored at `1e-6 c`.
 """
