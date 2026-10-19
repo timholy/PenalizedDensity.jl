@@ -2913,10 +2913,7 @@ function _loo_terms(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, h
         i = locnode[k]
         c = holdout === :location ? loccount[k] : one(T)    # observations deleted
         if c > 1 && c > _LOO_REFIT_SHARE * N
-            if c == N                                       # nothing left to fit
-                la2[k] = Zt[k] = T(NaN)
-                continue
-            end
+            c < N || throw(ArgumentError("cannot hold out every observation: nothing is left to fit"))
             wd = copy(w)
             wd[i] -= c
             # Start from the full fit, rescaled to the reduced total weight (Mφ = w./φ).
@@ -3233,6 +3230,8 @@ function _scoring_sample(x::AbstractVector{<:Real}, rtol::Real, support::Tuple{R
     a, b = _check_support_bounds(support)
     T = float(promote_type(eltype(x), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
+    isempty(xs) && throw(ArgumentError("cannot score κ for zero observations"))
+    xs[begin] < xs[end] || throw(ArgumentError("need at least two distinct points to score κ"))
     slo, shi = T(a), T(b)
     _check_support(xs, slo, shi)
     checkties && _check_ties(xs)

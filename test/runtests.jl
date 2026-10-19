@@ -454,6 +454,13 @@ end
         end
         @test_throws "κ must be finite and positive, got -1" klcv(xr .- 0.05, xr .+ 0.05, -1)
         @test_throws "lies outside the support" klcv(x, 2.0; support = (0.0, 1.0))
+        for score in (klcv, lscv)
+            @test_throws "cannot score κ for zero observations" score(Float64[], 2.0)
+            @test_throws "need at least two distinct points to score κ" score([0.5], 2.0)
+            @test_throws "need at least two distinct points to score κ" score(fill(0.5, 10), 2.0; resolution = 0)
+        end
+        @test_throws "need at least two distinct points to score κ" select_kappa(fill(0.5, 10); resolution = 0, kappas = [1.0, 2.0, 3.0])
+        @test_throws "cannot hold out every observation" PenalizedDensity._loo_logdensity([0.5], [10.0], 1.0, 1.0, 1.0, -Inf, Inf; locations = ([1], [10.0]))
     end
 
     @testset "select_kappa_lscv: cross-validated (MISE) scale" begin
