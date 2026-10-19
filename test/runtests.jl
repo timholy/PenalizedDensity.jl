@@ -1776,6 +1776,8 @@ end
             @test mean(d) ≈ m atol = 1e-10
             @test var(d) ≈ v rtol = 1e-10
             @test std(d) == sqrt(var(d))
+            @test median(d) == quantile(d, 0.5)
+            @test cdf(d, median(d)) ≈ 0.5 rtol = 1e-12
             @test negentropy(d) ≈ log(2π * ℯ * v) / 2 - entropy(d) rtol = 1e-10
             @test extrema(d) === (minimum(d), maximum(d)) === (d.lo, d.hi)
         end
@@ -1789,6 +1791,7 @@ end
         d32 = DensityEstimate(Float32.(x), 2.0f0; support=(Float32(a) - 0.05f0, Float32(b) + 0.3f0))
         @test @inferred(mean(d32)) isa Float32
         @test @inferred(var(d32)) ≈ var(fits.both_walls) rtol = 1e-4
+        @test @inferred(median(d32)) isa Float32
 
         # Sampling by inversion: reproducible, inside the support, and distributed as the fit
         # (the probability-integral transform of the draws is uniform).

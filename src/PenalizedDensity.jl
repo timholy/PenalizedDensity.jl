@@ -7,7 +7,7 @@ using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
 using Random: Random, AbstractRNG, Repetition, SamplerSimple
-using Statistics: Statistics, mean, quantile, std, var
+using Statistics: Statistics, mean, median, quantile, std, var
 using StatsAPI: StatsAPI, nobs, pvalue
 
 export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support
@@ -15,7 +15,7 @@ export Adaptive, AdaptiveScale, WindowScale, WindowRule
 export chisq, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
 export logdensity, logdensity_eval_gradient, logdensity_node_gradient
-export cdf, quantile, mean, var, std, nobs
+export cdf, quantile, median, mean, var, std, nobs
 export gaussianize, ungaussianize, gaussianize_logjacobian
 # `public` is a syntax error before Julia 1.11.
 if VERSION >= v"1.11"
@@ -38,7 +38,8 @@ subtype supports:
 - sampling by inversion through `rand`: `rand(d)`, `rand(rng, d, dims...)` and
   `rand!(rng, A, d)` draw from the fitted density;
 - the fit's moments [`mean`](@ref Statistics.mean), [`var`](@ref Statistics.var) and
-  [`std`](@ref Statistics.std), and the observation count [`nobs`](@ref);
+  [`std`](@ref Statistics.std), its [`median`](@ref Statistics.median), and the observation
+  count [`nobs`](@ref);
 - [`entropy`](@ref), [`negentropy`](@ref) (in-sample and held-out) and [`action`](@ref);
 - the probit transform [`gaussianize`](@ref), its inverse [`ungaussianize`](@ref), and
   [`gaussianize_logjacobian`](@ref).
@@ -999,6 +1000,22 @@ Statistics.var(d::AbstractDensityEstimate) = last(_moments(d))
 Standard deviation `√var(d)` of the fitted density; see [`var`](@ref Statistics.var).
 """
 Statistics.std(d::AbstractDensityEstimate) = sqrt(var(d))
+
+"""
+    median(d::AbstractDensityEstimate)
+
+Median of the fitted density, `quantile(d, 1/2)`; see [`quantile`](@ref Statistics.quantile).
+
+# Examples
+
+```jldoctest
+julia> d = DensityEstimate([0.0], 0.5);   # a Laplace density centered at 0
+
+julia> median(d)
+0.0
+```
+"""
+Statistics.median(d::AbstractDensityEstimate) = quantile(d, 1/2)
 
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
