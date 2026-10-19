@@ -2558,6 +2558,23 @@ end
             end
         end
 
+        @testset "selector: flat limit on a finite support" begin
+            # A uniform sample whose cross-validation score falls monotonically as κ → 0: the
+            # default grid stops at κ·(hi - lo) = 0.1 and returns a scale near there, rather than
+            # extending to where the leave-one-out expansions' error exceeds the score differences.
+            u = rand(Xoshiro(0xdd467046e2850655), 300)
+            for (x, support) in ((u, (0.0, 1.0)), (3 .* u .- 1, (-1.0, 2.0)))
+                κfloor = 0.1 / (support[2] - support[1])
+                for sel in (select_kappa, PenalizedDensity.select_kappa_lscv)
+                    κ = sel(x; support)
+                    @test κfloor <= κ < 2κfloor
+                end
+            end
+            # The rounded-data (interval) selector shares the floor
+            κ = select_kappa(round.(u; digits=3); resolution=0.001, support=(0.0, 1.0))
+            @test 0.1 <= κ < 0.2
+        end
+
         @testset "selector: bounded vs unbounded κ on a hard-edge family" begin
             x = -log.(1 .- (0.5:1999.5) ./ 2000)   # exponential, a jump edge at the left
             κ_unb = select_kappa(x)

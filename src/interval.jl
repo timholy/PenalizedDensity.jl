@@ -1231,7 +1231,7 @@ function select_kappa(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Rea
     r, slo, shi = T(rtol), T(a), T(b)
     lu, uu, counts = _tally_intervals(lower, upper, T)
     return _minimize_on_grid(κ -> _interval_klcv_at(lu, uu, counts, κ, r, slo, shi; holdout), κs, T;
-                             extend=kappas === nothing, κmax)
+                             extend=kappas === nothing, κmin=_kappa_floor(slo, shi), κmax)
 end
 
 function klcv(lower::AbstractVector{<:Real}, upper::AbstractVector{<:Real}, κ::Real;

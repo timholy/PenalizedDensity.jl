@@ -2978,7 +2978,10 @@ there. A grid passed as `kappas` must be sorted and positive, with at least thre
 searched as given: a minimum on its first or last value throws a `ConvergenceError`. For
 interval data the default grid never extends past the `κ` at which `κ` times the widest
 interval reaches 4096, beyond which the fit cannot be computed accurately; a minimum there is
-returned as the selected scale, since the fit is then at its histogram limit.
+returned as the selected scale, since the fit is then at its histogram limit. When both ends of
+`support` are finite, the default grid never extends below `κ = 0.1/(hi - lo)`, where the fit is
+already close to the uniform density on the support; a minimum there is returned as the
+selected scale.
 
 [`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
 of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and
@@ -3051,8 +3054,16 @@ function _select_by_score(scorefun, x::AbstractVector{<:Real}, kappas, rtol::Rea
     xs, r, slo, shi = _scoring_sample(x, rtol, support, checkties)
     T = eltype(xs)
     return _search_grid(κ -> _score_at(scorefun, xs, r, slo, shi, κ; holdout), κs, T;
-                        extend=kappas === nothing)
+                        extend=kappas === nothing, κmin=_kappa_floor(slo, shi))
 end
+
+const _FLAT_KAPPA_WIDTH = 0.1   # κ·(hi - lo) below which a fit on a finite support is flat
+
+# The lowest κ a default grid extends to on the support `(lo, hi)`. On a finite support the fit
+# tends to the uniform density as κ → 0; below this scale the differences between
+# cross-validation scores become comparable to the error of their leave-one-out expansions. On
+# a half-infinite or unbounded support there is no such limit.
+_kappa_floor(lo::T, hi::T) where {T} = isfinite(lo) && isfinite(hi) ? T(_FLAT_KAPPA_WIDTH) / (hi - lo) : zero(T)
 
 # The validated, sorted sample a constant-scale score is evaluated on, in the working float type
 # of the data, `rtol` and finite support bounds, together with `rtol` and the bounds in that type.
@@ -3086,18 +3097,20 @@ const _KGRID_EXT = 10   # grid steps added each time a default κ grid is extend
 # Non-finite scores count as +∞; a grid with no finite score is an error. A minimum on the
 # first or last grid point is an error, unless `extend` is set (a default grid): the grid then
 # grows by `_KGRID_EXT` steps of its own spacing past that end, up to `_CSHIFTS` times, but
-# never above `κmax`, where a minimum on the top point is accepted. Returns `(κ, κlo, κhi)`,
-# with `[κlo, κhi]` the range of the grid searched.
-function _search_grid(score, κs, ::Type{T}; extend::Bool=false, κmax::Real=T(Inf)) where {T}
+# never below `κmin` or above `κmax`, where a minimum on the end point is accepted. Returns
+# `(κ, κlo, κhi)`, with `[κlo, κhi]` the range of the grid searched.
+function _search_grid(score, κs, ::Type{T}; extend::Bool=false, κmin::Real=zero(T),
+                      κmax::Real=T(Inf)) where {T}
     f = _lnscore(score, T)
     lnκ = T[log(T(κ)) for κ in κs]
     scores, i = _grid_argmin(f, lnκ, T)
     i === nothing && throw(ConvergenceError("the smoothing scale search",
         "no κ in kappas (from $(first(κs)) to $(last(κs))) gives a finite score"))
-    lnmax = log(T(κmax))
+    lnmin, lnmax = log(T(κmin)), log(T(κmax))
     for nshifts in 0:_CSHIFTS
         atlo, athi = i == firstindex(lnκ), i == lastindex(lnκ)
         (atlo || athi) || break
+        atlo && lnκ[i] <= lnmin && break
         athi && lnκ[i] >= lnmax && break
         extend || throw(ConvergenceError("the smoothing scale search",
             "the minimum is at the $(atlo ? "lower" : "upper") end of kappas (κ = $(atlo ? first(κs) : last(κs))); " *
@@ -3106,7 +3119,7 @@ function _search_grid(score, κs, ::Type{T}; extend::Bool=false, κmax::Real=T(I
             "the minimum kept running off the default κ grid after $_CSHIFTS extensions " *
             "(κ from $(exp(first(lnκ))) to $(exp(last(lnκ))))"))
         h = (last(lnκ) - first(lnκ)) / (length(lnκ) - 1)
-        new = atlo ? first(lnκ) .- h .* (_KGRID_EXT:-1:1) :
+        new = atlo ? unique!(max.(first(lnκ) .- h .* (_KGRID_EXT:-1:1), lnmin)) :
                      unique!(min.(last(lnκ) .+ h .* (1:_KGRID_EXT), lnmax))
         newscores = map(f, new)
         lnκ = atlo ? vcat(new, lnκ) : vcat(lnκ, new)
