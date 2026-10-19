@@ -268,8 +268,8 @@ _estimate_eltype(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) wher
     float(promote_type(R, typeof(rtol), isempty(x) ? Bool : typeof(κfun(first(x))),
                        _support_eltype(a), _support_eltype(b)))
 
-# Every data point must lie in the requested support, or the boundary terms below (a cosh arc
-# pinned at the wall) would be fit against data outside their own domain.
+# Every data point must lie in the requested support, or the boundary terms (a cosh arc
+# ending at the wall) would be fit against data outside their own domain.
 function _check_support(xs::Vector{T}, lo::T, hi::T) where {T}
     first(xs) >= lo ||
         throw(DomainError(first(xs), "data point $(first(xs)) lies outside the support [$lo, $hi]"))
@@ -277,10 +277,9 @@ function _check_support(xs::Vector{T}, lo::T, hi::T) where {T}
         throw(DomainError(last(xs), "data point $(last(xs)) lies outside the support [$lo, $hi]"))
 end
 
-# A finite bound competes in the working-type promotion the same way κ or rtol does; an
-# infinite one is exactly representable in any AbstractFloat, so the default `support=(-Inf,
-# Inf)` (always `Float64`-typed, being a literal) must not force a wider type onto, say, a
-# Float32 fit. `Bool` is the promotion lattice's bottom numeric type, so it drops out here.
+# A finite bound joins the working-type promotion like κ or rtol. An infinite bound is exact
+# in any AbstractFloat, so the default `support=(-Inf, Inf)`, a `Float64` literal, must not
+# widen a Float32 fit; `Bool` is the narrowest numeric type, so it drops out of the promotion.
 _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
 function _estimate(::Type{T}, x::AbstractVector{<:Real}, κ::Real, rtol::Real, a::Real, b::Real;
@@ -293,9 +292,8 @@ function _estimate(::Type{T}, x::AbstractVector{<:Real}, κ::Real, rtol::Real, a
     return _fit(nodes, weights, κT, lo, hi; stats)
 end
 
-# The nodes are not known until the data has been merged, and the merge tolerance is itself
-# rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
-# to. The scale has to arrive as a function of position.
+# The merge tolerance rtol/κ(x) determines the nodes, so no node geometry exists for a
+# per-interval vector to align with; the scale must be a function of position.
 _estimate(::Type, ::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
     _vector_scale_error()
 _vector_scale_error() =
@@ -318,9 +316,8 @@ end
 _kappa(d::DensityEstimate{T,T}, k::Integer) where {T} = d.κ
 _kappa(d::DensityEstimate{T,Vector{T}}, k::Integer) where {T} = d.κ[k]
 
-# The same accessor for a bare scale — one rate, or one per interval — as passed around
-# before a `DensityEstimate` exists (the cross-validation scores work on nodes and weights,
-# not on a fit).
+# The same accessor for a bare scale (one rate, or one per interval), for code that works on
+# nodes and weights rather than on a fit, such as the cross-validation scores.
 _kappa(κ::Real, k::Integer) = κ
 _kappa(κs::AbstractVector, k::Integer) = κs[k]
 
@@ -332,8 +329,7 @@ function _show_kappa(d::DensityEstimate{T,Vector{T}}) where {T}
     return "κ ∈ [$lo, $hi]"
 end
 
-# "" when unbounded, else the support explicitly — appended after λ so a plain `show` of an
-# unbounded fit is untouched.
+# Empty for an unbounded fit; otherwise the support, shown after λ.
 _show_support(d::DensityEstimate) =
     isinf(d.lo) && isinf(d.hi) ? "" : ", support=[$(d.lo), $(d.hi)]"
 """
@@ -413,12 +409,10 @@ _reference_scale(κs::Vector{T}, κL::T, κR::T) where {T} =
 
 # _sorted_sample(x, T) -> xs::Vector{T}
 #
-# A sorted, one-based working copy of the sample `x`, whatever its axes. Every index the fit
-# takes afterwards — into the sample, into a scale realized on it, into the merged nodes —
-# is an index into this copy, and none of them escape, so the caller's axes have nothing to
-# propagate to.
-#
-# A value of `x` that is not finite in `T` throws an `ArgumentError`.
+# A sorted, one-based copy of the sample `x`, whatever its axes. All later indices (into the
+# sample, a scale realized on it, and the merged nodes) refer to this copy and none are
+# returned, so the caller's axes do not propagate. A value of `x` that is not finite in `T`
+# throws an `ArgumentError`.
 function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
     _check_finite_observations(x, T)
     xs = Vector{T}(undef, length(x))
@@ -431,7 +425,7 @@ function _sorted_sample(x::AbstractVector, ::Type{T}) where {T}
 end
 
 # Collapse runs of an already-sorted sequence `xs` within `atol` of the run's first member.
-# Factored out so a selector can merge one sorted copy at many tolerances. If `nodeof`
+# Taking sorted input lets a selector merge one sorted copy at many tolerances. If `nodeof`
 # is a vector, `nodeof[i]` receives the index of the node that `xs[i]` joined.
 function _merge_presorted(xs, atol::T, nodeof=nothing) where {T}
     nodes = T[]
@@ -451,8 +445,8 @@ end
 
 # As above, but with a tolerance `rtol / κ` local to the run's first member, whose scale is
 # `κx[i]` for the point `xs[i]`: the merge threshold is a fraction `rtol` of the smoothing
-# length there. The scales come in already realized on `xs` because the merge threshold is
-# what *produces* the nodes — a caller has no node geometry to align a per-node vector to.
+# length there. The scales are realized on `xs` rather than on nodes because the merge is
+# what produces the nodes.
 function _merge_presorted(xs, rtol::T, κx::AbstractVector{T}, nodeof=nothing) where {T}
     nodes = T[]
     weights = T[]
@@ -553,8 +547,8 @@ function _unsort_nodeindex(x::AbstractVector, perm::AbstractVector, nodeof::Abst
 end
 
 # Merge the sample at the tolerance a scale implies, then realize that scale on the nodes the
-# merge produced. This pairing is the whole entry into a piecewise-constant fit: the merge
-# needs the scale at the sample points, and the fit needs it on the nodes and tails.
+# merge produced: the merge needs the scale at the sample points, and the fit needs it on the
+# nodes and tails.
 function _merge_and_realize(xs::Vector{T}, κfun, rtol::T) where {T}
     nodes, weights = _merge_presorted(xs, rtol, _kappa_sorted(κfun, xs, T))
     κs, κL, κR = _kappa_profile(nodes, κfun, T)
@@ -602,8 +596,8 @@ function _roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T
     return SymTridiagonal(d, e)     # M
 end
 
-# tanh(u), overflow-free through e^{-2u} (accurate and finite up to u ≈ 1e300, well past where
-# cosh/sinh alone would overflow around u ≈ 710).
+# tanh(u) for u ≥ 0, overflow-free through e^{-2u} for any such u, including Inf; cosh/sinh
+# alone overflow near u ≈ 710.
 _tanh_stable(u::T) where {T} = (e = exp(-2u); (oneunit(T) - e) / (oneunit(T) + e))
 
 # sech(u)² = 1/cosh(u)², overflow-free through e^{-2u}.
@@ -628,13 +622,13 @@ end
 # The same operator for a piecewise-constant scale, with an optional natural boundary at
 # `lo`/`hi`: interval k (rate κs[k], θ = κs[k]·hₖ) contributes coth(θ)/κs[k] to each adjacent
 # diagonal entry and -csch(θ)/κs[k] off-diagonal, and each tail contributes
-# `_tail_diag(κ_edge, Δ)/κ_edge` — `1/κ_edge` as Δ → ∞ (an unbounded side), or
-# `tanh(κ_edge Δ)/κ_edge` at a finite gap. Dividing through by one κ no longer cancels the
-# entries, so the rates survive explicitly.
+# `_tail_diag(κ_edge, Δ)/κ_edge`: `1/κ_edge` as Δ → ∞ (an unbounded side), or
+# `tanh(κ_edge Δ)/κ_edge` at a finite gap. With varying rates no common κ divides out, so each
+# entry carries its own rate.
 #
-# Everything is scaled by the reference rate κ̄. That factor is arbitrary — it rescales the
-# unnormalized amplitude by κ̄^{-1/2} and drops out of both the normalized fit and λ = κ̄ Z —
-# but it fixes the magnitude the Newton solve sees. Taking κ̄ to be the typical rate keeps the
+# Everything is scaled by the reference rate κ̄. The factor is arbitrary (it rescales the
+# unnormalized amplitude by κ̄^{-1/2} and drops out of the normalized fit and of λ = κ̄ Z), but
+# it sets the magnitude the Newton solve sees. Taking κ̄ to be the typical rate keeps the
 # entries O(1), and at a constant κ (where κ̄ = κ) reproduces `roughness_operator(x, κ, lo, hi)`
 # entry for entry.
 function _roughness_operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, κ̄::T, lo::T, hi::T) where {T<:AbstractFloat}
@@ -729,18 +723,16 @@ end
 # maxᵢ |Δᵢ|/xᵢ, its value `prevstep` at the previous iteration, and whether a step has been
 # taken without the Armijo test (`unguarded`). Returns `:tolerance`, `:floor` or `:none`.
 #
-# The correction Δ is what the next step would subtract, so in the quadratic regime it is the
-# remaining error in x. Testing the objective instead, or the Newton decrement, which predicts
-# the same difference, constrains a quantity that is stationary at the minimizer, and is
-# satisfied while x is still wrong by the square root of the tolerance; that error would carry
-# into the normalization and the density.
+# In the quadratic regime the correction Δ is the remaining error in x. The objective and the
+# Newton decrement are stationary at the minimizer, so a test on either passes while x is still
+# wrong by the square root of the tolerance, an error that carries into the normalization and
+# the density.
 #
-# Roundoff floors the attainable correction at a level set by the conditioning of the Hessian,
-# and on a widely spread sample that floor can sit well above the tolerance; stopping when the
-# correction ceases to fall covers that case. The floor is only meaningful once the objective
-# has stopped resolving the decrease the step predicts, which is what `unguarded` records:
-# while the Armijo test is still informative the correction may plateau for a step or two
-# without the iteration being finished.
+# Roundoff limits the attainable correction to a level set by the Hessian's conditioning, which
+# on a widely spread sample can exceed the tolerance; the `:floor` exit stops when the
+# correction ceases to fall. It applies only once `unguarded` is set, i.e. the objective no
+# longer resolves the predicted decrease: while the Armijo test is informative, the correction
+# may plateau for a step or two before the iteration has finished.
 function _newton_stop(step::T, prevstep::T, unguarded::Bool) where {T}
     step <= eps(T)^(3 // 4) && return :tolerance
     unguarded && step >= prevstep && return :floor
@@ -767,7 +759,7 @@ end
 # Each step factorizes the tridiagonal Hessian in place (`ldlt!`/`ldiv!`) and backtracks
 # along the Newton direction to keep `ψ > 0` with Armijo decrease. Iteration stops when the
 # Newton correction reaches `eps(T)^(3/4)` relative to `ψ`, componentwise, or the floor
-# roundoff imposes on it, so the returned amplitudes — not merely `F` — are accurate to that
+# roundoff imposes on it, so the returned amplitudes, not only `F`, are accurate to that
 # tolerance. Reaching `maxiter` throws a `ConvergenceError`.
 #
 # A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
@@ -806,14 +798,12 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
         prevstep = step
         α = _positivity_cap(ψ, Δ)         # then Armijo backtracking
         # Armijo compares two values of F differing by α·decrement/4. F is a
-        # difference of terms accumulated over n nodes, so rounding leaves it
-        # uncertain by roughly √n·eps times the size of those terms
-        # (`_objective_scale`, which can exceed |F| by orders of magnitude when
-        # nearly coincident nodes make the operator's entries large); a predicted
-        # decrease below that carries no information, and rejecting the step on
-        # it stalls the iteration into halving α when it should be squaring the
-        # error. Such a step is deep enough into the quadratic regime to take
-        # unguarded.
+        # difference of terms summed over n nodes, so rounding makes it uncertain
+        # by about √n·eps times their size (`_objective_scale`, which can exceed
+        # |F| by orders of magnitude on nearly coincident nodes). A predicted
+        # decrease below that is uninformative, and rejecting the step on it would
+        # halve α repeatedly instead of converging quadratically; such a step is
+        # already in the quadratic regime and is taken unguarded.
         if α * decrement / 4 <= 4 * sqrt(T(n)) * eps(T) * (_objective_scale(M, w, ψ) + W)
             unguarded = true
             @. ψ -= α * Δ
@@ -835,7 +825,7 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
         end
         # Backtracking ran out of room: no positive step both keeps ψ inside the
         # orthant and moves it by more than rounding, so ψ is stationary to the
-        # precision available. That is a converged fit, not a failed one.
+        # available precision and the fit has converged.
         if !armijo
             converged = true; reason = :steplength; finalstep = step
             break
@@ -860,7 +850,7 @@ end
 # and either side may have a natural boundary at `lo`/`hi`. The interpolant on interval k and
 # the tail decays are set by the rates themselves, not by the operator's overall factor, so
 # this is the physical mass whatever κ̄ the amplitude was solved in. Each tail is
-# `_tail_mass(ψ_edge, κ_edge, Δ)` — ψ_edge²/(2κ_edge) as Δ → ∞ (an unbounded side), or
+# `_tail_mass(ψ_edge, κ_edge, Δ)`: ψ_edge²/(2κ_edge) as Δ → ∞ (an unbounded side), or
 # ψ_edge²(tanh u + u·sech²u)/(2κ_edge) at a finite gap.
 function _norm_sq(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     n = length(x)
@@ -902,11 +892,10 @@ end
 # `_tail_moments` at their decay rates and boundary gaps. Z is accumulated in the same pass rather
 # than assumed to be 1, so the result does not depend on how precisely ψ was normalized.
 #
-# Node positions are measured relative to x[1] throughout (not the caller's absolute
-# coordinate) before accumulating M1, M2: since μ, σ² are translation-covariant/-invariant,
-# this doesn't change the result, but it keeps M1, M2 (and hence M2 - M1²) of order the data's
-# spread rather than of order its absolute location, which is what M2 - M1² needs to stay
-# well-conditioned. Without it, data far from the origin (e.g. x .+ 1e8) can drive σ² negative.
+# Positions are measured relative to x[1]. Since μ is translation-covariant and σ² invariant,
+# the result is unchanged, but M1 and M2 stay of the order of the data's spread rather than its
+# location, which keeps M2 - M1² well conditioned. Otherwise data far from the origin (e.g.
+# x .+ 1e8) can give a negative σ².
 function _moments(d::AbstractDensityEstimate)
     x, ψ = d.x, d.ψ
     n = length(x)
@@ -1053,8 +1042,7 @@ Statistics.median(d::AbstractDensityEstimate) = quantile(d, 1/2)
 
 # Z = ∫ψ² together with its κ-derivative at fixed ψ and Gψ = ½ ∂Z/∂ψ, where Z = ψᵀGψ. The
 # three share the per-interval coth/csch coefficients, so one pass returns all of them.
-# Differentiating in κ presupposes a single rate: this serves the scalar-κ sensitivity
-# `_action_and_slope`, not the piecewise fit.
+# The κ-derivative presupposes a single rate, so κ must be a scalar.
 function _norm_sq_grad(x::Vector{T}, ψ::Vector{T}, κ::T) where {T}
     n = length(x)
     Gψ = zeros(T, n)
@@ -1084,9 +1072,9 @@ end
 # finite for isolated points (θ → ∞). Used by select_kappa_lscv for the ∫Q² term.
 #
 # The derivation is local to one interval, so a piecewise-constant scale changes nothing but
-# which κ each term carries. Each tail is `_tail_quartic(ψ_edge, κ_edge, Δ)` — ψ_edge⁴/(4κ_edge)
-# as Δ → ∞ (an unbounded side), or the boundary-segment quartic at a finite gap; the interior
-# sum is untouched by a boundary.
+# which κ each term carries. Each tail is `_tail_quartic(ψ_edge, κ_edge, Δ)`: ψ_edge⁴/(4κ_edge)
+# as Δ → ∞ (an unbounded side), or the boundary-segment quartic at a finite gap. A boundary
+# does not change the interior sum.
 function _int_quartic(x::Vector{T}, ψ::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T) where {T}
     n = length(x)
     Q2 = _tail_quartic(ψ[1], κL, x[1] - lo) + _tail_quartic(ψ[n], κR, hi - x[n])
@@ -1108,9 +1096,9 @@ end
 # ∫ψ̂⁴ over a boundary segment of gap Δ: ψ₁⁴(3θ + 2sinh 2θ + sinh(4θ)/4)/(8κ cosh⁴θ) at θ = κΔ,
 # the unbounded tail's ψ₁⁴/(4κ) being its θ → ∞ limit. Rewritten in p = e^{-2θ}, cosh⁴θ =
 # (1+p)⁴/(16p²), and the near-1 differences as expm1(-4θ) = p²-1, expm1(-8θ) = p⁴-1, this stays
-# accurate as θ → 0 (each expm1 term individually cancellation-free, and their sum has no
-# cross-term cancellation — all three contributions are non-negative) and finite well past where
-# raw cosh/sinh would overflow (θ ~ 500).
+# accurate as θ → 0 (each expm1 term is cancellation-free, and all three contributions are
+# nonnegative, so their sum does not cancel) and finite past where raw sinh(4θ) and cosh⁴θ
+# overflow (θ ≈ 177 in Float64).
 function _tail_quartic(ψ1::T, κ::T, Δ::T) where {T}
     isfinite(Δ) || return ψ1^4 / (4κ)
     θ = κ * Δ
@@ -1186,9 +1174,7 @@ end
 
 # ψ(x) in the left tail (x ≤ xs[1], lo ≤ x): the exponential decay ψ₁e^{κ(x-xs[1])} when
 # unbounded, or the Neumann cosh arc ψ₁cosh(κ(x-lo))/cosh(κ(xs[1]-lo)) at a finite boundary.
-# Both are ψ evaluated relative to its value at xs[1]; the finite form is exactly the unbounded
-# one with the exponential's single decaying branch replaced by the cosh arc it limits to as
-# lo → -∞.
+# Both equal ψ₁ at xs[1], and the cosh arc tends to the exponential as lo → -∞.
 _left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
     isfinite(lo) ? ψ1 * _cosh_ratio2(κ * (x - lo), κ * (x1 - lo)) : ψ1 * exp(κ * (x - x1))
 
@@ -1196,8 +1182,8 @@ _left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
 _right_tail_amplitude(ψn::T, κ::T, x::Real, xn::T, hi::T) where {T} =
     isfinite(hi) ? ψn * _cosh_ratio2(κ * (hi - x), κ * (hi - xn)) : ψn * exp(-κ * (x - xn))
 
-# ψ(x) inside interval k, i.e. for xs[k] ≤ x ≤ xs[k+1]. Split out so a caller that already
-# knows which interval x falls in — a sorted sweep — need not search for it.
+# ψ(x) inside interval k, i.e. for xs[k] ≤ x ≤ xs[k+1], for a caller that already knows the
+# interval (such as a sorted sweep).
 function _amplitude(d::DensityEstimate{T}, k::Integer, x::Real) where {T}
     xs, ψ = d.x, d.ψ
     κ = _kappa(d, k)
@@ -1230,8 +1216,8 @@ julia> amplitude(d, -800.0), isfinite(logdensity(d, -800.0))
 """
 logdensity(d::AbstractDensityEstimate, x::Real) = _logdensity(d, x)
 
-# ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`, and the two must be kept
-# so: a caller reaching either one for the same quantity may not get a different answer.
+# ln Q(x) = 2 ln ψ(x), branch for branch the mirror of `_amplitude`; the two must stay
+# consistent so that they agree on the same quantity.
 function _logdensity(d::DensityEstimate{T}, x::Real) where {T}
     _check_not_nan(x)
     R = promote_type(T, typeof(x))
@@ -1273,10 +1259,9 @@ function _logdensity_sorted(d::DensityEstimate{T}, ts::AbstractVector) where {T}
 end
 
 # ln ψ(x) inside interval k, the log-domain mirror of `_amplitude(d, k, x)`. Both sinh arcs
-# are formed in the log domain and combined with `logaddexp`, so the result holds wherever
-# ψ itself underflows: at κ(xs[k+1] - xs[k]) ≳ 1490 the arcs vanish in the middle of the
-# interval, which is where a log density is most worth having. ψ is strictly positive by
-# construction (`_solve_amplitude` keeps it so), hence `log(ψ[k])` is always real.
+# are formed in the log domain and combined with `logaddexp`, so the result is finite where
+# ψ itself underflows: at κ(xs[k+1] - xs[k]) ≳ 1490 the arcs underflow in the middle of the
+# interval. ψ is strictly positive (`_solve_amplitude` keeps it so), so `log(ψ[k])` is real.
 function _log_amplitude(d::DensityEstimate, k::Integer, x::Real)
     xs, ψ = d.x, d.ψ
     κ = _kappa(d, k)
@@ -1285,11 +1270,9 @@ function _log_amplitude(d::DensityEstimate, k::Integer, x::Real)
     return logaddexp(log(ψ[k]) + logabssinh(a), log(ψ[k+1]) + logabssinh(b)) - logabssinh(a + b)
 end
 
-# ln ψ(t) in the left tail. Every branch stays in the log domain: the unbounded arm as a
-# sum rather than the logarithm of a product, the bounded arm through `logcosh`. The tails
-# are where a log-density is worth having precisely because ψ itself has underflowed to
-# zero, so forming the amplitude first would return -Inf over the whole region the
-# logarithm exists to describe.
+# ln ψ(t) in the left tail, computed in the log domain (a sum for the unbounded arm,
+# `logcosh` for the bounded one): deep in a tail ψ underflows to zero, so forming the
+# amplitude first would return -Inf.
 _log_left_tail_amplitude(ψ1::T, κ::T, x::Real, x1::T, lo::T) where {T} =
     isfinite(lo) ? log(ψ1) + logcosh(κ * (x - lo)) - logcosh(κ * (x1 - lo)) :
                    log(ψ1) + κ * (x - x1)
@@ -1447,7 +1430,7 @@ end
 
 # ψ̂(v)² integrated from the wall (v = 0) out to v, for the boundary field ψ̂(s) = cosh(κs)/cosh(u)
 # on a segment of width u = κΔ (Neumann at the wall, node value ψ_node at s = Δ); v = κs ∈ [0, u].
-# Both terms are non-negative for v ≥ 0, so — unlike the interior `_segmass` — this needs no
+# Both terms are nonnegative for v ≥ 0, so unlike the interior `_segmass` this needs no
 # small-u cancellation treatment; it reduces to `_tail_mass` at v = u.
 function _boundary_mass_from_wall(ψ_node::T, κ::T, v::T, u::T) where {T}
     return ψ_node^2 * (v * _sech2_stable(u) + _cosh_ratio2(v, u) * _sinh_ratio2(v, u)) / (2κ)
@@ -1459,7 +1442,7 @@ end
 # (a difference of two nearly equal quantities there). Expanding cosh(u+v)sinh(u-v)/cosh(u)² in
 # p = e^{-2u} and δ = u - v ≥ 0 collapses both e^{2(v-u)} - 1 and e^{-2(v+u)} - e^{-4u} to the
 # same factor `nA` = 1 - e^{-2δ}, evaluated through expm1 for a δ of any size (no cancellation
-# as δ → 0, no overflow as u → ∞ — every exponent stays ≤ 0).
+# as δ → 0, and no overflow as u → ∞ since every exponent is ≤ 0).
 function _boundary_mass_from_node(ψ_node::T, κ::T, v::T, u::T) where {T}
     p = exp(-2u)
     nA = -expm1(-2 * (u - v))              # 1 - exp(-2(u-v)), δ = u - v ≥ 0 keeps this safe
@@ -1474,8 +1457,8 @@ end
 # the two sides that Φ⁻¹ needs at full precision (see _gaussianize). ψ is normalized so the
 # total is 1 up to roundoff; the mass functions divide by this total rather than assuming 1,
 # which pins cdf(d, ±Inf) to exactly 0 and 1 and keeps the CDF monotone across the last node.
-# The inner constructors store the result as `d.F`, `d.G` and `d.total`, so every evaluation
-# reads the tables instead of reassembling them at O(length(d.x)) cost.
+# The inner constructors store the result as `d.F`, `d.G` and `d.total`, so evaluations read
+# the tables rather than reassembling them at O(length(d.x)) cost.
 function _node_cumulatives(d::AbstractDensityEstimate)
     n = length(d.x)
     m = eltype(d.x)[_cell_mass(d, k) for k in 1:n-1]
@@ -1498,7 +1481,7 @@ end
 # integrated from whichever end (wall or node) bounds the smaller part of the segment's mass,
 # so the partial mass is never a difference of nearly equal quantities. Choosing by mass rather
 # than by distance matters in a steep segment, where nearly all the mass sits near the node and
-# a point nearer the node can still have only a sliver of mass between it and the wall. The
+# a point nearer the node can still have little mass between it and the wall. The
 # CDF stays continuous through the boundary node, as `_cdf_mass_interior` keeps it at interior
 # nodes. `x` is converted to the fit's element type.
 function _cdf_mass(d::AbstractDensityEstimate, xin::Real)
@@ -1526,8 +1509,8 @@ function _cdf_mass(d::AbstractDensityEstimate, xin::Real)
 end
 
 # Unnormalized cumulative mass at x within interval k (xs[k] ≤ x ≤ xs[k+1]). The partial
-# mass is integrated from the nearer node — subtracting from F[k+1] when x lies in the
-# right half — so its absolute error vanishes toward both nodes and the CDF stays
+# mass is integrated from the nearer node (subtracting from F[k+1] when x lies in the
+# right half), so its absolute error vanishes toward both nodes and the CDF stays
 # continuous and monotone through every node. The subtraction keeps full relative
 # precision only while its result is at least F[k+1]/2. Since the result is at least F[k],
 # that is guaranteed when F[k] ≥ F[k+1]/2; otherwise (a cell holding more mass than lies
@@ -1561,10 +1544,10 @@ function _ccdf_mass_interior(d::DensityEstimate, k::Int, x::Real)
 end
 
 # Unnormalized mass above x, ∫_x^{hi} ψ² dt: the complement of `_cdf_mass`, with a boundary
-# segment integrated from whichever end bounds the smaller part of its mass, as there. The
-# transport feeds Φ⁻¹ the smaller of `_cdf_mass`/`_ccdf_mass`, and `_quantile` inverts the
-# right segment through this function, so within a boundary segment the near-wall side —
-# computed here from the wall rather than as `total - _cdf_mass` — keeps full relative
+# segment integrated from whichever end bounds the smaller part of its mass, as there.
+# `_gaussianize` feeds Φ⁻¹ the smaller of `_cdf_mass`/`_ccdf_mass`, and `_quantile` inverts the
+# right segment through this function, so within a boundary segment the near-wall side,
+# computed here from the wall rather than as `total - _cdf_mass`, keeps full relative
 # precision where that difference would cancel.
 function _ccdf_mass(d::AbstractDensityEstimate, xin::Real)
     xs, ψ, F, G = d.x, d.ψ, d.F, d.G
@@ -1792,7 +1775,7 @@ _logΦ(t::T) where {T} = log(erfcx(-t / sqrt(T(2))) / 2) - t^2 / 2
 # Deeper, solve ln Φ(-t) = ℓ for t > 0 by Newton in log space: _logΦ is exact there, its
 # derivative is -φ(t)/Φ(-t) = -√(2/π)/erfcx(t/√2), and the asymptotic seed
 # t² ≈ -2ℓ - ln(2π·(-2ℓ)) puts the quadratically-convergent iteration within a few steps
-# of machine precision. Non-convergence indicates a bug, not a data property: fail fast.
+# of machine precision. Non-convergence indicates a bug rather than a property of the data.
 function _probit_from_log(ℓ::T) where {T<:AbstractFloat}
     ℓ == T(-Inf) && return T(-Inf)
     ℓ > log(floatmin(T)) / 2 && return -sqrt(T(2)) * erfcinv(2 * exp(ℓ))
@@ -1819,7 +1802,7 @@ _probit_from_masses(mlo::T, mhi::T, total::T) where {T} =
 # `_tail_rates(d)`), so the composition runs in log space and never saturates for finite x.
 # Beyond a finite wall the "tail" is the bounded cosh-arc boundary segment: its mass is finite,
 # so the same node-cumulative assembly as the interior applies, and past the wall F is 0 (or 1),
-# giving the honest y = ∓Inf for a compact-support density.
+# giving y = ∓Inf for a compact-support density.
 function _gaussianize(d::AbstractDensityEstimate, xin::Real)
     xs, ψ, total = d.x, d.ψ, d.total
     T = typeof(total)
@@ -1843,7 +1826,7 @@ end
 # computed (each exactly, via _logΦ). On an unbounded side the deep-tail inversion is the
 # closed form of _quantile written in log space, so deep |y| maps to the finite x whose
 # tail mass matches e^{lnΦ} rather than saturating to ±Inf. A finite wall needs no such
-# guard — the support is bounded, so `_quantile` inverts directly and maps y = ∓Inf (Φ = 0
+# guard: the support is bounded, so `_quantile` inverts directly and maps y = ∓Inf (Φ = 0
 # or 1 underflowed) to the wall itself.
 function _ungaussianize(d::AbstractDensityEstimate, yin::Real)
     xs, ψ, F, G, total = d.x, d.ψ, d.F, d.G, d.total
@@ -1870,12 +1853,12 @@ end
 # (y, ln y′): the map together with the log-Jacobian ln Q̂(x) - ln φ(y), Q̂ = ψ²/total.
 # Interior, both terms are moderate (|y| stays small wherever a node cumulative bounds the
 # probability away from 0 and 1) and the direct formula is accurate. On an unbounded side the
-# direct form cancels — ln Q̂ and -y²/2 grow together — but there F = Q̂/(2κ_edge) exactly, and
+# direct form cancels (ln Q̂ and -y²/2 grow together), but there F = Q̂/(2κ_edge) exactly, and
 # eliminating ln Q̂ via ln φ(y) = ln Φ(y) + ln(φ/Φ) collapses the log-Jacobian to
 # ln(2κ_edge) + ½ln(π/2) + ln erfcx(∓y/√2), cancellation-free. Inside a finite boundary segment
 # the density stays finite at the wall (a natural boundary leaves ψ free), so ln Q̂ does not
-# diverge and no cancellation arises — the direct formula is used. Past the wall the density is
-# zero: the log-Jacobian is -Inf (the map is constant there), the compact-support convention.
+# diverge and the direct formula is used. Past the wall the density is zero and the
+# log-Jacobian is -Inf (the map is constant there).
 function _gaussianize_logjac(d::AbstractDensityEstimate, xin::Real)
     xs = d.x
     T = typeof(d.total)
@@ -2303,16 +2286,16 @@ _Φ(t::T) where {T} = erfc(-t / sqrt(T(2))) / 2
 # S = diag(2wₖ/ψₖ²), and the free part of the precision is L₀ = 2λ𝒜, 𝒜u = -(κ(x)⁻²u′)′ + u,
 # so G₀⁻¹ = 2λ M̂ with M̂ the `roughness_operator` at unit reference scale. That identity is
 # not the Gauss-Markov one: M̂ maps the nodal values of an 𝒜-harmonic interpolant to the
-# jumps of its flux v = κ⁻²ψ′, and a Green's-function column Ĝ(·,xⱼ) is precisely the
-# 𝒜-harmonic field whose only flux jump is a unit one at xⱼ, so M̂ Ĝ|nodes = I. It needs the
-# breakpoints of κ to be the nodes — with a jump strictly inside an interval, Ĝ(·,xⱼ) would
-# not be a single hyperbolic arc there — which is why the fit realizes one rate per interval.
+# jumps of its flux v = κ⁻²ψ′, and a Green's-function column Ĝ(·,xⱼ) is the 𝒜-harmonic
+# field whose only flux jump is a unit one at xⱼ, so M̂ Ĝ|nodes = I. It needs the breakpoints
+# of κ to be the nodes (with a jump strictly inside an interval, Ĝ(·,xⱼ) would not be a
+# single hyperbolic arc there), which is why the fit realizes one rate per interval.
 # At constant κ it reduces to G₀⁻¹ = (2λ/κ)M, with (G₀)ᵢⱼ = κ e^{-κ|xᵢ-xⱼ|}/(4λ).
 #
 # The ∫ψ_cl δψ = 0 constraint contributes one rank-one term, C = C₀ - b bᵀ/Vφ (Eq. 18's T(g)
 # factor). Tail probabilities come from Imhof's inversion, whose integrand needs only
-# det(I + iuA) per node — an O(N) tridiagonal determinant plus a rank-one correction — so no
-# eigenvalues are formed.
+# det(I + iuA) at each quadrature point, an O(N) tridiagonal determinant plus a rank-one
+# correction, so no eigenvalues are formed.
 
 """
     ChisqReference(d::DensityEstimate)
@@ -2397,9 +2380,9 @@ end
 # Each tail fixes one solution: u₋ = e^{κL(x-x₁)} to the left of x₁ when unbounded (normalized to
 # 1 there, whence v₋ = 1/κL) or the boundary segment's cosh arc when finite (v₋ = the
 # Dirichlet-to-Neumann flux `_tail_diag(κL, ΔL)/κL`), and its mirror to the right. Since u∓ grow
-# like e^{±∫κ}, they are propagated — along with their accumulations — scaled by e^{∓∫κ}, which
-# is what keeps the recursions bounded; the scale factors cancel identically in α, so it is
-# assembled from the scaled quantities alone. `Â[1] = ∫_{lo}^{x₁} u₋ψ_cl / ψ₁` is
+# like e^{±∫κ}, they and their accumulations are propagated scaled by e^{∓∫κ}, which keeps the
+# recursions bounded; the scale factors cancel identically in α, so it is assembled from the
+# scaled quantities alone. `Â[1] = ∫_{lo}^{x₁} u₋ψ_cl / ψ₁` is
 # `_tail_mass(ψ₁, κL, ΔL)/ψ₁` at a finite boundary (the same integral `_norm_sq` needs, since u₋
 # and ψ_cl are the same cosh arc up to normalization) or `ψ₁/(2κL)` unbounded; mirror on the
 # right. The Wronskian `Ĉ = û₊[1]·v̂₋[1] + v̂₊[1]` at a finite boundary specializes to
@@ -2441,7 +2424,7 @@ end
 # ∬ψ_cl G₀ ψ_cl = ∫ψ_cl α, with an optional natural boundary at `lo`/`hi`. On each interval α
 # solves 𝒜α = ψ_cl/(2λ) at constant κ against a hyperbolic source, so it is the interpolant of
 # its own nodal values mₖ plus the resonant particular solution s·cosh(κs) that the source
-# forces; the interior sum is untouched by a boundary. Each tail is `_tail_psi_alpha` — the same
+# forces; a boundary does not change the interior sum. Each tail is `_tail_psi_alpha`: the same
 # computation with ψ_cl ∝ e^{∓κ(x-x_edge)} and α acquiring the same resonant factor when
 # unbounded, or the boundary segment's closed form at a finite gap.
 function _int_psi_alpha(x::Vector{T}, ψ::Vector{T}, m::Vector{T}, κ, κL::T, κR::T, λ::T,
@@ -2713,7 +2696,7 @@ pvalue(ref, chisq(d, Q))
 """
 StatsAPI.pvalue(r::ChisqReference, χ²::Real; kwargs...) = chisq_ccdf(r, χ²; kwargs...)
 
-# Golden-section minimisation of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
+# Golden-section minimization of a unimodal `f` on `[a, b]` in `ln κ`; returns the minimizer.
 function _golden_min(f, a::T, b::T; iters::Int=60) where {T}
     invφ = (sqrt(T(5)) - 1) / 2      # 1/golden ≈ 0.618
     c = b - invφ * (b - a); fc = f(c)
@@ -2849,27 +2832,28 @@ _log_coupling(x::Vector{T}, κ::T, κ̄::T, k::Int) where {T} = -logabssinh(κ *
 _log_coupling(x::Vector{T}, κs::Vector{T}, κ̄::T, k::Int) where {T} =
     log(κ̄ / κs[k]) - logabssinh(κs[k] * (x[k+1] - x[k]))
 
-# Normalised amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
+# Normalized amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
 # one observation at node i decrements wᵢ; the deleted field is a Newton step of that problem from
 # the full solution, along the direction H⁻¹eᵢ (H the fit's SPD Hessian ∇²F = M + diag(w/φ²)). A
-# unit step is the first-order approximation; it under-penalizes over-fitting, because where the node
-# leverage h = (H⁻¹)ᵢᵢ/φᵢ² is high the removed point's spike collapses super-linearly and a linear
-# step cannot see it. Instead the step length t is set so node i's own nonlinear stationarity holds
-# exactly: t² h(1 - wᵢh) - t + 1 = 0, whose root t = 2/(1 + √(1 - 4h(1 - wᵢh))) (real because
-# h(1 - wᵢh) ≤ 1/4) is 1 as h → 0, recovering first order, and grows to shrink the overshoot as h
-# rises. The node amplitude becomes φᵢ(1 - t h), and the normalization is carried linearly,
+# unit step, the first-order approximation, under-penalizes over-fitting: where the node leverage
+# h = (H⁻¹)ᵢᵢ/φᵢ² is high, the removed point's spike collapses faster than linearly. The step
+# length t is instead set so node i's own nonlinear stationarity holds exactly:
+# t² h(1 - wᵢh) - t + 1 = 0, whose root t = 2/(1 + √(1 - 4h(1 - wᵢh))) (real because
+# h(1 - wᵢh) ≤ 1/4) is 1 as h → 0, recovering first order, and grows with h to reduce the
+# overshoot. The node amplitude becomes φᵢ(1 - t h), and the normalization is carried linearly,
 # Zₜ = Z - 2t vᵢ/φᵢ with v = H⁻¹Gφ (Gφ = ½ ∂Z/∂φ, Z = ∫φ² = φᵀGφ), so Q̂₋ᵢ(xᵢ) = (φᵢ(1 - t h))² / Zₜ.
 #
 # A node isolated at unit weight sits at the double root: its own stationarity gives Mᵢᵢφᵢ² = wᵢ, so
 # h = 1/2, the discriminant vanishes and t = 2. Rounding can carry the discriminant just below zero
 # there, hence the clamp in `_deletion_step`.
 #
-# t and its inputs are dimensionless or scale like Z, so — as for the linear step — nothing depends
-# on M's entries beyond its being the fixed SPD operator with mass functional Z: it holds unchanged
-# for a piecewise-constant scale, and for a natural boundary via the bounded `_operator`/`_norm_sq_gram`.
+# t and its inputs are dimensionless or scale like Z, so, as for the linear step, nothing depends
+# on M's entries beyond its being the fixed SPD operator with mass functional Z. It therefore
+# holds for a piecewise-constant scale, and for a natural boundary via the bounded
+# `_operator`/`_norm_sq_gram`.
 #
-# The step tracks a literal leave-one-out refit (wᵢ decremented, a singleton node dropped) closely
-# across the scale range on continuous data.
+# On continuous data the step closely tracks a full leave-one-out refit (wᵢ decremented, a
+# singleton node dropped) across the scale range.
 #
 # `holdout = :location` instead deletes all wᵢ observations at node i, the held-out value then
 # lying away from every atom of the remaining sample. Deleting c observations (c = 1 or wᵢ) takes
@@ -2941,7 +2925,7 @@ function _loo_logdensity(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo:
     return ψ, [Zt[i] > 0 ? la2[i] - log(Zt[i]) : T(NaN) for i in eachindex(la2, Zt)]
 end
 
-# The step τ for deleting c of the w observations at a node of leverage h (see `_loo_density`).
+# The step τ for deleting c of the w observations at a node of leverage h (see `_loo_terms`).
 # The discriminant is ≥ 0 for c ∈ {1, w}, up to the rounding the clamp absorbs.
 function _deletion_step(h::T, w::T, c::T) where {T}
     disc = 1 - 4 * c * h * (1 - w * h)
@@ -3320,8 +3304,7 @@ end
 _scale_from_logdensity(k::AdaptiveScale, lnp) = max(k.c * exp(k.α * (lnp - k.loggbar)), k.κmin)
 
 # ln p̂ rather than p̂: the pilot density underflows to zero beyond and between far-separated
-# tail nodes, where its logarithm is still perfectly finite. `_logdensity` is what makes that
-# true; `2 log(_amplitude(...))` would reintroduce the underflow this rule exists to survive,
+# tail nodes, where its logarithm is finite. `2 log(_amplitude(...))` would underflow there,
 # and would disagree with the batch path below.
 (k::AdaptiveScale)(x::Real) = _scale_from_logdensity(k, _logdensity(k.pilot, x))
 
@@ -3340,10 +3323,10 @@ Base.show(io::IO, k::AdaptiveScale) =
 
 # Score a candidate scale end to end: merge at the local tolerance it implies, realize it on
 # the resulting nodes, and cross-validate. A κ profile spanning many orders of magnitude can
-# drive the LDLᵀ factorization of the assembled tridiagonal to an exact zero pivot; that
-# candidate is unresolvable, which is what a non-finite score already means to the searches
-# here, so it reports NaN rather than aborting the whole selection. `scorefun` takes the support
-# bounds `lo`/`hi` as its last two arguments; either may be infinite.
+# drive the LDLᵀ factorization of the assembled tridiagonal to an exact zero pivot. Such a
+# candidate is unresolvable and scores NaN, which the searches step over, rather than aborting
+# the selection. `scorefun` takes the support bounds `lo`/`hi` as its last two arguments;
+# either may be infinite.
 function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T, lo::T, hi::T) where {T}
     nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
     length(nodes) >= 2 || return T(NaN)
@@ -3429,23 +3412,21 @@ const _CSHIFTS = 6     # times the bracket may recenter on an edge minimum befor
 # the best edge until the minimum falls strictly inside. Unresolvable candidates score
 # non-finite; treating those as +∞ lets the search step over them.
 #
-# `span`/`ngrid`/`iters`/`maxshifts` default to the plug-in-scale search's own constants but
-# are independently tunable — `select_support` reuses this same coarse-grid-then-golden-with-
-# recentering pattern for both its finite-gap search (a wide span, since the gap's effect on
-# the score is gentle over a broad range) and its chained inner κ search (a narrow span about
-# the previous gap candidate's optimum). `reverse` visits the coarse grid from the wide end of
-# the bracket to the narrow end instead of the default low-to-high; `select_support`'s gap
-# search needs this so a stateful κ warm start (threaded through `score`) tracks gaps in the
-# wide-to-narrow order the coupling between gap and κ assumes. `label` names the candidate in
-# the two error messages.
-# `bounds`, when given, is an absolute `(lo, hi)` the search may never recenter past: an edge
-# minimum that coincides with a clamped bound is accepted outright rather than triggering
-# another shift, since there is nowhere sane left to look. `select_support`'s chained κ search
-# uses this to stay inside the data-scaled range `select_kappa` itself would ever consider —
-# without it, a handful of gap candidates can warm-start each other up an unbounded chain into
-# a regime where the first-order LOO expansion is no longer trustworthy and spuriously reports
-# ever-improving scores (observed directly: KLCV score turning unboundedly negative for
-# κ ≳ 1e6 on data where every sane candidate sits below 1e4).
+# `span`/`ngrid`/`iters`/`maxshifts` default to the plug-in-scale search's constants.
+# `select_support` sets them for its finite-gap search (a wide span, since the gap affects the
+# score gently over a broad range) and for its chained inner κ search (a narrow span about the
+# previous gap candidate's optimum). `reverse` visits the coarse grid from the wide end of the
+# bracket to the narrow end; `select_support`'s gap search needs this so that a stateful κ warm
+# start (threaded through `score`) tracks gaps in the wide-to-narrow order the coupling between
+# gap and κ assumes. `label` names the candidate in the error messages.
+#
+# `bounds`, when given, is an absolute `(lo, hi)` the search never recenters past: an edge
+# minimum at a clamped bound is accepted rather than triggering another shift.
+# `select_support`'s chained κ search uses it to stay inside the data-scaled range
+# `select_kappa` would consider. Without it, gap candidates can warm-start each other up an
+# unbounded chain into a regime where the first-order LOO expansion is unreliable and reports
+# spuriously improving scores (KLCV unboundedly negative for κ ≳ 1e6 on data whose reasonable
+# candidates all lie below 1e4).
 #
 # The returned c never scores non-finite: if the golden-section refinement ends on an
 # unresolvable c, the best grid point is returned instead.
@@ -3688,9 +3669,9 @@ function select_kappa(x::AbstractVector{<:Real}, adaptive::Adaptive; support::Tu
     resolution === nothing && _check_ties(xs)
     r = T(rtol)
 
-    # `pilot` chooses only a scalar starting scale, so it is called support-oblivious (any
-    # callable returning a positive scale from the sample, including ones with no notion of a
-    # boundary at all); the pilot density p̂ below is what actually carries the support.
+    # `pilot` chooses only a scalar starting scale and is called without the support, so any
+    # callable returning a positive scale from the sample works, including one with no notion
+    # of a boundary; the pilot density p̂ below carries the support.
     κ0 = T(adaptive.pilot === nothing ? select_kappa(xs; resolution=0) : adaptive.pilot(xs))
     κ0 > 0 || throw(ArgumentError("pilot must return a positive scale, got $κ0"))
     p = DensityEstimate(xs, κ0; rtol=r, support=(slo, shi))
@@ -3713,11 +3694,11 @@ function _select_power(score, gain_se, p, κ0::T, const_score::T, alphas, nse) w
     loggbar = _log_geomean(p)
 
     # The exponents are searched in increasing order, each bracket centered on the previous
-    # resolved exponent's optimum. The optimal c climbs steeply with α — a scale falling off as
-    # p̂^α needs a larger c to keep the same resolution where the data actually are — and by
-    # α = 1 it can sit well outside a bracket centered on the pilot scale. Walking α upward keeps
-    # every optimum comfortably inside its bracket. An exponent with no resolvable c in its
-    # bracket is skipped and leaves the center where it was.
+    # resolved exponent's optimum. The optimal c climbs steeply with α (a scale falling off as
+    # p̂^α needs a larger c to keep the same resolution where the data are), and by α = 1 it can
+    # lie well outside a bracket centered on the pilot scale. Walking α upward keeps every
+    # optimum inside its bracket. An exponent with no resolvable c in its bracket is skipped and
+    # leaves the center where it was.
     best_c, best_α, best_score = κ0, zero(T), typemax(T)
     c0 = κ0
     for α in sort!(collect(T, alphas))
@@ -3777,33 +3758,28 @@ const _CHAIN_SPAN = 4.0    # the chained κ search's window, ×/÷ this factor a
 const _CHAIN_GRID = 9      # its coarse grid: smaller than the plug-in-scale search's, since the
                            # window is narrow and it runs once per gap candidate
 const _CHAIN_ITERS = 12
-const _GAP_LO_MULT = 5.0   # the gap bracket's lower end, × the edge spacing — a hard floor,
-                           # never crossed even by recentering (see `_select_gap`)
+const _GAP_LO_MULT = 5.0   # the gap bracket's lower end, × the edge spacing: a hard floor,
+                           # never crossed by recentering (see `_select_gap`)
 const _GAP_HI_MULT = 100.0 # the bracket's upper end, extensible outward
 const _GAP_GRID = 9
 const _GAP_ITERS = 12
 
 # Best κ at the fixed support (lo, hi): golden-section on ln κ in a window ×/÷`_CHAIN_SPAN`
-# about the warm start `κ0`, recentering at the window edge (the `_select_c` discipline,
-# reused directly) up to a bounded number of times before erring. `κ_bounds` caps the absolute
-# range (see `_select_c`'s note): without it, a chain of gap candidates can warm-start each
-# other beyond where the LOO expansion stays trustworthy.
+# about the warm start `κ0`, recentering at the window edge (via `_select_c`) a bounded number
+# of times before throwing. `κ_bounds` caps the absolute range; see `_select_c` for why.
 _select_kappa_at_support(xs::Vector{T}, rtol::T, lo::T, hi::T, κ0::T, κ_bounds::Tuple{T,T}) where {T} =
     _select_c(κ -> _support_klcv(xs, rtol, κ, lo, hi), κ0;
              span=_CHAIN_SPAN, ngrid=_CHAIN_GRID, iters=_CHAIN_ITERS, bounds=κ_bounds)
 
-# Golden-section-refined grid search for one side's boundary gap, over ln(gap) starting from
-# the bracket [`_GAP_LO_MULT`, `_GAP_HI_MULT`] × `spacing` and extending outward — never
-# inward, past the floor — when the grid's minimum sits at the high edge: a more distant wall
-# is always a safe direction to keep searching, since it converges to the unbounded fit as the
-# gap grows. The low edge is a hard floor, the tightest gap ever tried: within a few edge
-# spacings of the extreme data point, a natural (Neumann) boundary reflects the nearest
-# interior points back onto it and inflates that point's leave-one-out likelihood on *any*
-# sample, genuine edge or not — checked directly against a brute-force leave-one-out refit, so
-# this is a property of the reflecting boundary condition itself, not an artifact of the
-# package's first-order LOO expansion. Unlike `_select_c`'s two-sided recentering (which would
-# chase this reflection effect down to an arbitrarily tight, spurious gap on every sample,
-# hard-edge or smooth alike), only the outward direction is treated as informative.
+# Golden-section-refined grid search for one side's boundary gap over ln(gap), starting from
+# the bracket [`_GAP_LO_MULT`, `_GAP_HI_MULT`] × `spacing` and extending outward when the
+# grid's minimum is at the high edge: a more distant wall converges to the unbounded fit, so
+# outward is always safe. The low edge is a hard floor. Within a few edge spacings of the
+# extreme data point, a natural (Neumann) boundary reflects the nearest interior points back
+# onto it and inflates that point's leave-one-out likelihood on any sample, edge or not. A
+# brute-force leave-one-out refit shows the same effect, so it comes from the boundary
+# condition, not from the first-order LOO expansion. Two-sided recentering, as in `_select_c`,
+# would follow this effect down to a spurious tight gap on every sample.
 function _select_gap(score, spacing::T) where {T}
     f = _lnscore(score, T)
     lo0 = log(spacing) + log(T(_GAP_LO_MULT))
@@ -3823,7 +3799,7 @@ end
 # Finite-boundary search for one side (:left or :right), the opposite side fixed at
 # `other_lo`/`other_hi`. `_select_gap` finds the gap; κ is re-optimized at every candidate by
 # `_select_kappa_at_support` in a window warm-started from the *previous* (wider) candidate's
-# optimum, so consecutive candidates' optima — which move continuously with the gap — stay
+# optimum, so consecutive candidates' optima, which move continuously with the gap, stay
 # inside their narrow search window rather than triggering its recentering fallback. `κ0`
 # warm-starts the widest candidate. Returns the winning `(gap, κ, score)`; `score` is directly
 # comparable to the ∞ arm's (the same support with this side left unbounded).
@@ -3843,11 +3819,11 @@ function _search_boundary(xs::Vector{T}, rtol::T, κ0::T, side::Symbol,
     return gap, κ, _support_klcv(xs, rtol, κ, lo, hi)
 end
 
-# Whether `challenger` beats `incumbent` by more than floating-point/golden-section noise: a
-# relative margin, not a bare `<`. A KLCV score carries ~1e-10-level noise from golden-section
-# refinement and summation order, and — per `_select_gap`'s note — a boundary at the gap floor
-# can match the unbounded score to within that noise on *any* sample; a genuine edge's gain is
-# orders of magnitude larger (percent-level), so the margin only screens out noise.
+# Whether `challenger` beats `incumbent` by more than a relative margin. A KLCV score carries
+# noise of order 1e-10 from golden-section refinement and summation order, and a boundary at
+# the gap floor (see `_select_gap`) can match the unbounded score to within that noise on any
+# sample; a true edge's gain is orders of magnitude larger (percent level), so the margin
+# screens out only noise.
 const _SUPPORT_MARGIN = 1e-8
 _beats(challenger::T, incumbent::T) where {T} =
     challenger + _SUPPORT_MARGIN * max(abs(incumbent), oneunit(T)) < incumbent
@@ -3940,8 +3916,8 @@ function select_support(x::AbstractVector{<:Real}; rtol::Real=cbrt(eps(float(elt
     r = T(rtol)
     full_search(support) = _select_by_score(_klcv, xs, kappas, r, support)
 
-    # The chained κ search never leaves the range of the grid the unbounded search used — see
-    # `_select_c`'s note on why an unbounded chain of warm starts is unsafe.
+    # The chained κ search stays within the range of the grid the unbounded search used; see
+    # `_select_c` for why an unbounded chain of warm starts is unsafe.
     κ_inf, κlo, κhi = full_search((T(-Inf), T(Inf)))
     κ_bounds = (T(κlo), T(κhi))
     score_cur = _support_klcv(xs, r, κ_inf, T(-Inf), T(Inf))

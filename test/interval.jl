@@ -114,8 +114,8 @@ function fd_errors(d, lower, upper, κ; support=(-Inf, Inf), pad=14 / (κ isa Re
     end
 end
 
-# Second-order agreement: the error at the finer grid is a quarter of the coarser one (within
-# 10%), so the FD solution converges to the nodal fit rather than to something nearby.
+# Second-order agreement: the error at the finer grid is a quarter of the coarser one, within
+# 10%, so the FD solution converges to the nodal fit.
 second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
 
 @testset "IntervalDensityEstimate" begin
@@ -764,9 +764,8 @@ end
         Hneg = PenalizedDensity._LocalHessian([d[1:end-1]; -0.1], e, H.γ, H.rq, H.n)
         @test PenalizedDensity._solve_pd(Hneg, x) === nothing
         # A tridiagonal part that is positive definite but nearly singular (last pivot ~1e-18),
-        # made well conditioned by the rank-one terms: a Newton iterate of a far-tail deletion
-        # on a rounded normal sample of 10⁵ at κ·width ≈ 17. Woodbury cancels there; the
-        # result must be declined or accurate, never an error.
+        # made well conditioned by the rank-one terms, where Woodbury cancels: the solve
+        # declines or is accurate, and does not throw.
         Hns = PenalizedDensity._LocalHessian(
             [0.0005565405939444408, 9.62217862535374e-6, 0.0006043233352390404],
             [-6.481865618175143e-5, -3.539386296912471e-5],
@@ -921,7 +920,7 @@ end
         @test (κo.c, κo.α) == (κ.c, κ.α)
         # resolution = 0: exact points, through the point path.
         @test select_kappa(round.(randn(Xoshiro(2), 300); digits=2), Adaptive(); resolution=0) isa Float64
-        # pilot receives the bounds.
+        # `pilot` receives the bounds.
         seen = Ref{Any}(nothing)
         spy(l, u) = (seen[] = (l, u); 3.0)
         κp = select_kappa(lower, upper, Adaptive(; window=nothing, alphas=(0.5,), pilot=spy))
@@ -990,8 +989,8 @@ end
     end
 
     @testset "an underflowing interval edge is unresolvable, not an error" begin
-        # The fixture of the select_kappa test above: the adaptive search's scores reject the
-        # scales at which the far edge underflows.
+        # The data of the select_kappa test above: the adaptive search's scores are NaN at the
+        # scales where the far edge underflows.
         lower = [0.0, 1.0, 2.0, 0.9, 1.5, 2.5]
         upper = [1.0, 2.0, 3.0, 0.9, 1.5, 2.5]
         @test isfinite(PenalizedDensity._interval_score(lower, upper, nothing, 50.0, rtol, -Inf, Inf))

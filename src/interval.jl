@@ -99,7 +99,7 @@ function _tail_coeffs(k2::T) where {T}
     return k, 1 / (2k), -1 / (4 * k^3)
 end
 
-# sinh(√z)/√z for z ≤ 0 (sin t / t) and small positive z.
+# sinh(√z)/√z, an entire function of z; for z < 0 it is sin t / t with t = √-z.
 function _sfun(z::T) where {T}
     abs(z) <= 1 && return _cell_series(z)[2]
     z > 0 && return sinh(sqrt(z)) / sqrt(z)
@@ -220,8 +220,8 @@ end
 
 # When the smoothing length 1/κ is far below an interval's width, the coupling between
 # neighboring intervals (flux terms of order 1/(κ²h)) falls below the roundoff in the
-# log-probability terms and the nodal solve loses accuracy; by then the estimate has long since
-# reached its limit as κ → ∞, the histogram on the recorded intervals.
+# log-probability terms and the nodal solve loses accuracy; by then the estimate is already at
+# its limit as κ → ∞, the histogram on the recorded intervals.
 function _check_resolvable(y::Vector{T}, κs::Vector{T}, cellgroup::Vector{Int}, reps) where {T}
     c = _unresolvable_cell(y, κs, cellgroup)
     c == 0 && return nothing
@@ -776,9 +776,8 @@ end
 # H \ b by the Woodbury identity on the tridiagonal part, in O(k) per rank-one term. Returns
 # `nothing` unless the tridiagonal part is positive definite (its LDLᵀ pivots all positive);
 # the rank-one terms are positive semidefinite, so H is then positive definite too. Also returns
-# `nothing` when the result is inaccurate: a tridiagonal part that is nearly singular while the
-# rank-one terms make H well conditioned (an occupied interval's cells near κ·h ≫ 1) makes the
-# identity cancel, so the solution is accepted only if its residual is below √eps of `b`.
+# `nothing` unless the residual is below √eps of `b`: the identity cancels when the tridiagonal
+# part is nearly singular but H is well conditioned (occupied cells with κ·h ≫ 1).
 function _solve_pd(H::_LocalHessian{T}, b::AbstractVector) where {T}
     k = length(H.d)
     piv = similar(H.d); l = similar(H.e)        # LDLᵀ of the tridiagonal part
@@ -859,23 +858,21 @@ end
 # or the whole location is deleted, as for `_loo_density`. Entries are `NaN` where the
 # deleted fit collapses (a non-positive held-out probability, density, or normalization).
 #
-# Both come from the full fit's Hessian without refitting. Each deletion is minimized over a
-# local set of nodal amplitudes: those of the group losing the observation (or, for a point, of
-# the groups occupying the cells beside it), widened by the groups occupying the adjacent cells.
-# The terms of those groups and any point terms on those nodes are kept exact, with the
-# multiplicity or point weight reduced; the rest of the problem enters through its quadratic
-# model in the amplitudes, reduced onto the local nodes by the Schur complement `(K_ll)⁻¹ - A`
-# (`K` the inverse Hessian in amplitudes, `A` the Hessian of the exact terms). The remaining
-# nodes follow the quadratic model, which carries the normalization to first order. The exact
-# terms matter where the smoothing length is well below the interval width: deleting an
-# observation then reshapes the field across its own and the neighboring intervals. The
-# quadratic model is taken in amplitudes because empty cells are exactly quadratic there. A
-# point bordered only by empty cells uses the nonlinear step of the point-data score. Where a
-# deletion leaves a stretch with no observations (a singleton interval, or a location deleted
-# whole, bordered only by empty cells), the held-out value comes from the source-free
-# stationarity there in the log domain, as in `_loo_terms`, so that it keeps its relative accuracy
-# when it is of order e^{-2κ·gap}. Cost is `O(m·bw²)` for the band of the inverse plus a few
-# small solves per group and per point beside an occupied cell.
+# Both come from the full fit's Hessian without refitting. Each deletion is minimized over the
+# nodal amplitudes of the group losing the observation (for a point, the groups in the cells
+# beside it) and of the groups in their adjacent cells. Those groups' terms and the point terms
+# on their nodes are kept exact, with the deleted multiplicity or weight subtracted: at a
+# smoothing length well below the interval width, a deletion reshapes the field across
+# neighboring intervals. The rest of the problem enters through its quadratic model in the
+# amplitudes (exact on empty cells), reduced onto the local nodes by the Schur complement
+# `(K_ll)⁻¹ - A` (`K` the inverse Hessian in amplitudes, `A` the Hessian of the exact terms);
+# the other nodes follow that model, which carries the normalization to first order. A point
+# bordered only by empty cells uses the nonlinear step of the point-data score. Where a deletion
+# leaves a stretch with no observations (a singleton interval, or a location deleted whole,
+# bordered only by empty cells), the held-out value comes from the source-free stationarity in
+# the log domain, as in `_loo_terms`, so that it keeps its relative accuracy at order
+# e^{-2κ·gap}. Cost: `O(m·bw²)` for the band of the inverse plus a few small solves per group
+# and per point beside an occupied cell.
 function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {T}
     holdout in (:location, :observation) ||
         throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
@@ -1109,11 +1106,10 @@ _span_nodes(gs, m::Int) = minimum(g -> first(_group_nodes(g, m)), gs):maximum(g 
 # minimizer, the local terms there, and which amplitudes are resolved.
 #
 # A node that the deletion leaves source-free next to an emptied cell falls by a factor of order
-# e^{-κh}, which the positivity cap on the step approaches only geometrically. Once an amplitude
-# is below √eps of its starting value it is negligible: its effect on the other nodes and on the
-# masses is below roundoff. Such nodes are excluded from the step cap and the convergence test and
-# held positive by dividing them by 100 whenever the step would overshoot; they are reported as
-# unresolved, and a caller that needs one of their values must not use it.
+# e^{-κh}, which the positivity cap on the step approaches only geometrically. An amplitude below
+# √eps of its starting value affects the other nodes and the masses only below roundoff, so it is
+# marked unresolved: excluded from the step cap and the convergence test, and kept positive by
+# dividing it by 100 whenever the step would overshoot. Callers must not use unresolved values.
 function _delete_local(L::_IntervalLayout{T}, gs, rs, pw::Vector{T}, v::Vector{T}, nodes,
                        loc, S::SymTridiagonal{T}, τ0) where {T}
     v0 = v[nodes]
@@ -1683,7 +1679,7 @@ function _fitted_group_mass(d::IntervalDensityEstimate{T}, g::_IntervalGroup) wh
 end
 
 # ∫ Q ln Q over a group's cells. A group reaches a tail only through a censored bound of ∓Inf,
-# so on an unbounded side, where Q = Q₁e^{-2kr} gives Q₁(ln Q₁ - 1)/(2k) in closed form;
+# so the tail is unbounded and Q = Q₁e^{-2kr} gives Q₁(ln Q₁ - 1)/(2k) in closed form;
 # interior cells use `_cell_qlogq`.
 function _group_qlogq(d::IntervalDensityEstimate{T}, g::_IntervalGroup) where {T}
     xs, ψ = d.x, d.ψ
@@ -1701,10 +1697,10 @@ function _group_qlogq(d::IntervalDensityEstimate{T}, g::_IntervalGroup) where {T
     return s
 end
 
-# ∫ Q ln Q over interior cell c, by adaptive quadrature. A fixed rule is not enough: when ψ nearly
-# vanishes just outside the cell (a trigonometric arc with |k|h near π, or a nearly linear ψ
-# falling to a small end value) ln Q is nearly singular at that end. The absolute tolerance is
-# relative to the cell's mass, so the error in ⟨ln Q⟩ is at most about `rtol` in absolute terms.
+# ∫ Q ln Q over interior cell c, by adaptive quadrature, because ln Q is nearly singular at an
+# end where ψ nearly vanishes just outside the cell (a trigonometric arc with |k|h near π, or a
+# nearly linear ψ falling to a small end value). The absolute tolerance is relative to the cell's
+# mass, so the error in ⟨ln Q⟩ is at most about `rtol` in absolute terms.
 # ln Q comes from `_cell_log_amplitude`, so a stretch where Q underflows contributes zero.
 function _cell_qlogq(d::IntervalDensityEstimate{T}, c::Int) where {T}
     rtol = eps(T)^(3 // 4)
