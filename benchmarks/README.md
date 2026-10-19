@@ -33,7 +33,7 @@ checked in; the first run resolves and installs the comparison packages.
 
 3. **Selector shootout** — `PenalizedDensity` offers several automatic scale selectors; this
    holds the estimator fixed and pits them head-to-head. The action-based selector
-   (`PenalizedDensity.select_kappa_ms`, minimum sensitivity) resolves information
+   (`PenalizedDensity.select_kappa_sensitivity`, minimum sensitivity) resolves information
    and its κ grows like `√N`; the cross-validation selectors (`PenalizedDensity.select_kappa_lscv`, LSCV;
    `select_kappa`, KL) target error and grow like `N^{1/5}`. Each row's `L1`/`ISE` is
    compared against the `oracle` κ that minimises `L1` on a scan — the best the estimator can

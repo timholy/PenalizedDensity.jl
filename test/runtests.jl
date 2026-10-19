@@ -1,5 +1,5 @@
 using PenalizedDensity
-using PenalizedDensity: select_kappa_lscv, select_kappa_ms, klcv, lscv, action_sensitivity
+using PenalizedDensity: select_kappa_lscv, select_kappa_sensitivity, klcv, lscv, action_sensitivity
 using DensityInterface: DensityInterface, DensityKind, HasDensity
 import Distributions, StatsBase
 using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
@@ -297,7 +297,7 @@ end
     @testset "λ ≈ N near the optimal κ (Eq. 10 asymptotics)" begin
         Random.seed!(1)
         x = randn(400)
-        κ = select_kappa_ms(x; kappas=exp.(range(log(0.05), log(20); length=40)))
+        κ = select_kappa_sensitivity(x; kappas=exp.(range(log(0.05), log(20); length=40)))
         d = DensityEstimate(x, κ)
         @test 0.75 < d.λ / length(x) < 1.25    # paper: λ ≈ N
         @test integrate(d, -40, 40) ≈ 1 atol = 1e-6
@@ -318,14 +318,14 @@ end
         end
     end
 
-    @testset "select_kappa_ms: analytic, grid-independent" begin
+    @testset "select_kappa_sensitivity: analytic, grid-independent" begin
         Random.seed!(2)
         x = randn(1500)
-        κ = select_kappa_ms(x)                                       # data-scaled default grid
+        κ = select_kappa_sensitivity(x)       # data-scaled default grid
         @test κ > 0
         # Golden-section refinement makes the result independent of the bracketing grid.
-        κ10  = select_kappa_ms(x; kappas = exp.(range(log(0.5), log(60); length = 10)))
-        κ200 = select_kappa_ms(x; kappas = exp.(range(log(0.5), log(60); length = 200)))
+        κ10  = select_kappa_sensitivity(x; kappas = exp.(range(log(0.5), log(60); length = 10)))
+        κ200 = select_kappa_sensitivity(x; kappas = exp.(range(log(0.5), log(60); length = 200)))
         @test κ10 ≈ κ200 rtol = 1e-3
         @test κ ≈ κ200 rtol = 1e-3
         # The returned κ is a local minimum of |dS/dln κ|.
@@ -372,7 +372,7 @@ end
         x = randn(300)
         # Each selector returns the minimizer of its score.
         for (sel, score) in ((select_kappa, klcv), (select_kappa_lscv, lscv),
-                             (select_kappa_ms, action_sensitivity))
+                             (select_kappa_sensitivity, action_sensitivity))
             κ = sel(x)
             s = score(x, κ)
             @test isfinite(s)
@@ -476,8 +476,8 @@ end
         ise(κ0) = (gg = range(-8, 8; length = 6001);
                    dd = DensityEstimate(x, κ0);
                    step(gg) * sum((dd(t) - Q(t))^2 for t in gg))
-        @test κ < select_kappa_ms(x)
-        @test ise(κ) < ise(select_kappa_ms(x))
+        @test κ < select_kappa_sensitivity(x)
+        @test ise(κ) < ise(select_kappa_sensitivity(x))
 
         # Generic indexing: OffsetArray input gives an identical result.
         @test select_kappa_lscv(OffsetArray(x, -750)) == κ
@@ -532,8 +532,8 @@ end
         kl(κ0) = (gg = range(-8, 8; length = 6001);
                   dd = DensityEstimate(x, κ0);
                   step(gg) * sum(Q(t) * log(Q(t) / dd(t)) for t in gg))
-        @test κ < select_kappa_ms(x)
-        @test kl(κ) < kl(select_kappa_ms(x))
+        @test κ < select_kappa_sensitivity(x)
+        @test kl(κ) < kl(select_kappa_sensitivity(x))
 
         # Tracks the least-squares (MISE) scale to leading order.
         @test select_kappa(x) ≈ select_kappa_lscv(x) rtol = 0.5
@@ -925,7 +925,7 @@ end
         @test PenalizedDensity.klcv(xi, xi .+ 1, 0.5) == PenalizedDensity.klcv(xf, xf .+ 1, 0.5)
         @test PenalizedDensity.lscv(xi, 0.5; resolution=0) == PenalizedDensity.lscv(xf, 0.5; resolution=0)
         @test PenalizedDensity.select_kappa_lscv(xi; resolution=0) == PenalizedDensity.select_kappa_lscv(xf; resolution=0)
-        @test PenalizedDensity.select_kappa_ms(xi) == PenalizedDensity.select_kappa_ms(xf)
+        @test PenalizedDensity.select_kappa_sensitivity(xi) == PenalizedDensity.select_kappa_sensitivity(xf)
         @test PenalizedDensity.action_sensitivity(xi, 0.5) == PenalizedDensity.action_sensitivity(xf, 0.5)
     end
 
@@ -1173,9 +1173,9 @@ end
             κ = select_kappa(chisq1, Adaptive(; window=nothing, alphas=(1.0,)))
             @test κ isa AdaptiveScale && κ.α == 1.0
             # pilot: any callable returning a positive scale from the sample.
-            κms = select_kappa(chisq1, Adaptive(; window=nothing, alphas=(0.5,), pilot=select_kappa_ms))
+            κms = select_kappa(chisq1, Adaptive(; window=nothing, alphas=(0.5,), pilot=select_kappa_sensitivity))
             @test κms isa AdaptiveScale
-            @test κms.pilot.κ == select_kappa_ms(chisq1)
+            @test κms.pilot.κ == select_kappa_sensitivity(chisq1)
             # Offset input is merged and sorted like any other vector.
             @test select_kappa(OffsetVector(chisq1, -1500), Adaptive(; window=nothing)) isa AdaptiveScale
         end
@@ -1525,7 +1525,7 @@ end
 
         # The exact distribution reproduces a direct Monte-Carlo of the fluctuation field.
         Random.seed!(1)
-        x = randn(150); d = DensityEstimate(x, select_kappa_ms(x))
+        x = randn(150); d = DensityEstimate(x, select_kappa_sensitivity(x))
         r = ChisqReference(d)
         chis = fieldmc_chisq(d; nsamp=60_000, seed=7)
         @test mean(r) ≈ mean(chis) rtol = 0.02
@@ -1712,7 +1712,7 @@ end
             bimodal = vcat(randn(N ÷ 2) .- 3, randn(N ÷ 2) .+ 3),
         )
         for (name, x) in pairs(families)
-            κ = select_kappa_ms(x)
+            κ = select_kappa_sensitivity(x)
             d = DensityEstimate(x, κ)
             @test negentropy(d) > 0
             @test negentropy(d) ≈ quad_negentropy(d, var(x)) rtol = 0.1
@@ -1722,7 +1722,7 @@ end
         negs = map((200, 2_000, 20_000)) do n
             Random.seed!(1)
             xn = randn(n)
-            dn = DensityEstimate(xn, select_kappa_ms(xn))
+            dn = DensityEstimate(xn, select_kappa_sensitivity(xn))
             abs(negentropy(dn))
         end
         @test issorted(negs; rev=true)
@@ -1731,7 +1731,7 @@ end
         # scale equivariance), and negentropy is invariant under it, for a > 0 and a < 0.
         Random.seed!(9)
         x = 1.7 .* randn(2_000) .+ 0.3
-        κ0 = select_kappa_ms(x)
+        κ0 = select_kappa_sensitivity(x)
         d0 = DensityEstimate(x, κ0)
         for a in (4.5, -3.0)
             b = -2.1
@@ -2080,10 +2080,10 @@ end
         @test_throws "κ must be finite and positive, got NaN" DensityEstimate([1.0, 2.0], NaN)
         @test_throws ArgumentError DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws "rtol must be nonnegative" DensityEstimate([1.0], 1.0; rtol=-1.0)
-        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
-        @test_throws "kappas must be sorted and positive" select_kappa_ms([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
-        @test_throws ArgumentError select_kappa_ms([1.0, 2.0]; kappas=[1.0, 2.0])  # need ≥ 3
-        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_ms([1.0, 2.0]; kappas=[1.0, 2.0])
+        @test_throws ArgumentError select_kappa_sensitivity([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws "kappas must be sorted and positive" select_kappa_sensitivity([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
+        @test_throws ArgumentError select_kappa_sensitivity([1.0, 2.0]; kappas=[1.0, 2.0])  # need ≥ 3
+        @test_throws "need at least 3 values in kappas to bracket the minimum" select_kappa_sensitivity([1.0, 2.0]; kappas=[1.0, 2.0])
 
         @test_throws ArgumentError select_kappa_lscv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
         @test_throws "kappas must be sorted and positive" select_kappa_lscv([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
@@ -2596,7 +2596,7 @@ end
     @testset "unbounded regression" begin
         Random.seed!(60)
         x = randn(150)
-        d = DensityEstimate(x, select_kappa_ms(x))
+        d = DensityEstimate(x, select_kappa_sensitivity(x))
         r = ChisqReference(d)
         d2 = DensityEstimate(x, d.κ; support=(-Inf, Inf))
         r2 = ChisqReference(d2)
@@ -2892,7 +2892,7 @@ end
 if VERSION >= v"1.11"
     @testset "public API" begin
         for n in (:ConvergenceError, :SolveStats, :merge_samples, :roughness_operator,
-                  :select_kappa_lscv, :select_kappa_ms, :klcv, :lscv, :action_sensitivity)
+                  :select_kappa_lscv, :select_kappa_sensitivity, :klcv, :lscv, :action_sensitivity)
             @test Base.ispublic(PenalizedDensity, n) && !Base.isexported(PenalizedDensity, n)
         end
     end

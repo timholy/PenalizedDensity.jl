@@ -90,12 +90,12 @@ and, where it minimizes a score, as a function that evaluates that score at a gi
 |:--|:--|:--|
 | likelihood cross-validation (KLCV) | [`select_kappa`](@ref) | [`klcv`](@ref) |
 | least-squares cross-validation (LSCV) | [`select_kappa_lscv`](@ref) | [`lscv`](@ref) |
-| minimum sensitivity | [`select_kappa_ms`](@ref) | [`action_sensitivity`](@ref) |
+| minimum sensitivity | [`select_kappa_sensitivity`](@ref) | [`action_sensitivity`](@ref) |
 
 Evaluating a score over a range of ``\kappa`` shows how sharply its minimum is defined:
 
 ```@example tutorial
-using PenalizedDensity: klcv, lscv, action_sensitivity, select_kappa_lscv, select_kappa_ms
+using PenalizedDensity: klcv, lscv, action_sensitivity, select_kappa_lscv, select_kappa_sensitivity
 κs = exp.(range(log(0.5), log(50); length = 41))
 scores = [klcv(xs, κ) for κ in κs]
 κs[argmin(scores)], κ_kl                     # best grid point and the selected scale
@@ -114,13 +114,13 @@ range of test densities `select_kappa` tracks the error-optimal scale more close
 `benchmarks/`), and it is cheaper, because it needs no ``\int \hat Q^2`` term. LSCV has no
 interval form, so rounded data should go to `select_kappa` with `resolution`.
 
-[`select_kappa_ms`](@ref) resolves *information* in the data rather than minimizing error. It
-returns the point of *minimum sensitivity*, where [`action_sensitivity`](@ref)
+[`select_kappa_sensitivity`](@ref) resolves *information* in the data rather than minimizing
+error. It returns the point of *minimum sensitivity*, where [`action_sensitivity`](@ref)
 ``= |dS/d\ln\kappa|`` is smallest. The derivative is computed analytically, so the result is
 free of the noise that finite-differencing the action curve would introduce.
 
 ```@example tutorial
-κ_ms = select_kappa_ms(xs)
+κ_ms = select_kappa_sensitivity(xs)
 ```
 
 On smooth densities minimum sensitivity over-resolves: its scale grows faster with ``N`` than

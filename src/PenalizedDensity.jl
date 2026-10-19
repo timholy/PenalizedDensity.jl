@@ -20,7 +20,8 @@ export gaussianize, ungaussianize, gaussianize_logjacobian
 # `public` is a syntax error before Julia 1.11.
 if VERSION >= v"1.11"
     eval(Expr(:public, :ConvergenceError, :SolveStats, :merge_samples, :roughness_operator,
-                       :select_kappa_lscv, :select_kappa_ms, :klcv, :lscv, :action_sensitivity))
+                       :select_kappa_lscv, :select_kappa_sensitivity, :klcv, :lscv,
+                       :action_sensitivity))
 end
 
 """
@@ -1945,7 +1946,7 @@ end
     action(d::DensityEstimate) -> S
 
 Classical action `S[ψ_cl] = N - λ - Σᵢ wᵢ ln Q(xᵢ)` (Eq. 10) of the fitted density,
-where `N = Σ wᵢ`. Used by [`select_kappa_ms`](@ref).
+where `N = Σ wᵢ`. Used by [`select_kappa_sensitivity`](@ref).
 """
 function action(d::DensityEstimate)
     N = sum(d.w)
@@ -2661,7 +2662,7 @@ function _is_rounded(resolution)
 end
 
 """
-    select_kappa_ms(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
+    select_kappa_sensitivity(x; kappas=<data-scaled grid>, rtol=cbrt(eps(T))) -> κ
 
 Choose the smoothing scale by the principle of minimum sensitivity: return the `κ` at which
 the classical action [`action`](@ref) `S` is least sensitive to the scale, i.e. the `κ`
@@ -2684,8 +2685,9 @@ search, bracketed by the grid `kappas`. This is a principled convention rather t
 optimum: `S` has no exact stationary point in `κ`, so the flattest point depends on measuring
 sensitivity in `ln κ`.
 """
-function select_kappa_ms(x::AbstractVector{<:Real}; kappas::AbstractVector{<:Real}=_default_κs(x),
-                         rtol::Real=cbrt(eps(float(eltype(x)))))
+function select_kappa_sensitivity(x::AbstractVector{<:Real};
+                                  kappas::AbstractVector{<:Real}=_default_κs(x),
+                                  rtol::Real=cbrt(eps(float(eltype(x)))))
     _check_kappa_grid(kappas)
     xs, r = _sensitivity_sample(x, rtol)
     return _minimize_on_grid(κ -> _action_sensitivity(xs, r, κ), kappas, eltype(xs))
@@ -2696,9 +2698,9 @@ end
 
 The minimum-sensitivity score `s = |dS/d ln κ|` of the scale `κ` for data `x`, where `S` is the
 classical [`action`](@ref) of the unbounded fit [`DensityEstimate`](@ref)`(x, κ; rtol)`.
-[`select_kappa_ms`](@ref) returns the `κ` minimizing it; evaluating it over a range of `κ` shows
-how sharply that minimum is defined. The derivative is computed analytically. Like
-`select_kappa_ms`, it takes point data only.
+[`select_kappa_sensitivity`](@ref) returns the `κ` minimizing it; evaluating it over a range
+of `κ` shows how sharply that minimum is defined. The derivative is computed analytically.
+Like `select_kappa_sensitivity`, it takes point data only.
 """
 function action_sensitivity(x::AbstractVector{<:Real}, κ::Real; rtol::Real=cbrt(eps(float(eltype(x)))))
     xs, r = _sensitivity_sample(x, rtol)
@@ -2877,8 +2879,8 @@ Choose the smoothing scale by least-squares cross-validation: return the `κ` mi
 an unbiased estimate — up to the `κ`-independent `∫Q²` — of the integrated squared error
 `∫(Q̂_κ - Q)²`, where `Q̂_{κ,-i}` is the density fitted with the `i`-th point left out. Its
 minimizer therefore targets minimum mean integrated squared error (MISE). This generally
-selects a coarser scale than [`select_kappa_ms`](@ref) (minimum sensitivity), which resolves
-information rather than squared error and tends to over-resolve smooth densities.
+selects a coarser scale than [`select_kappa_sensitivity`](@ref) (minimum sensitivity), which
+resolves information rather than squared error and tends to over-resolve smooth densities.
 
 `support`, `kappas`, `rtol` and `holdout` mean what they do for [`select_kappa`](@ref).
 `resolution` may be `nothing` (check for ties) or `0` (accept the values as exact points);
@@ -2968,7 +2970,8 @@ the default grid stops where `κ` times the widest interval reaches 4096, beyond
 at its histogram limit and cannot be computed accurately.
 
 [`klcv`](@ref) evaluates the score at a given `κ`. See the "Comparing selection criteria" section
-of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and [`select_kappa_ms`](@ref).
+of the manual for the alternative criteria [`select_kappa_lscv`](@ref) and
+[`select_kappa_sensitivity`](@ref).
 
 # Extended help
 
@@ -3507,8 +3510,8 @@ noise. The scores are the interval-likelihood KLCV scores, and `N` counts all ob
 
 `pilot` is a scale-selection method, and is called on the sample alone with no notion of
 `support`; the pilot density it scales is what is fitted on `support`. So a selector with no
-notion of a boundary, like [`select_kappa_ms`](@ref), remains usable as `pilot` on a bounded
-domain. Because `support` is fixed throughout the `α` search, composing with
+notion of a boundary, like [`select_kappa_sensitivity`](@ref), remains usable as `pilot` on a
+bounded domain. Because `support` is fixed throughout the `α` search, composing with
 [`select_support`](@ref) re-runs that search on each boundary arm's own domain, so `α` gets to
 respond to whatever regularity a boundary already bought, rather than being reused from an
 unbounded selection that saw a different edge.
