@@ -762,11 +762,13 @@ end
 # roundoff imposes on it, so the returned amplitudes, not only `F`, are accurate to that
 # tolerance. Reaching `maxiter` throws a `ConvergenceError`.
 #
-# A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts.
+# A `SolveStats` passed as `stats` accumulates the Newton-step and backtracking counts. `start`,
+# if given, is a strictly positive starting point, such as the solution for nearby weights.
 function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
-                          stats::Union{Nothing,SolveStats}=nothing) where {T<:AbstractFloat}
+                          stats::Union{Nothing,SolveStats}=nothing,
+                          start::Union{Nothing,AbstractVector}=nothing) where {T<:AbstractFloat}
     n = length(w)
-    ψ = fill(oneunit(T), n)             # strictly positive start
+    ψ = start === nothing ? fill(oneunit(T), n) : Vector{T}(start)   # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
     Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
     W = sum(w)                          # total multiplicity, the scale of F's two terms
@@ -2832,6 +2834,8 @@ _log_coupling(x::Vector{T}, κ::T, κ̄::T, k::Int) where {T} = -logabssinh(κ *
 _log_coupling(x::Vector{T}, κs::Vector{T}, κ̄::T, k::Int) where {T} =
     log(κ̄ / κs[k]) - logabssinh(κs[k] * (x[k+1] - x[k]))
 
+const _LOO_REFIT_SHARE = 0.01   # tie groups above this share of the sample are deleted exactly
+
 # Normalized amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node, in O(N). Dropping
 # one observation at node i decrements wᵢ; the deleted field is a Newton step of that problem from
 # the full solution, along the direction H⁻¹eᵢ (H the fit's SPD Hessian ∇²F = M + diag(w/φ²)). A
@@ -2855,14 +2859,29 @@ _log_coupling(x::Vector{T}, κs::Vector{T}, κ̄::T, k::Int) where {T} =
 # On continuous data the step closely tracks a full leave-one-out refit (wᵢ decremented, a
 # singleton node dropped) across the scale range.
 #
-# `holdout = :location` instead deletes all wᵢ observations at node i, the held-out value then
-# lying away from every atom of the remaining sample. Deleting c observations (c = 1 or wᵢ) takes
-# the step τ = c·t along the same direction, with node i's stationarity at weight wᵢ - c fixing
-# τ²h(1 - wᵢh) - τ + c = 0; the root continuous with the first-order step is
+# The held-out values are computed per location: `locations = (node, count)` lists the distinct
+# values of the sample, location k holding `count[k]` copies of one value merged into node
+# `node[k]`, in sample order. Merging joins distinct values within a fraction `rtol` of the
+# smoothing length, so a node can hold many locations. `locations = nothing` takes each node as
+# one location of wᵢ copies.
+#
+# `holdout = :location` deletes all copies of the held-out value, which then lies away from
+# every atom of the remaining sample; `:observation` deletes one. Deleting c of node i's wᵢ
+# observations takes the step τ = c·t along the same direction, with node i's stationarity at
+# weight wᵢ - c fixing τ²h(1 - wᵢh) - τ + c = 0; the root continuous with the first-order step is
 # τ = 2c/(1 + √(1 - 4ch(1 - wᵢh))), the node amplitude becomes φᵢ(1 - τh), and Zₜ = Z - 2τvᵢ/φᵢ.
 # For c = wᵢ the discriminant is (1 - 2wᵢh)² and the node collapses at wᵢh = 1/2, as a single
-# isolated point does at h = 1/2. At wᵢ = 1 the two modes coincide. On tied data, leaving out a
-# single copy of a repeated value rewards spikes at the atoms, so `:location` is the default.
+# isolated point does at h = 1/2. On tied data, leaving out a single copy of a repeated value
+# rewards spikes at the atoms, so `:location` is the default.
+#
+# The step is accurate while the deletion is a small part of the sample. Values merged only
+# because they are close are therefore held out one at a time: deleting a whole node that holds
+# a large share of the sample (at a small κ, the merge tolerance spans much of the data) makes
+# the step overshoot and the held-out density spuriously high. Deleting a tie group of more
+# than one copy and more than a fraction `_LOO_REFIT_SHARE` of the sample is instead done
+# exactly, by refitting on the same operator with node i's weight reduced by c (to zero if the
+# node holds only that location, where the amplitude is source-free). There are at most
+# 1/_LOO_REFIT_SHARE such groups, each costing one fit.
 #
 # When all of node i's observations are deleted (c = wᵢ), node i's stationarity at weight zero is
 # source-free, (Mφ')ᵢ = 0, so the deleted amplitude is also φ'ᵢ = Σⱼ (-Mᵢⱼ) φ'ⱼ / Mᵢᵢ over the
@@ -2871,27 +2890,52 @@ _log_coupling(x::Vector{T}, κs::Vector{T}, κ̄::T, k::Int) where {T} =
 # density is of order e^{-2κ·gap}; the neighbor sum has positive terms and is formed in the log
 # domain, so it holds its relative accuracy there. That form is used whenever c = wᵢ.
 #
-# Returns ψ, the log of each squared deleted amplitude (NaN where a neighbor's linear update is
-# not positive), and each deleted normalization Zₜ; see `_loo_density` and `_loo_logdensity`.
+# Returns ψ, and per location the log of the squared deleted amplitude (NaN where a neighbor's
+# linear update is not positive) and the deleted normalization Zₜ; see `_loo_density` and
+# `_loo_logdensity`.
 function _loo_terms(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
-                    holdout::Symbol=:location) where {T}
+                    holdout::Symbol=:location, locations=nothing) where {T}
     holdout in (:location, :observation) ||
         throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
     M = _operator(nodes, κ, κL, κR, lo, hi)
     φ = _solve_amplitude(M, w)
     Z, Gφ = _norm_sq_gram(nodes, φ, κ, κL, κR, lo, hi)
-    H = SymTridiagonal(M.dv .+ w ./ φ.^2, M.ev)
+    H = SymTridiagonal(M.dv .+ w ./ φ.^2, copy(M.ev))
     gii, gnext = _inv_band(H)
     v = ldiv!(ldlt!(H), Gφ)             # H⁻¹Gφ; H is consumed, its inverse band already extracted
     κ̄ = _reference_scale(κ, κL, κR)
     n = length(φ)
-    la2 = similar(φ)
-    Zt = similar(φ)
-    for i in eachindex(φ, w)
-        h = gii[i] / φ[i]^2                             # single-observation leverage
-        c = holdout === :location ? w[i] : one(T)       # observations deleted
+    N = sum(w)
+    locnode, loccount = locations === nothing ? (eachindex(w), w) : locations
+    la2 = similar(φ, length(locnode))
+    Zt = similar(la2)
+    for k in eachindex(locnode, loccount, la2)
+        i = locnode[k]
+        c = holdout === :location ? loccount[k] : one(T)    # observations deleted
+        if c > 1 && c > _LOO_REFIT_SHARE * N
+            if c == N                                       # nothing left to fit
+                la2[k] = Zt[k] = T(NaN)
+                continue
+            end
+            wd = copy(w)
+            wd[i] -= c
+            # Start from the full fit, rescaled to the reduced total weight (Mφ = w./φ).
+            φd = _solve_amplitude(M, wd; start=φ .* sqrt((N - c) / N))
+            Zt[k] = first(_norm_sq_gram(nodes, φd, κ, κL, κR, lo, hi))
+            if wd[i] == 0
+                # Source-free: the neighbor sum, in the log domain as below.
+                l = T(-Inf)
+                i > 1 && (l = logaddexp(l, _log_coupling(nodes, κ, κ̄, i - 1) + log(φd[i-1])))
+                i < n && (l = logaddexp(l, _log_coupling(nodes, κ, κ̄, i) + log(φd[i+1])))
+                la2[k] = 2 * (l - log(M.dv[i]))
+            else
+                la2[k] = 2 * log(φd[i])
+            end
+            continue
+        end
+        h = gii[i] / φ[i]^2                                 # single-observation leverage
         τ = _deletion_step(h, w[i], c)
-        Zt[i] = Z - 2 * τ * v[i] / φ[i]
+        Zt[k] = Z - 2 * τ * v[i] / φ[i]
         if c == w[i]
             l = T(-Inf)
             if i > 1
@@ -2902,15 +2946,40 @@ function _loo_terms(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, h
                 φj = φ[i+1] - τ * gnext[i] / φ[i]
                 l = φj > 0 ? logaddexp(l, _log_coupling(nodes, κ, κ̄, i) + log(φj)) : T(NaN)
             end
-            la2[i] = 2 * (l - log(M.dv[i]))
+            la2[k] = 2 * (l - log(M.dv[i]))
         else
-            la2[i] = log((φ[i] * (1 - τ * h))^2)
+            la2[k] = log((φ[i] * (1 - τ * h))^2)
         end
     end
     return φ ./ sqrt(Z), la2, Zt
 end
 
-# Normalized amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every node (see `_loo_terms`).
+# The locations of the sorted sample `xs` merged into nodes of weights `w`, as `_loo_terms`
+# takes them: each run of equal values, with the node it merged into and its count. Merging
+# collapses contiguous runs of `xs`, so node i holds the next `w[i]` observations in order.
+function _locations(xs::Vector{T}, w::Vector{T}) where {T}
+    locnode = Int[]
+    loccount = T[]
+    j = firstindex(xs)
+    for i in eachindex(w)
+        jend = j + Int(w[i]) - 1        # an integer count: merging only ever adds oneunit(T)
+        for jj in j:jend
+            if jj > j && xs[jj] == xs[jj-1]
+                loccount[end] += oneunit(T)
+            else
+                push!(locnode, i)
+                push!(loccount, oneunit(T))
+            end
+        end
+        j = jend + 1
+    end
+    j == lastindex(xs) + 1 ||
+        error("merged weights sum to $(sum(w)), but the sample has $(length(xs)) observations")
+    return locnode, loccount
+end
+
+# Normalized amplitude ψ and the leave-one-out densities Q̂₋ᵢ(xᵢ) at every location (see
+# `_loo_terms`).
 function _loo_density(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
                       kwargs...) where {T}
     ψ, la2, Zt = _loo_terms(nodes, w, κ, κL, κR, lo, hi; kwargs...)
@@ -2926,7 +2995,8 @@ function _loo_logdensity(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo:
 end
 
 # The step τ for deleting c of the w observations at a node of leverage h (see `_loo_terms`).
-# The discriminant is ≥ 0 for c ∈ {1, w}, up to the rounding the clamp absorbs.
+# The discriminant is ≥ 0 for 0 < c ≤ w (h(1 - wh) ≤ 1/(4w)), up to the rounding the clamp
+# absorbs.
 function _deletion_step(h::T, w::T, c::T) where {T}
     disc = 1 - 4 * c * h * (1 - w * h)
     return 2c / (1 + sqrt(max(disc, zero(disc))))
@@ -2935,12 +3005,14 @@ end
 # Least-squares cross-validation score LSCV(κ) = ∫Q̂² - (2/N) Σᵢ wᵢ Q̂₋ᵢ(xᵢ), with an optional
 # natural boundary at `lo`/`hi`: an unbiased estimate, up to the κ-independent ∫Q², of the
 # integrated squared error ∫(Q̂-Q)².
-function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
-    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi; kwargs...)
+function _lscv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+               locations=nothing, kwargs...) where {T}
+    ψ, looi = _loo_density(nodes, w, κ, κL, κR, lo, hi; locations, kwargs...)
+    m = locations === nothing ? w : locations[2]
     N = sum(w)
     cross = zero(T)
-    for i in eachindex(w, looi)
-        cross += w[i] * looi[i]
+    for k in eachindex(m, looi)
+        cross += m[k] * looi[k]
     end
     return _int_quartic(nodes, ψ, κ, κL, κR, lo, hi) - 2 * cross / N
 end
@@ -2949,12 +3021,14 @@ end
 # -(1/N) Σᵢ wᵢ ln Q̂₋ᵢ(xᵢ), with an optional natural boundary at `lo`/`hi`: an estimate, up to a
 # κ-independent constant, of KL(Q ‖ Q̂_κ). Reuses the same leave-one-out densities as _lscv, in
 # the log domain. An undefined held-out log density returns NaN so the search rejects κ.
-function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T; kwargs...) where {T}
-    _, ℓ = _loo_logdensity(nodes, w, κ, κL, κR, lo, hi; kwargs...)
+function _klcv(nodes::Vector{T}, w::Vector{T}, κ, κL::T, κR::T, lo::T, hi::T;
+               locations=nothing, kwargs...) where {T}
+    _, ℓ = _loo_logdensity(nodes, w, κ, κL, κR, lo, hi; locations, kwargs...)
+    m = locations === nothing ? w : locations[2]
     s = zero(T)
-    for i in eachindex(w, ℓ)
-        isfinite(ℓ[i]) || return T(NaN)
-        s += w[i] * ℓ[i]
+    for k in eachindex(m, ℓ)
+        isfinite(ℓ[k]) || return T(NaN)
+        s += m[k] * ℓ[k]
     end
     return -s / sum(w)
 end
@@ -3166,8 +3240,10 @@ function _scoring_sample(x::AbstractVector{<:Real}, rtol::Real, support::Tuple{R
 end
 
 # `scorefun` at the constant scale κ, on the nodes merged at tolerance `r/κ`.
-_score_at(scorefun, xs, r, slo, shi, κ; holdout::Symbol=:location) =
-    scorefun(_merge_presorted(xs, r / κ)..., κ, κ, κ, slo, shi; holdout)
+function _score_at(scorefun, xs, r, slo, shi, κ; holdout::Symbol=:location)
+    nodes, w = _merge_presorted(xs, r / κ)
+    return scorefun(nodes, w, κ, κ, κ, slo, shi; holdout, locations=_locations(xs, w))
+end
 
 # A scale passed to a score function, converted to the working type `T`.
 _score_scale(κ::Real, ::Type{T}) where {T} = _kappa_in(T, κ)
@@ -3331,7 +3407,7 @@ function _score_kappa(scorefun, xs::Vector{T}, κfun, rtol::T, lo::T, hi::T) whe
     nodes, w, κs, κL, κR = _merge_and_realize(xs, κfun, rtol)
     length(nodes) >= 2 || return T(NaN)
     try
-        return scorefun(nodes, w, κs, κL, κR, lo, hi)
+        return scorefun(nodes, w, κs, κL, κR, lo, hi; locations=_locations(xs, w))
     catch e
         e isa ZeroPivotException && return T(NaN)
         rethrow()
@@ -3341,10 +3417,9 @@ end
 # Leave-one-out log densities ln Q̂₋ⱼ(xⱼ), one per observation of the sorted sample `xs`, for the
 # candidate scale `κfun`: a constant (a `Real`, merged and scored exactly as the constant
 # candidate in the adaptive `select_kappa`) or any scale function (merged and scored as
-# `_score_kappa` does). Each observation takes the value at the node it merged into; merging
-# collapses contiguous runs of `xs`, so node i covers the next `w[i]` observations in order.
-# Hence `-mean` of the result is `_klcv` on the same nodes, up to rounding. Entries whose node has
-# an undefined leave-one-out log density are NaN, and an unresolvable candidate (fewer than two
+# `_score_kappa` does). Each observation takes the value at its location (see `_locations`),
+# so `-mean` of the result is `_klcv` on the same nodes, up to rounding. Entries whose location
+# has an undefined leave-one-out log density are NaN, and an unresolvable candidate (fewer than two
 # nodes, or an exact zero pivot) returns all NaN, matching the NaN score `_klcv`/`_score_kappa`
 # report in those cases.
 function _loo_logdensities(xs::Vector{T}, κ::Real, rtol::T, lo::T, hi::T) where {T}
@@ -3361,18 +3436,17 @@ function _loo_logdensities(xs::Vector{T}, nodes::Vector{T}, w::Vector{T}, κ, κ
                            lo::T, hi::T) where {T}
     ℓ = fill(T(NaN), length(xs))
     length(nodes) >= 2 || return ℓ
-    ℓnode = try
-        _loo_logdensity(nodes, w, κ, κL, κR, lo, hi)[2]
+    locations = _locations(xs, w)
+    ℓloc = try
+        _loo_logdensity(nodes, w, κ, κL, κR, lo, hi; locations)[2]
     catch e
         e isa ZeroPivotException && return ℓ
         rethrow()
     end
-    sum(w) == length(xs) ||
-        error("merged weights sum to $(sum(w)), but the sample has $(length(xs)) observations")
     j = firstindex(ℓ)
-    for i in eachindex(w, ℓnode)
-        v = isfinite(ℓnode[i]) ? ℓnode[i] : T(NaN)
-        m = Int(w[i])               # an integer count: merging only ever adds oneunit(T)
+    for (k, count) in pairs(locations[2])
+        v = isfinite(ℓloc[k]) ? ℓloc[k] : T(NaN)
+        m = Int(count)
         ℓ[j:j+m-1] .= v
         j += m
     end
@@ -3678,7 +3752,7 @@ function select_kappa(x::AbstractVector{<:Real}, adaptive::Adaptive; support::Tu
 
     # The constant scale, scored on the same footing as the adaptive candidates. The 7-arg
     # `_klcv` reduces to the unbounded arithmetic exactly when `slo, shi = -Inf, Inf`.
-    const_score = _klcv(_merge_presorted(xs, r / κ0)..., κ0, κ0, κ0, slo, shi)
+    const_score = _score_at(_klcv, xs, r, slo, shi, κ0)
     score(κfun) = _score_kappa(_klcv, xs, κfun, r, slo, shi)
     gain_se(κa) = _adaptive_gain(xs, κ0, κa, r, slo, shi)
     κp, sp = _select_power(score, gain_se, p, κ0, const_score, adaptive.alphas, adaptive.nse)
@@ -3747,7 +3821,7 @@ function _support_klcv(xs::Vector{T}, rtol::T, κ::T, lo::T, hi::T) where {T}
     nodes, w = _merge_presorted(xs, rtol / κ)
     length(nodes) >= 2 || return T(NaN)
     try
-        return _klcv(nodes, w, κ, κ, κ, lo, hi)
+        return _klcv(nodes, w, κ, κ, κ, lo, hi; locations=_locations(xs, w))
     catch e
         e isa ZeroPivotException && return T(NaN)
         rethrow()

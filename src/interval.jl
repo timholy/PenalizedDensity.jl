@@ -127,6 +127,11 @@ _group_nodes(g::_IntervalGroup, m::Int) = max(g.first, 1):min(g.last + 1, m)
 struct _IntervalLayout{T}
     y::Vector{T}                     # sorted distinct nodes
     w::Vector{T}                     # point multiplicity at each node
+    # Point locations, sorted: the distinct (lower, upper) pairs whose bounds share a node (a
+    # point, or an interval narrower than the merge tolerance), with that node and their count.
+    lockey::Vector{Tuple{T,T}}
+    locnode::Vector{Int}
+    loccount::Vector{T}
     groups::Vector{_IntervalGroup{T}}
     cellgroup::Vector{Int}           # cellgroup[c+1]: the group containing cell c, or 0
     κs::Vector{T}                    # scale on each interior cell
@@ -181,6 +186,7 @@ function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol
     m = length(y)
     w = zeros(T, m)
     keys = Tuple{Int,Int,T,T,T}[]    # (lower node or 0, upper node or m+1, lower, upper, count)
+    pts = Tuple{T,T,Int,T}[]         # (lower, upper, node, count)
     for i in eachindex(lower, upper)
         a, b = T(lower[i]), T(upper[i])
         cnt = counts === nothing ? one(T) : T(counts[i])
@@ -188,8 +194,18 @@ function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol
         ib = isfinite(b) ? searchsortedlast(y, b) : m + 1
         if ia == ib             # a point, or an interval narrower than the merge tolerance
             w[ia] += cnt
+            push!(pts, (a, b, ia, cnt))
         else
             push!(keys, (ia, ib, a, b, cnt))
+        end
+    end
+    sort!(pts)
+    lockey, locnode, loccount = Tuple{T,T}[], Int[], T[]
+    for (a, b, i, cnt) in pts
+        if !isempty(lockey) && lockey[end] == (a, b)
+            loccount[end] += cnt
+        else
+            push!(lockey, (a, b)); push!(locnode, i); push!(loccount, cnt)
         end
     end
     sort!(keys; by=k -> (k[1], k[2]))
@@ -215,7 +231,7 @@ function _interval_layout(lower::AbstractVector, upper::AbstractVector, κ, rtol
     κs, κL, κR = _layout_kappa(κ, y)
     strict || _unresolvable_cell(y, κs, cellgroup) == 0 || return nothing
     _check_resolvable(y, κs, cellgroup, reps)
-    return _IntervalLayout{T}(y, w, groups, cellgroup, κs, κL, κR, lo, hi)
+    return _IntervalLayout{T}(y, w, lockey, locnode, loccount, groups, cellgroup, κs, κL, κR, lo, hi)
 end
 
 # When the smoothing length 1/κ is far below an interval's width, the coupling between
@@ -853,10 +869,10 @@ end
 # _interval_loo(L; holdout=:location) -> (lp, ld)
 #
 # Held-out log-probabilities for interval data: `lp[j]` is `ln(P₋/Z₋)` for group `j` refitted
-# with one of its observations deleted, and `ld[i]` the held-out log-density at node `i`
-# (`NaN` where the node carries no point observation), with `holdout` choosing whether one point
-# or the whole location is deleted, as for `_loo_density`. Entries are `NaN` where the
-# deleted fit collapses (a non-positive held-out probability, density, or normalization).
+# with one of its observations deleted, and `ld[k]` the held-out log-density at point location
+# `k` (`L.lockey[k]`), with `holdout` choosing whether one point or the whole location is
+# deleted, as for `_loo_density`. Entries are `NaN` where the deleted fit collapses (a
+# non-positive held-out probability, density, or normalization).
 #
 # Both come from the full fit's Hessian without refitting. Each deletion is minimized over the
 # nodal amplitudes of the group losing the observation (for a point, the groups in the cells
@@ -871,8 +887,13 @@ end
 # leaves a stretch with no observations (a singleton interval, or a location deleted whole,
 # bordered only by empty cells), the held-out value comes from the source-free stationarity in
 # the log domain, as in `_loo_terms`, so that it keeps its relative accuracy at order
-# e^{-2κ·gap}. Cost: `O(m·bw²)` for the band of the inverse plus a few small solves per group
-# and per point beside an occupied cell.
+# e^{-2κ·gap}. A point location of more than one copy and more than a fraction
+# `_LOO_REFIT_SHARE` of the observations is deleted exactly by a refit, as in `_loo_terms`. If
+# that leaves its node with no observations and no occupied cell beside it, far enough out that
+# the refit's s = v² there is too small for its Hessian to stay positive definite, the location
+# couples to the rest of the fit only at order e^{-κ·gap}; the one-step deletion with the
+# neighbor sum, accurate in that regime, is used instead. Cost: `O(m·bw²)` for the band of the inverse plus a few small solves per group
+# and per point beside an occupied cell, and at most 1/_LOO_REFIT_SHARE refits.
 function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {T}
     holdout in (:location, :observation) ||
         throw(ArgumentError("holdout must be :location or :observation, got :$holdout"))
@@ -915,12 +936,31 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
         Zm = Z - loc.P + Pm + dZ(nodes, loc, Kinv, δ)
         isfinite(lP) && Zm > 0 && (lp[j] = lP - log(Zm))
     end
-    ld = fill(T(NaN), m)
-    for i in 1:m
+    ld = fill(T(NaN), length(L.locnode))
+    N = sum(L.loccount) + sum(g -> g.r, L.groups; init=zero(T))
+    for k in eachindex(L.locnode, L.loccount, ld)
+        i = L.locnode[k]
         w = L.w[i]
-        w == 0 && continue
+        c = holdout === :location ? L.loccount[k] : one(T)
+        if c > 1 && c > _LOO_REFIT_SHARE * N
+            # A large tie group: deleted exactly by a refit, as in `_loo_terms`.
+            wd = copy(L.w)
+            wd[i] -= c
+            Ld = _IntervalLayout{T}(L.y, wd, L.lockey, L.locnode, L.loccount, L.groups, L.cellgroup,
+                                    L.κs, L.κL, L.κR, L.lo, L.hi)
+            res = try
+                _solve_interval(Ld)
+            catch e
+                e isa Union{LinearAlgebra.PosDefException,_UnresolvableScale} || rethrow()
+                nothing
+            end
+            if res !== nothing
+                sd, Ed = res
+                sd[i] > 0 && Ed.Z > 0 && (ld[k] = log(sd[i]) - log(Ed.Z))
+                continue
+            end
+        end
         h = 2 * Kv(i, i) / v[i]^2               # leverage, in the convention of `_loo_density`
-        c = holdout === :location ? w : one(T)
         τ = _deletion_step(h, w, c)
         Zm = Z - 2 * τ * KgZ[i] / v[i]
         touching = unique!(filter(!=(0), [L.cellgroup[i], L.cellgroup[i+1]]))
@@ -955,7 +995,7 @@ function _interval_loo(L::_IntervalLayout{T}; holdout::Symbol=:location) where {
         else
             lv2 = log((v[i] * (1 - τ * h))^2)
         end
-        isfinite(lv2) && Zm > 0 && (ld[i] = lv2 - log(Zm))
+        isfinite(lv2) && Zm > 0 && (ld[k] = lv2 - log(Zm))
     end
     return lp, ld
 end
@@ -1204,11 +1244,10 @@ function _interval_klcv(L::_IntervalLayout{T}; holdout::Symbol=:location) where 
         s += g.r * l
         n += g.r
     end
-    for i in eachindex(L.w, ld)
-        L.w[i] == 0 && continue
-        isfinite(ld[i]) || return T(NaN)
-        s += L.w[i] * ld[i]
-        n += L.w[i]
+    for (cnt, l) in zip(L.loccount, ld)
+        isfinite(l) || return T(NaN)
+        s += cnt * l
+        n += cnt
     end
     return -s / n
 end
@@ -1761,7 +1800,7 @@ end
 
 # Held-out log-likelihood of each observation (each distinct pair, with `counts`), in the order
 # of `eachindex(lower, upper)`: the log-probability of its interval or the log-density at its
-# point, as `_interval_loo` gives them for the group or node it belongs to. The `counts`-weighted
+# point, as `_interval_loo` gives them for its group or location. The `counts`-weighted
 # mean of the result is `-_interval_klcv` up to rounding. All NaN when `κ` is unresolvable;
 # entries whose held-out value is undefined are NaN.
 function _interval_loo_obs(lower, upper, counts, κ, rtol::T, lo::T, hi::T) where {T}
@@ -1776,7 +1815,7 @@ function _interval_loo_obs(lower, upper, counts, κ, rtol::T, lo::T, hi::T) wher
         a, b = T(lower[i]), T(upper[i])
         ia = isfinite(a) ? searchsortedlast(L.y, a) : 0
         ib = isfinite(b) ? searchsortedlast(L.y, b) : m + 1
-        v = ia == ib ? ld[ia] : lp[L.cellgroup[ia+1]]
+        v = ia == ib ? ld[searchsortedfirst(L.lockey, (a, b))] : lp[L.cellgroup[ia+1]]
         ℓ[j] = isfinite(v) ? v : T(NaN)
     end
     return ℓ

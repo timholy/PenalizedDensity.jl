@@ -373,6 +373,41 @@ end
         end
     end
 
+    @testset "held-out locations: merged values and large tie groups" begin
+        PD = PenalizedDensity
+        # At small κ the merge tolerance rtol/κ spans much of the sample, so a node holds many
+        # distinct values. Each is still held out alone: the two holdouts agree, and since the
+        # fit is flat at 1 on (0, 1), every held-out log density is close to 0.
+        xu = rand(Xoshiro(71), 500)
+        for κ in (3e-3, 3e-5, 1e-5)
+            nodes, _ = PD._merge_presorted(sort(xu), cbrt(eps()) / κ)
+            s = klcv(xu, κ; support=(0.0, 1.0))
+            @test s == klcv(xu, κ; support=(0.0, 1.0), holdout=:observation)
+            @test abs(s) < 1e-4
+            κ == 1e-5 && @test length(nodes) <= 5
+        end
+        @test PD._locations([1.0, 2.0, 2.0, 3.0, 3.0, 3.0], [3.0, 3.0]) == ([1, 1, 2], [1.0, 2.0, 3.0])
+        # A tie group holding a large share of the sample is deleted exactly.
+        for (support, base) in (((-Inf, Inf), randn(Xoshiro(1), 400)), ((0.0, 1.0), rand(Xoshiro(1), 400))),
+                κ in (0.3, 30.0)
+            xs = sort([base; fill(0.5, 100)])
+            nodes, w = PD._merge_presorted(xs, cbrt(eps()) / κ)
+            locs = PD._locations(xs, w)
+            _, ℓ = PD._loo_logdensity(nodes, w, κ, κ, κ, support...; locations=locs)
+            k = findfirst(==(100.0), locs[2])
+            @test nodes[locs[1][k]] == 0.5
+            @test ℓ[k] ≈ logdensity(DensityEstimate(base, κ; support), 0.5) rtol = 1e-8
+        end
+        # Ten coincident points and one other: leaving out the ten copies refits on the single
+        # remaining point, and stays finite where that held-out density underflows (κ·gap ≫ 1).
+        y = vcat(fill(0.0, 10), [100.0])
+        for κ in (0.01, 1.0, 10.0)
+            ℓ = PD._loo_logdensities(y, κ, cbrt(eps()), -Inf, Inf)
+            @test ℓ[1:10] ≈ fill(logdensity(DensityEstimate([100.0], κ), 0.0), 10) rtol = 1e-8
+            @test isfinite(klcv(y, κ; resolution=0))
+        end
+    end
+
     @testset "score functions" begin
         Random.seed!(12)
         x = randn(300)
@@ -1110,7 +1145,7 @@ end
         # χ²₁: a divergent edge at 0, the regularity limit a constant scale cannot resolve.
         chisq1 = sort!(randn(Xoshiro(19), 3000).^2)
         rtol = cbrt(eps(Float64))
-        klcv_const(x, κ) = klcv_unbounded(PenalizedDensity._merge_presorted(x, rtol / κ)..., κ)
+        klcv_const(x, κ) = PenalizedDensity._score_at(PenalizedDensity._klcv, x, rtol, -Inf, Inf, κ)
         klcv_scale(x, k) = PenalizedDensity._score_kappa(PenalizedDensity._klcv, x, k, rtol, -Inf, Inf)
 
         @testset "AdaptiveScale evaluates c·(p̂/ḡ)^α" begin
@@ -1285,9 +1320,6 @@ end
             # A grid with no finite score is an error.
             @test_throws PenalizedDensity.ConvergenceError mog(_ -> NaN, κs)
             @test_throws "no κ in kappas" mog(_ -> Inf, κs)
-            # Through the public API: ten coincident points and one other merge to two
-            # nodes, where no κ yields a finite leave-one-out score.
-            @test_throws "no κ in kappas" select_kappa(vcat(fill(0.0, 10), [100.0]); resolution=0)
             # A minimum at either end of a given grid is an error.
             @test_throws "the minimum is at the upper end of kappas (κ = 100.0" mog(κ -> (log(κ) - log(500.0))^2, κs)
             @test_throws "the minimum is at the lower end of kappas (κ = 0.1" mog(κ -> (log(κ) - log(0.01))^2, κs)
@@ -1330,10 +1362,10 @@ end
         @testset "an unresolvable candidate scores NaN" begin
             # A κ profile spanning many orders of magnitude can give the factorization an exact
             # zero pivot; that candidate scores NaN.
-            zero_pivot(args...) = throw(ZeroPivotException(3))
+            zero_pivot(args...; kw...) = throw(ZeroPivotException(3))
             @test isnan(PenalizedDensity._score_kappa(zero_pivot, chisq1, _ -> 5.0, rtol, -Inf, Inf))
             # Any other exception propagates.
-            other(args...) = throw(DomainError(1.0, "something else went wrong"))
+            other(args...; kw...) = throw(DomainError(1.0, "something else went wrong"))
             @test_throws DomainError PenalizedDensity._score_kappa(other, chisq1, _ -> 5.0, rtol, -Inf, Inf)
             # Too few nodes to fit: scored NaN before the scorefun is ever reached.
             @test isnan(PenalizedDensity._score_kappa(zero_pivot, [1.0], _ -> 5.0, rtol, -Inf, Inf))
@@ -1369,7 +1401,7 @@ end
         PD = PenalizedDensity
         rtol = cbrt(eps(Float64))
         klcv_scale(x, k) = PD._score_kappa(PD._klcv, x, k, rtol, -Inf, Inf)
-        klcv_const(x, κ) = klcv_unbounded(PD._merge_presorted(x, rtol / κ)..., κ)
+        klcv_const(x, κ) = PD._score_at(PD._klcv, x, rtol, -Inf, Inf, κ)
 
         @testset "window statistics match their definition" begin
             y = sort!(randn(Xoshiro(1), 500))
@@ -2180,9 +2212,11 @@ end
         κ32 = select_kappa(Float32.(x))
         @test κ32 isa Float32
         # The default rtol, cbrt(eps(T)), is looser for Float32; at a common rtol the two
-        # types agree.
-        @test κ32 ≈ select_kappa(x; rtol=cbrt(eps(Float32))) rtol = 2e-3
-        @test select_kappa(Float32.(x); rtol=Float32(cbrt(eps()))) ≈ select_kappa(x) rtol = 0.02
+        # types agree. The score is flat near its minimum, so Float32 rounding in the score
+        # moves the minimizer by about 0.6% (one standard deviation over samples), and by
+        # about 2.6% at the tighter Float64 rtol.
+        @test κ32 ≈ select_kappa(x; rtol=cbrt(eps(Float32))) rtol = 0.03
+        @test select_kappa(Float32.(x); rtol=Float32(cbrt(eps()))) ≈ select_kappa(x) rtol = 0.1
     end
 
     @testset "error model: NaN throws, non-convergence throws ConvergenceError" begin
@@ -2904,11 +2938,14 @@ end
         @test max(El, Ei, Er) < 1e-6
         @test abs(left + interior + right - 1) < 1e-6
 
-        # Uniform on its true (0, 1) support. On this sample the power family is selected.
+        # Uniform on its true (0, 1) support: the selected fit is flat. The power and window
+        # candidates both reach a flat fit, with scores that differ by far less than the window
+        # rule's penalty k·γ/√N, so the power family is selected.
         xu = rand(Xoshiro(71), 500)
         κu = select_kappa(xu, Adaptive(); support=(0.0, 1.0))
         @test κu isa AdaptiveScale
         du = DensityEstimate(xu, κu; support=(0.0, 1.0))
+        @test maximum(t -> abs(du(t) - 1), 0.0:0.01:1.0) < 1e-6
         @test cdf(du, 0.0) == 0.0 && cdf(du, 1.0) == 1.0
         mass, _ = quadgk(du, 0.0, 1.0; rtol=1e-8)
         @test mass ≈ 1 atol=1e-4
