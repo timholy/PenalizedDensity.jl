@@ -98,6 +98,7 @@ end
 
 """
     DensityEstimate(x, κ; support=(-Inf, Inf), rtol=cbrt(eps(float(eltype(x)))))
+    DensityEstimate{T}(x, κ; support=(-Inf, Inf), rtol=cbrt(eps(T)))
 
 Estimate a continuous one-dimensional probability density from sample points `x`,
 using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
@@ -105,6 +106,11 @@ using the scalar-field method of Holy, *Phys. Rev. Lett.* **79**, 3545 (1997).
 `κ` is either a positive number, giving one scale everywhere, or a callable `κ(x)` returning
 the scale local to `x`; larger `κ` gives a rougher estimate. See [`select_kappa`](@ref) for
 choosing it automatically.
+
+The fit's floating-point type `T` is the promotion of the data, `κ`, `rtol` and any finite
+`support` bound; an infinite bound does not widen it. `DensityEstimate{T}(x, κ; …)` sets `T`
+instead, converting the data and parameters to it: `DensityEstimate{Float32}(x, κ)` fits
+`Float64` data in single precision.
 
 `support = (a, b)` fits the density on a finite domain instead of all of `ℝ`; either end may be
 `-Inf`/`Inf` for a one-sided or fully unbounded fit (the default). The density `Q` is exactly
@@ -179,7 +185,7 @@ unbounded line.
 Passing a [`SolveStats`](@ref) as the `stats` keyword records the Newton-step and backtracking
 counts of the fixed-scale solve, for benchmarking; it does not change the fit.
 """
-struct DensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
+struct DensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: AbstractDensityEstimate
     x::Vector{T}   # sorted, distinct node locations
     w::Vector{T}   # weight (multiplicity) at each node
     ψ::Vector{T}   # normalized amplitude at the nodes
@@ -190,7 +196,7 @@ struct DensityEstimate{T<:AbstractFloat,K} <: AbstractDensityEstimate
     hi::T          # right edge of the support; +Inf for an unbounded right tail
     λ::T           # normalization multiplier (diagnostic)
 
-    function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ) where {T<:AbstractFloat,K}
+    function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ) where {T<:AbstractFloat,K<:Union{T,Vector{T}}}
         length(x) == length(w) == length(ψ) ||
             throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
                                     "got $(length(x)), $(length(w)), $(length(ψ))"))
@@ -214,11 +220,27 @@ DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T}
 
 function DensityEstimate(x::AbstractVector{R}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
                          rtol::Real=cbrt(eps(float(R))), stats=nothing) where R<:Real
+    a, b = _check_support_bounds(support)
+    T = _estimate_eltype(x, κ, rtol, a, b)
+    return DensityEstimate{T}(x, κ; support, rtol, stats)
+end
+
+function DensityEstimate{T}(x::AbstractVector{<:Real}, κ; support::Tuple{Real,Real}=(-Inf, Inf),
+                            rtol::Real=cbrt(eps(T)), stats=nothing) where {T<:AbstractFloat}
     _check_rtol(rtol)
     isempty(x) && throw(ArgumentError("cannot fit a density to zero points"))
-    lo, hi = _check_support_bounds(support)
-    return _estimate(x, κ, rtol, lo, hi; stats)
+    a, b = _check_support_bounds(support)
+    return _estimate(T, x, κ, rtol, a, b; stats)
 end
+
+# The working float type of a fit: the promotion of the data, scale, tolerance and finite
+# support bounds. A callable scale's precision is seen by sampling it at a data point.
+_estimate_eltype(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real) where {R<:Real} =
+    float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
+_estimate_eltype(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real) = _vector_scale_error()
+_estimate_eltype(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real) where {R<:Real} =
+    float(promote_type(R, typeof(rtol), isempty(x) ? Bool : typeof(κfun(first(x))),
+                       _support_eltype(a), _support_eltype(b)))
 
 # Every data point must lie in the requested support, or the boundary terms below (a cosh arc
 # pinned at the wall) would be fit against data outside their own domain.
@@ -235,9 +257,9 @@ end
 # Float32 fit. `Bool` is the promotion lattice's bottom numeric type, so it drops out here.
 _support_eltype(a) = isfinite(a) ? typeof(a) : Bool
 
-function _estimate(x::AbstractVector{R}, κ::Real, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
+function _estimate(::Type{T}, x::AbstractVector{<:Real}, κ::Real, rtol::Real, a::Real, b::Real;
+                   stats=nothing) where {T}
     _check_kappa(κ)
-    T = float(promote_type(R, typeof(κ), typeof(rtol), _support_eltype(a), _support_eltype(b)))
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)
@@ -248,17 +270,15 @@ end
 # The nodes are not known until the data has been merged, and the merge tolerance is itself
 # rtol/κ(x) — so there is no node geometry a caller could have aligned a per-interval vector
 # to. The scale has to arrive as a function of position.
-_estimate(::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
+_estimate(::Type, ::AbstractVector{<:Real}, ::AbstractVector, ::Real, ::Real, ::Real; stats=nothing) =
     _vector_scale_error()
 _vector_scale_error() =
     throw(ArgumentError("the smoothing scale cannot be given as a vector: node merging depends " *
                         "on the local scale, so the nodes it would index do not exist yet. Pass a " *
                         "callable `κ(x)` instead; the fit reports the realized per-interval rates."))
 
-function _estimate(x::AbstractVector{R}, κfun, rtol::Real, a::Real, b::Real; stats=nothing) where {R<:Real}
-    # The scale's own precision joins the promotion, as a scalar κ's would; sampling κfun at a
-    # data point is the only way to see it.
-    T = float(promote_type(R, typeof(rtol), typeof(κfun(first(x))), _support_eltype(a), _support_eltype(b)))
+function _estimate(::Type{T}, x::AbstractVector{<:Real}, κfun, rtol::Real, a::Real, b::Real;
+                   stats=nothing) where {T}
     xs = _sorted_sample(x, T)
     lo, hi = T(a), T(b)
     _check_support(xs, lo, hi)

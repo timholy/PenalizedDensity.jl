@@ -508,6 +508,31 @@ second_order(errs) = 3.6 < errs[1] / errs[2] < 4.4
         @test_throws DimensionMismatch IntervalDensityEstimate([0.0, 1.0], [1.0], 1.0)
     end
 
+    @testset "IntervalDensityEstimate{T}: every call form reaches one constructor" begin
+        x = round.(randn(Xoshiro(2), 300); digits=1)
+        lower, upper = PenalizedDensity._lattice_bounds(x, 0.1, (-Inf, Inf))
+        κfun(t) = 1.5 * (1 + exp(-t^2))
+        d = IntervalDensityEstimate(lower, upper, 1.5)
+        @test IntervalDensityEstimate{Float64}(lower, upper, 1.5).ψ == d.ψ
+        @test IntervalDensityEstimate{Float64}(x, 1.5; resolution=0.1).ψ == d.ψ
+        @test IntervalDensityEstimate(x, 1.5; resolution=0.1).ψ == d.ψ
+        @test IntervalDensityEstimate{Float64}(lower, upper, κfun).ψ == IntervalDensityEstimate(lower, upper, κfun).ψ
+        # An explicit T converts the observations and parameters, including a callable's values.
+        d32 = IntervalDensityEstimate{Float32}(lower, upper, 1.5)
+        @test d32 isa IntervalDensityEstimate{Float32,Float32}
+        @test d32.ψ == IntervalDensityEstimate(Float32.(lower), Float32.(upper), 1.5f0).ψ
+        @test IntervalDensityEstimate{Float32}(lower, upper, κfun) isa IntervalDensityEstimate{Float32,Vector{Float32}}
+        @test IntervalDensityEstimate{Float32}(x, 1.5; resolution=0.1) isa IntervalDensityEstimate{Float32,Float32}
+        @test_throws "pass the lattice spacing" IntervalDensityEstimate{Float32}(x, 1.5)
+        # The field-level constructor stores κ in the fit's type.
+        di = IntervalDensityEstimate{Float64}(d.x, d.w, d.ψ, d.k2, d.kL, d.kR, Float32(1.5), d.κL, d.κR,
+                                              d.lo, d.hi, d.groups, d.λ)
+        @test di isa IntervalDensityEstimate{Float64,Float64}
+        @test_throws TypeError IntervalDensityEstimate{Float64,Float32}(d.x, d.w, d.ψ, d.k2, d.kL, d.kR,
+                                                                       1.5f0, d.κL, d.κR, d.lo, d.hi,
+                                                                       d.groups, d.λ)
+    end
+
     @testset "input validation" begin
         @test_throws "overlapping intervals are not supported" IntervalDensityEstimate([0.0, 0.5], [1.0, 1.5], 1.0)
         @test_throws "lower ≤ upper" IntervalDensityEstimate([1.0], [0.0], 1.0)

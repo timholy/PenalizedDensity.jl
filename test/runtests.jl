@@ -929,6 +929,28 @@ end
         @test PenalizedDensity.action_sensitivity(xi, 0.5) == PenalizedDensity.action_sensitivity(xf, 0.5)
     end
 
+    @testset "DensityEstimate{T}: every call form reaches one constructor" begin
+        x = randn(MersenneTwister(2), 300)
+        κfun(t) = 1.5 * (1 + exp(-t^2))
+        d = DensityEstimate(x, 1.5)
+        @test DensityEstimate{Float64}(x, 1.5).ψ == d.ψ
+        @test DensityEstimate{Float64}(x, κfun).ψ == DensityEstimate(x, κfun).ψ
+        @test DensityEstimate{Float64}(x, 1.5; support=(-5, 5)).ψ == DensityEstimate(x, 1.5; support=(-5, 5)).ψ
+        # An explicit T converts the data and parameters, including a callable's values.
+        d32 = DensityEstimate{Float32}(x, 1.5)
+        @test d32 isa DensityEstimate{Float32,Float32}
+        @test d32.ψ == DensityEstimate(Float32.(x), 1.5f0).ψ
+        a32 = DensityEstimate{Float32}(x, κfun)
+        @test a32 isa DensityEstimate{Float32,Vector{Float32}}
+        @test a32.ψ == DensityEstimate(Float32.(x), t -> Float32(κfun(t))).ψ
+        @test_throws "cannot be given as a vector" DensityEstimate{Float64}(x, [1.0, 2.0])
+        @test_throws "zero points" DensityEstimate{Float32}(Float64[], 1.0)
+        @test_throws "zero points" DensityEstimate(Float64[], κfun)
+        # K is tied to T: a scale of another float type cannot be stored.
+        @test_throws TypeError DensityEstimate{Float64,Vector{Float32}}(d.x, d.w, d.ψ, Float32[1], 1.0, 1.0,
+                                                                        -Inf, Inf, 1.0)
+    end
+
     @testset "broadcasting treats a fit as a scalar" begin
         x = [-1.5, 0.2, 0.2, 1.1, 3.4]
         fits = (DensityEstimate(x, 1.1),
