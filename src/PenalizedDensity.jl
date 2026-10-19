@@ -1471,12 +1471,15 @@ end
 
 # Unnormalized cumulative mass ∫_{lo}^{x} ψ² dt, from the node cumulatives `d.F`: zero at or below
 # `lo` (an unreachable comparison when `lo = -Inf`) and the grand total at or above `hi`. The
-# tails are elementary exponential integrals when unbounded; a finite boundary integrates the
-# cosh-arc segment from whichever end (wall or node) is nearer x, so its absolute error vanishes
-# toward both ends and the CDF stays continuous through the boundary node — the same discipline
-# `_cdf_mass_interior` applies at interior nodes. `x` is converted to the fit's element type.
+# tails are elementary exponential integrals when unbounded. A finite boundary segment is
+# integrated from whichever end (wall or node) bounds the smaller part of the segment's mass,
+# so the partial mass is never a difference of nearly equal quantities. Choosing by mass rather
+# than by distance matters in a steep segment, where nearly all the mass sits near the node and
+# a point nearer the node can still have only a sliver of mass between it and the wall. The
+# CDF stays continuous through the boundary node, as `_cdf_mass_interior` keeps it at interior
+# nodes. `x` is converted to the fit's element type.
 function _cdf_mass(d::AbstractDensityEstimate, xin::Real)
-    xs, ψ, F = d.x, d.ψ, d.F
+    xs, ψ, F, G = d.x, d.ψ, d.F, d.G
     T = eltype(F)
     n = length(xs)
     κL, κR = _tail_rates(d)
@@ -1486,14 +1489,14 @@ function _cdf_mass(d::AbstractDensityEstimate, xin::Real)
         isfinite(d.lo) || return ψ[1]^2 / (2κL) * exp(2κL * (x - xs[1]))
         x <= d.lo && return zero(T)
         v, u = κL * (x - d.lo), κL * (xs[1] - d.lo)
-        return v <= u / 2 ? _boundary_mass_from_wall(ψ[1], κL, v, u) :
-                            F[1] - _boundary_mass_from_node(ψ[1], κL, v, u)
+        mw = _boundary_mass_from_wall(ψ[1], κL, v, u)   # F[1] is the segment's mass
+        return mw <= F[1] / 2 ? mw : F[1] - _boundary_mass_from_node(ψ[1], κL, v, u)
     elseif x >= xs[n]
         isfinite(d.hi) || return F[n] + ψ[n]^2 / (2κR) * (-expm1(-2κR * (x - xs[n])))
-        x >= d.hi && return F[n] + _right_end_mass(d)
+        x >= d.hi && return F[n] + G[n]
         vp, u = κR * (d.hi - x), κR * (d.hi - xs[n])
-        return vp >= u / 2 ? F[n] + _boundary_mass_from_node(ψ[n], κR, vp, u) :
-                             F[n] + _right_end_mass(d) - _boundary_mass_from_wall(ψ[n], κR, vp, u)
+        mn = _boundary_mass_from_node(ψ[n], κR, vp, u)  # G[n] is the segment's mass
+        return mn <= G[n] / 2 ? F[n] + mn : F[n] + (G[n] - _boundary_mass_from_wall(ψ[n], κR, vp, u))
     end
     k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
     return _cdf_mass_interior(d, k, x)
@@ -1532,13 +1535,14 @@ function _ccdf_mass_interior(d::DensityEstimate, k::Int, x::Real)
     end
 end
 
-# Unnormalized mass above x, ∫_x^{hi} ψ² dt: the complement of `_cdf_mass`, integrated from
-# whichever end is nearer x for the same reason (its absolute error vanishes toward both ends).
-# The transport feeds Φ⁻¹ the smaller of `_cdf_mass`/`_ccdf_mass`, so within a boundary segment
-# the near-wall side — computed here from the wall rather than as `total - _cdf_mass` — keeps
-# full relative precision where that difference would cancel.
+# Unnormalized mass above x, ∫_x^{hi} ψ² dt: the complement of `_cdf_mass`, with a boundary
+# segment integrated from whichever end bounds the smaller part of its mass, as there. The
+# transport feeds Φ⁻¹ the smaller of `_cdf_mass`/`_ccdf_mass`, and `_quantile` inverts the
+# right segment through this function, so within a boundary segment the near-wall side —
+# computed here from the wall rather than as `total - _cdf_mass` — keeps full relative
+# precision where that difference would cancel.
 function _ccdf_mass(d::AbstractDensityEstimate, xin::Real)
-    xs, ψ, G = d.x, d.ψ, d.G
+    xs, ψ, F, G = d.x, d.ψ, d.F, d.G
     T = eltype(G)
     n = length(xs)
     κL, κR = _tail_rates(d)
@@ -1548,14 +1552,14 @@ function _ccdf_mass(d::AbstractDensityEstimate, xin::Real)
         isfinite(d.hi) || return ψ[n]^2 / (2κR) * exp(-2κR * (x - xs[n]))
         x >= d.hi && return zero(T)
         vp, u = κR * (d.hi - x), κR * (d.hi - xs[n])
-        return vp <= u / 2 ? _boundary_mass_from_wall(ψ[n], κR, vp, u) :
-                             G[n] - _boundary_mass_from_node(ψ[n], κR, vp, u)
+        mw = _boundary_mass_from_wall(ψ[n], κR, vp, u)  # G[n] is the segment's mass
+        return mw <= G[n] / 2 ? mw : G[n] - _boundary_mass_from_node(ψ[n], κR, vp, u)
     elseif x <= xs[1]
         isfinite(d.lo) || return G[1] + ψ[1]^2 / (2κL) * (-expm1(2κL * (x - xs[1])))
-        x <= d.lo && return G[1] + _left_end_mass(d)
+        x <= d.lo && return G[1] + F[1]
         v, u = κL * (x - d.lo), κL * (xs[1] - d.lo)
-        return v >= u / 2 ? G[1] + _boundary_mass_from_node(ψ[1], κL, v, u) :
-                            G[1] + _left_end_mass(d) - _boundary_mass_from_wall(ψ[1], κL, v, u)
+        mn = _boundary_mass_from_node(ψ[1], κL, v, u)   # F[1] is the segment's mass
+        return mn <= F[1] / 2 ? G[1] + mn : G[1] + (F[1] - _boundary_mass_from_wall(ψ[1], κL, v, u))
     end
     k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
     return _ccdf_mass_interior(d, k, x)
@@ -1673,10 +1677,10 @@ DensityInterface.densityof(d::AbstractDensityEstimate, x::Real) = d(x)
 # Closed-form quantile in an unbounded exponential tail: target = ψ₁²/(2κ) e^{2κ(x-x₁)}.
 _left_tail_quantile(ψ1::T, κ::T, x1::T, target::T) where {T} = x1 + log(2κ * target / ψ1^2) / (2κ)
 
-# Mirror of `_left_tail_quantile` for the right tail, solved through the complement 1 - q so
-# upper quantiles lose no more precision than `q` itself carries.
-_right_tail_quantile(ψn::T, κ::T, xn::T, total::T, q::Real) where {T} =
-    xn - log(2κ * (total * (1 - q)) / ψn^2) / (2κ)
+# Mirror of `_left_tail_quantile` for the right tail, solved through the upper-tail
+# probability cq = 1 - q so upper quantiles keep the precision cq carries.
+_right_tail_quantile(ψn::T, κ::T, xn::T, total::T, cq::T) where {T} =
+    xn - log(2κ * (total * cq) / ψn^2) / (2κ)
 
 # Safeguarded Newton (bisection fallback) for the `y` solving `massfun(y) == target` on
 # `[lo, hi]`, where `massfun` is increasing with derivative `ψ(y)²`.
@@ -1693,17 +1697,20 @@ function _invert_mass(d::AbstractDensityEstimate, massfun, lo::T, hi::T, y::T, t
     throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
 end
 
-# The right boundary segment is inverted through the mass above y, `total - _cdf_mass`, and
-# its target `(1 - q)·total`, which keep precision as `q → 1`, mirroring
-# `_right_tail_quantile`'s use of `1 - q`. Both are negated so that `_invert_mass` sees an
+# `cq` is the upper-tail probability 1 - q. Callers that know it more precisely than `1 - q`
+# (`_ungaussianize`, from ln(1 - Φ(y))) pass it; for q ≥ 1/2 the default is exact. The right
+# side is solved through it: the unbounded tail in closed form, and the boundary segment by
+# inverting the mass above y, `_ccdf_mass`, against the target cq·total. `_ccdf_mass` is
+# accumulated from the wall, so it keeps full relative precision where `total - _cdf_mass`
+# would cancel to the resolution of `total`. It is negated so that `_invert_mass` sees an
 # increasing function.
-function _quantile(d::AbstractDensityEstimate, qin::Real)
+function _quantile(d::AbstractDensityEstimate, qin::Real, cqin::Real = 1 - qin)
     0 <= qin <= 1 || throw(DomainError(qin, "quantile is defined only for probabilities 0 ≤ q ≤ 1"))
-    xs, ψ, F, total = d.x, d.ψ, d.F, d.total
+    xs, ψ, F, G, total = d.x, d.ψ, d.F, d.G, d.total
     T = eltype(F)
     n = length(xs)
     κL, κR = _tail_rates(d)
-    q = T(qin)
+    q, cq = T(qin), T(cqin)
     target = q * total
     if target <= F[1]
         isfinite(d.lo) || return _left_tail_quantile(ψ[1], κL, xs[1], target)
@@ -1713,10 +1720,10 @@ function _quantile(d::AbstractDensityEstimate, qin::Real)
         y = F[1] > 0 ? d.lo + (target / F[1]) * (xs[1] - d.lo) : d.lo
         return _invert_mass(d, t -> _cdf_mass(d, t), d.lo, xs[1], y, target)
     elseif target >= F[n]
-        isfinite(d.hi) || return _right_tail_quantile(ψ[n], κR, xs[n], total, q)
-        ctarget = (1 - q) * total           # = total - target, precise as q → 1
-        y = total > F[n] ? d.hi - (ctarget / (total - F[n])) * (d.hi - xs[n]) : d.hi
-        return _invert_mass(d, t -> _cdf_mass(d, t) - total, xs[n], d.hi, y, -ctarget)
+        isfinite(d.hi) || return _right_tail_quantile(ψ[n], κR, xs[n], total, cq)
+        ctarget = cq * total                # = total - target, precise as q → 1
+        y = G[n] > 0 ? d.hi - (ctarget / G[n]) * (d.hi - xs[n]) : d.hi
+        return _invert_mass(d, t -> -_ccdf_mass(d, t), xs[n], d.hi, y, -ctarget)
     end
     k = searchsortedlast(F, target)     # F[k] ≤ target < F[k+1], so 1 ≤ k < n
     lok, hik = xs[k], xs[k+1]
@@ -1805,7 +1812,7 @@ function _ungaussianize(d::AbstractDensityEstimate, yin::Real)
         if isinf(d.hi) && r <= log(G[n] / total)    # right tail: ln(1-F) is linear in x
             return xs[n] - (r + log(2 * κR * total / ψ[n]^2)) / (2 * κR)
         end
-        return _quantile(d, 1 - exp(r))
+        return _quantile(d, 1 - exp(r), exp(r))
     end
 end
 
