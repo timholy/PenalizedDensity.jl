@@ -1769,12 +1769,6 @@ end
 # ---------------------------------------------------------------------------------------------
 # Spatially varying scale
 
-function AdaptiveScale(c::Real, α::Real, pilot::IntervalDensityEstimate{T}) where {T}
-    α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
-    c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
-    return AdaptiveScale{T}(T(c), T(α), pilot, _log_geomean(pilot), T(_KAPPA_FLOOR) * T(c))
-end
-
 # ln ḡ over the pilot's observations, -entropy(d): a point contributes ln p̂ at the point, an
 # interval observation the pilot's mean of ln p̂ over its interval.
 function _log_geomean(d::IntervalDensityEstimate)

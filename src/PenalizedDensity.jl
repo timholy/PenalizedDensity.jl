@@ -3119,30 +3119,29 @@ The scale is floored at `1e-6 c`, which intercepts underflow of `(p̂/ḡ)^α` a
 the pilot density is negligible; the floor sits far below any scale the rule would
 otherwise choose, so it never shapes the fit.
 """
-struct AdaptiveScale{T<:AbstractFloat,D}
+struct AdaptiveScale{T<:AbstractFloat,D<:AbstractDensityEstimate}
     c::T           # scale where the pilot density equals its geometric mean
     α::T           # exponent coupling the scale to the pilot density
     pilot::D       # the pilot density estimate p̂
     loggbar::T     # ln ḡ, the mean of ln p̂ over the pilot's sample
     κmin::T        # underflow floor
 
-    function AdaptiveScale{T,D}(c, α, pilot, loggbar, κmin) where {T<:AbstractFloat,D}
-        return new{T,D}(c, α, pilot, loggbar, κmin)
+    # `loggbar` must equal `_log_geomean(pilot)`. It is an argument only so that a search over
+    # many `c` for one pilot computes it once; for an interval pilot it costs an entropy integral.
+    function AdaptiveScale{T,D}(c, α, pilot, loggbar=_log_geomean(pilot)) where {T<:AbstractFloat,
+                                                                                D<:AbstractDensityEstimate}
+        α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
+        c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
+        return new{T,D}(c, α, pilot, loggbar, T(_KAPPA_FLOOR) * T(c))
     end
 end
 
-AdaptiveScale{T}(c, α, pilot::D, loggbar, κmin) where {T,D} =
-    AdaptiveScale{T,D}(c, α, pilot, loggbar, κmin)
+AdaptiveScale{T}(c, α, pilot::D, args...) where {T,D} = AdaptiveScale{T,D}(c, α, pilot, args...)
+AdaptiveScale(c::Real, α::Real, pilot::AbstractDensityEstimate) = AdaptiveScale{eltype(pilot)}(c, α, pilot)
 
 # The pilot density underflows to zero between two far-separated tail nodes, sending
 # (p̂/ḡ)^α there to zero; the floor keeps the assembled operator's coth(θ)/κ entries finite.
 const _KAPPA_FLOOR = 1e-6
-
-function AdaptiveScale(c::Real, α::Real, pilot::DensityEstimate{T}) where {T}
-    α > 0 || throw(ArgumentError("the exponent α must be positive, got $α"))
-    c > 0 || throw(ArgumentError("the scale c must be positive, got $c"))
-    return AdaptiveScale{T}(T(c), T(α), pilot, _log_geomean(pilot), T(_KAPPA_FLOOR) * T(c))
-end
 
 # ln ḡ = (1/N) Σᵢ ln p̂(xᵢ) over the pilot's sample. Merged points share their node's density,
 # so the node weights carry the sample's multiplicities.
@@ -3561,7 +3560,7 @@ function _select_power(score, gain_se, p, κ0::T, const_score::T, alphas, nse) w
     best_c, best_α, best_score = κ0, zero(T), typemax(T)
     c0 = κ0
     for α in sort!(collect(T, alphas))
-        scale(c) = AdaptiveScale{T}(c, α, p, loggbar, T(_KAPPA_FLOOR) * c)
+        scale(c) = AdaptiveScale{T}(c, α, p, loggbar)
         res = _select_c_scored(c -> score(scale(c)), c0; skip_unresolved=true)
         res === nothing && continue
         c0, s = res

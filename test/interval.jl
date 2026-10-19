@@ -963,5 +963,6 @@ end
         κ = AdaptiveScale(2.0, 0.5, d)
         @test κ(0.25) ≈ 2.0 * exp(0.5 * (logdensity(d, 0.25) - expect))
         @test_throws "must be positive" AdaptiveScale(2.0, 0.0, d)
+        @test κ.loggbar == AdaptiveScale{Float64,typeof(d)}(2.0, 0.5, d).loggbar == expect
     end
 end
