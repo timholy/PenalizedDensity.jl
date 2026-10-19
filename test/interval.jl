@@ -630,7 +630,7 @@ end
 
 # Literal deletion refits, the estimand of `_interval_loo`: for each interval group of the layout,
 # the log-probability of its interval under the fit with one of its observations removed, and for
-# each point node the log-density there with all of its observations removed.
+# each point location the log-density at its node with all of its observations removed.
 function held_out_refit(lower, upper, κ; support=(-Inf, Inf))
     L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), float.(support)...)
     m = length(L.y)
@@ -649,12 +649,11 @@ function held_out_refit(lower, upper, κ; support=(-Inf, Inf))
             log(cdf(d, b) - cdf(d, a))
         end
     end
-    pts = [i for i in 1:m if L.w[i] > 0]
-    ld = map(pts) do i
-        keep = [j for j in eachindex(lower, upper) if !(lower[j] == upper[j] == L.y[i])]
+    ld = map(L.lockey, L.locnode) do key, i
+        keep = [j for j in eachindex(lower, upper) if (lower[j], upper[j]) != key]
         logdensity(IntervalDensityEstimate(lower[keep], upper[keep], κ; support), L.y[i])
     end
-    return L, lp, pts, ld
+    return L, lp, ld
 end
 
 @testset "interval scale selection" begin
@@ -683,12 +682,12 @@ end
             (rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), seed=4), (-Inf, Inf)),  # mixed
         )
         for ((lower, upper), support) in cases, κ in (1.0, 3.0)
-            L, lp_ref, pts, ld_ref = held_out_refit(lower, upper, κ; support)
+            L, lp_ref, ld_ref = held_out_refit(lower, upper, κ; support)
             lp, ld = PenalizedDensity._interval_loo(L)
             @test maximum(abs.(lp .- lp_ref)) < 0.02
-            @test isempty(pts) || maximum(abs.(ld[pts] .- ld_ref)) < 0.02
+            @test isempty(ld) || maximum(abs.(ld .- ld_ref)) < 0.02
             rs = [g.r for g in L.groups]
-            score_ref = -(sum(rs .* lp_ref) + sum(L.w[pts] .* ld_ref)) / length(lower)
+            score_ref = -(sum(rs .* lp_ref) + sum(L.loccount .* ld_ref)) / length(lower)
             @test PenalizedDensity._interval_klcv(L) ≈ score_ref atol = 2e-3
         end
         # Smoothing lengths far below the bin width: deleting an observation reshapes its own and
@@ -701,12 +700,12 @@ end
             ("rounded", rounded_intervals()),
         )
         for (_, (lower, upper)) in cases, κ in (30.0, 200.0)
-            L, lp_ref, pts, ld_ref = held_out_refit(lower, upper, κ)
+            L, lp_ref, ld_ref = held_out_refit(lower, upper, κ)
             lp, ld = PenalizedDensity._interval_loo(L)
             fin = isfinite.(lp_ref)       # the refit's cdf difference underflows for far bins
             @test maximum(abs.(lp[fin] .- lp_ref[fin])) < 0.02
             @test all(isfinite, lp)
-            @test isempty(pts) || maximum(abs.(ld[pts] .- ld_ref)) < 0.02
+            @test isempty(ld) || maximum(abs.(ld .- ld_ref)) < 0.02
         end
         # The mixed case includes intervals spanning several cells (a point inside a bin).
         L = PenalizedDensity._interval_layout(rounded_intervals(; n=150, extra=randn(Xoshiro(4), 20), seed=4)..., 1.0,
@@ -720,8 +719,40 @@ end
         for κ in (1.0, 4.0), holdout in (:location, :observation)
             L = PenalizedDensity._interval_layout(x, x, κ, cbrt(eps()), -Inf, Inf)
             _, ld = PenalizedDensity._interval_loo(L; holdout)
-            _, looi = PenalizedDensity._loo_density(L.y, L.w, κ, κ, κ, -Inf, Inf; holdout)
+            _, looi = PenalizedDensity._loo_density(L.y, L.w, κ, κ, κ, -Inf, Inf; holdout,
+                                                    locations=(L.locnode, L.loccount))
             @test ld ≈ log.(looi) rtol = 1e-10
+        end
+    end
+
+    @testset "point locations: merged values and large tie groups" begin
+        # Distinct points merged into one node are held out alone, so the holdouts agree.
+        x = sort(randn(Xoshiro(5), 80))
+        L = PenalizedDensity._interval_layout(x, x, 1e-4, cbrt(eps()), -Inf, Inf)
+        @test length(L.y) < length(x) && length(L.lockey) == length(x)
+        @test PenalizedDensity._interval_loo(L)[2] == PenalizedDensity._interval_loo(L; holdout=:observation)[2]
+        # A tie group of points holding a large share of the sample, inside an occupied bin, is
+        # deleted exactly.
+        lower, upper = rounded_intervals(; n=150, extra=[randn(Xoshiro(4), 20); fill(0.3, 30)], seed=4)
+        for κ in (1.0, 30.0)
+            L, _, ld_ref = held_out_refit(lower, upper, κ)
+            _, ld = PenalizedDensity._interval_loo(L)
+            k = searchsortedfirst(L.lockey, (0.3, 0.3))
+            i = L.locnode[k]
+            @test L.cellgroup[i] != 0 || L.cellgroup[i+1] != 0
+            @test L.loccount[k] == 30
+            @test ld[k] ≈ ld_ref[k] rtol = 1e-6
+        end
+        # The same far in the tail, bordered only by empty cells: exact where the refit can be
+        # solved, and from the neighbor sum, still finite, once the held-out density is too small
+        # for it.
+        lower = [repeat(-1.0:0.25:1.0, 3); fill(-4.0, 10)]
+        upper = [repeat(-1.0:0.25:1.0, 3) .+ 0.25; fill(-4.0, 10)]
+        for (κ, tol) in ((3.0, 1e-8), (10.0, 1e-8), (30.0, 2e-3), (200.0, 2e-3))
+            L = PenalizedDensity._interval_layout(lower, upper, κ, cbrt(eps()), -Inf, Inf)
+            _, ld = PenalizedDensity._interval_loo(L)
+            ref = logdensity(IntervalDensityEstimate(lower[1:27], upper[1:27], κ), -4.0)
+            @test ld[1] ≈ ref rtol = tol
         end
     end
 
