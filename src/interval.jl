@@ -1426,9 +1426,10 @@ function IntervalDensityEstimate{T}(lower::AbstractVector{<:Real}, upper::Abstra
                                     stats=nothing) where {T<:AbstractFloat}
     _check_rtol(rtol)
     a, b = _check_support_bounds(support)
-    κ isa Real && _check_kappa(κ)
-    L = _interval_layout(lower, upper, κ, T(rtol), T(a), T(b))
-    return _interval_fit(L, κ isa Real ? T(κ) : L.κs; stats)
+    κ isa AbstractVector && _vector_scale_error()
+    κT = κ isa Real ? _kappa_in(T, κ) : κ
+    L = _interval_layout(lower, upper, κT, T(rtol), T(a), T(b))
+    return _interval_fit(L, κ isa Real ? κT : L.κs; stats)
 end
 
 function IntervalDensityEstimate(x::AbstractVector{<:Real}, κ; resolution::Union{Real,Nothing}=nothing,
@@ -1488,6 +1489,7 @@ function _lattice_bounds(x::AbstractVector, δ::T, support) where {T}
 end
 
 _kappa_eltype(κ::Real, lower, upper) = typeof(κ)
+_kappa_eltype(::AbstractVector, lower, upper) = _vector_scale_error()
 function _kappa_eltype(κfun, lower, upper)
     for (a, b) in zip(lower, upper)
         isfinite(a) && return typeof(κfun(a))

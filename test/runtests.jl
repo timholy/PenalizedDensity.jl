@@ -412,6 +412,7 @@ end
         for score in (klcv, lscv, action_sensitivity)
             @test_throws "κ must be finite and positive, got 0.0" score(x, 0.0)
             @test_throws "κ must be finite and positive, got Inf" score(x, Inf)
+            @test_throws "is not a finite positive Float32" score(Float32.(x), 1e-50)
         end
         @test_throws "κ must be finite and positive, got -1" klcv(xr .- 0.05, xr .+ 0.05, -1)
         @test_throws "lies outside the support" klcv(x, 2.0; support = (0.0, 1.0))
@@ -1830,6 +1831,12 @@ end
         d = DensityEstimate(x, κ)
         ye = 1.2 .* randn(150) .+ 0.5          # independent evaluation batch
 
+        # The Gaussian reference needs a positive variance.
+        msg = "negentropy(d, xeval) needs at least two distinct evaluation points"
+        @test_throws ArgumentError negentropy(d, [0.3])
+        @test_throws msg negentropy(d, [0.3])
+        @test_throws msg negentropy(d, fill(0.3, 4))
+
         # entropy(d, ye) is the plug-in -(2/M) Σ ln ψ(yⱼ) at the held-out points.
         M = length(ye)
         @test entropy(d, ye) ≈ -2 * sum(log(amplitude(d, y)) for y in ye) / M
@@ -2090,6 +2097,10 @@ end
         @test_throws "κ must be finite and positive, got -1.0" DensityEstimate([1.0], -1.0)
         @test_throws "κ must be finite and positive, got Inf" DensityEstimate([1.0, 2.0], Inf)
         @test_throws "κ must be finite and positive, got NaN" DensityEstimate([1.0, 2.0], NaN)
+        # κ is checked in the fit's float type, after conversion.
+        @test_throws ArgumentError DensityEstimate{Float32}([1.0, 2.0, 4.0], 1e-50)
+        @test_throws "κ = 1.0e-50 is not a finite positive Float32 (it converts to 0.0)" DensityEstimate{Float32}([1.0, 2.0, 4.0], 1e-50)
+        @test_throws "κ = 1.0e50 is not a finite positive Float32 (it converts to Inf)" DensityEstimate{Float32}([1.0, 2.0, 4.0], 1e50)
         @test_throws ArgumentError DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws "rtol must be nonnegative" DensityEstimate([1.0], 1.0; rtol=-1.0)
         @test_throws ArgumentError select_kappa_sensitivity([1.0, 2.0]; kappas=[1.0, -1.0, 2.0])
