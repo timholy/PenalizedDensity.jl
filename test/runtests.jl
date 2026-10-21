@@ -2517,6 +2517,59 @@ end
         @test abs(left + interior + right - 1) < 1e-9
     end
 
+    @testset "normalization and moments as κ·(hi - lo) → 0" begin
+        # Once rtol/κ exceeds the data range every observation merges into one node, and the
+        # fit tends to the uniform density on the support.
+        for (x, lo, hi) in ((rand(Xoshiro(1), 100), 0.0, 1.0), (randn(Xoshiro(2), 200), -5.0, 5.0))
+            pts = vcat(lo, sort(x), hi)
+            quad(f) = quadgk(f, pts...; rtol = 1e-12)[1]
+            L = hi - lo
+            for κL in (1.0, 1e-3, 1e-6, 1e-9, 1e-12, 1e-14, 1e-15, 1e-16, 1e-17, 1e-30, 1e-100, 1e-300)
+                d = DensityEstimate(x, κL / L; support = (lo, hi))
+                @test quad(t -> exp(logdensity(d, t))) ≈ 1 atol = 1e-12
+                @test cdf(d, hi) == 1
+                m = quad(t -> t * exp(logdensity(d, t)))
+                @test mean(d) ≈ m atol = 1e-12 * L
+                @test var(d) ≈ quad(t -> (t - m)^2 * exp(logdensity(d, t))) rtol = 1e-10
+                if κL <= 1e-12
+                    @test logdensity(d, (lo + hi) / 2) ≈ -log(L) atol = 1e-12
+                    @test var(d) ≈ L^2 / 12 rtol = 1e-12
+                end
+            end
+            d32 = DensityEstimate(Float32.(x), Float32(1e-20 / L); support = (Float32(lo), Float32(hi)))
+            @test quadgk(t -> exp(logdensity(d32, t)), Float32.(pts)...)[1] ≈ 1 atol = 1e-6
+            @test var(d32) ≈ L^2 / 12 rtol = 1e-6
+            # Z = ∫ψ² of the unnormalized amplitude grows like nobs/κ.
+            @test_throws "too small to normalize the fit in Float64" DensityEstimate(x, floatmin(Float64); support = (lo, hi))
+        end
+        # Intervals that reach the wall put the only node on it (zero boundary gap).
+        lower = vcat(0.0, 0.3, 0.6); upper = vcat(0.2, 0.5, 0.9)
+        for κ in (1e-9, 1e-14)
+            d = IntervalDensityEstimate(lower, upper, κ; support = (0.0, 1.0))
+            @test d.x == [0.0]
+            @test mean(d) ≈ 0.5 rtol = 1e-12
+            @test var(d) ≈ 1 / 12 rtol = 1e-12
+        end
+        # The closed forms against BigFloat, through the cancellation range.
+        setprecision(BigFloat, 2048) do
+            for u in (1e-300, 1e-100, 1e-16, 1e-8, 1e-3, 0.5, prevfloat(1.0))
+                ub = big(u)
+                @test PenalizedDensity._tanh_stable(u) ≈ tanh(ub) rtol = 2eps()
+                @test PenalizedDensity._tanh_minus_usech2_over_u3(u) ≈ (tanh(ub) - ub * sech(ub)^2) / ub^3 rtol = 4eps()
+            end
+        end
+        @test PenalizedDensity._tanh_stable(Inf) == 1
+        @test PenalizedDensity._tail_moments(2.0, 0.0) == (0.0, 0.0, 0.0)
+        for (κ, Δ) in ((1.0, 0.25), (1.0, prevfloat(1.0)), (1.0, 1.0), (1.0, 3.0), (1e-200, 2.0))
+            Jref = setprecision(BigFloat, 2048) do
+                K, D = big(κ), big(Δ)
+                ψ̂(r) = cosh(K * (D - r)) / cosh(K * D)
+                Tuple(Float64(quadgk(r -> r^m * ψ̂(r)^2, big(0.0), D; rtol = big(1e-30))[1]) for m in 0:2)
+            end
+            @test all(PenalizedDensity._tail_moments(κ, Δ) .≈ Jref)
+        end
+    end
+
     @testset "cdf ∘ quantile round trip; monotonicity across the boundary" begin
         Random.seed!(43)
         x = sort(rand(200) .* 0.6 .+ 0.2)

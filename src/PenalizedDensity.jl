@@ -348,7 +348,7 @@ Base.show(io::IO, d::DensityEstimate) = print(io, "DensityEstimate with $(length
 # Fit with an optional natural (Neumann) boundary at `lo`/`hi` (either may be infinite).
 function _fit(nodes::Vector{T}, weights::Vector{T}, κ::T, lo::T, hi::T; stats=nothing) where {T}
     ψ = _solve_amplitude(_roughness_operator(nodes, κ, lo, hi), weights; stats)
-    Z = _norm_sq(nodes, ψ, κ, κ, κ, lo, hi)
+    Z = _checked_norm_sq(_norm_sq(nodes, ψ, κ, κ, κ, lo, hi), weights)
     ψ ./= sqrt(Z)
     λ = κ * Z                       # scaling law: normalized ψ solves Mψ = (κ/λ)/ψ
     return DensityEstimate{T}(nodes, weights, ψ, κ, κ, κ, lo, hi, λ)
@@ -362,9 +362,18 @@ end
 function _fit(nodes::Vector{T}, weights::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T; stats=nothing) where {T}
     κ̄ = _reference_scale(κs, κL, κR)
     ψ = _solve_amplitude(_roughness_operator(nodes, κs, κL, κR, κ̄, lo, hi), weights; stats)
-    Z = _norm_sq(nodes, ψ, κs, κL, κR, lo, hi)
+    Z = _checked_norm_sq(_norm_sq(nodes, ψ, κs, κL, κR, lo, hi), weights)
     ψ ./= sqrt(Z)
     return DensityEstimate{T}(nodes, weights, ψ, κs, κL, κR, lo, hi, κ̄ * Z)
+end
+
+# The unnormalized amplitude solves Mψ = w ./ ψ, so Z = ∫ψ² grows like nobs/κ and leaves the
+# floating-point range only for κ within a factor nobs of floatmin(T).
+function _checked_norm_sq(Z::T, w::Vector{T}) where {T}
+    isfinite(Z) && Z > 0 && return Z
+    throw(ArgumentError("the smoothing scale is too small to normalize the fit in $T: the " *
+                        "unnormalized ∫ψ² = $Z for $(sum(w)) observations; κ must exceed " *
+                        "roughly nobs/floatmax($T) = $(sum(w) / floatmax(T))"))
 end
 
 # Reject scale values a fit cannot use: a scalar κ, or a scale function's value κ(x).
@@ -597,14 +606,21 @@ function _roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T
 end
 
 # tanh(u) for u ≥ 0, overflow-free through e^{-2u} for any such u, including Inf; cosh/sinh
-# alone overflow near u ≈ 710.
-_tanh_stable(u::T) where {T} = (e = exp(-2u); (oneunit(T) - e) / (oneunit(T) + e))
+# alone overflow near u ≈ 710. The numerator 1 - e^{-2u} goes through expm1 so the result keeps
+# full relative precision as u → 0.
+_tanh_stable(u::T) where {T} = (e = expm1(-2u); -e / (2 + e))
 
 # sech(u)² = 1/cosh(u)², overflow-free through e^{-2u}.
 _sech2_stable(u::T) where {T} = (e = exp(-2u); 4 * e / (oneunit(T) + e)^2)
 
 # u·sech(u)², the companion term in the boundary tail mass below.
 _usech2_stable(u::T) where {T} = u * _sech2_stable(u)
+
+# (tanh(u) - u·sech(u)²)/u³ for 0 ≤ u < 1. The two terms agree to O(u³), so this uses
+# (sinh(2u) - 2u)/(2u³cosh²u) with sinh(z) - z summed from its Taylor series (truncation below
+# eps(Float64) for z = 2u ≤ 2).
+_tanh_minus_usech2_over_u3(u::T) where {T} = 4 * evalpoly(4u^2, map(T, _SINH_TAYLOR)) / cosh(u)^2
+const _SINH_TAYLOR = ntuple(k -> Float64(inv(factorial(big(2k + 1)))), 12)   # 1/3!, 1/5!, …, 1/25!
 
 # Tail diagonal contribution to the roughness operator at a boundary gap Δ = |edge - boundary|:
 # tanh(κΔ) for a natural (Neumann) boundary, or 1 in the unbounded limit Δ = ∞. Both forms agree
@@ -749,6 +765,19 @@ function _positivity_cap(x::AbstractVector{T}, Δ::AbstractVector{T}) where {T}
     return α < one(T) ? α * oftype(α, 0.99) : α
 end
 
+# Default start for `_solve_amplitude`: the constant vector c·1 minimizing F(c·1) over c > 0,
+# c² = W/(1'M1). The minimizer of F obeys ψ'Mψ = W (take the dot product of Mψ = w ./ ψ with
+# ψ), and starting on that level keeps the iteration count independent of the overall scale of
+# M: from ψ = 1, an M with tiny entries (κ times the support width far below 1) needs about
+# ½log₂(W/(1'M1)) Newton steps, each roughly doubling ψ. 1'M1 is positive in exact arithmetic but can round to zero or below when
+# nearly coincident nodes make the coth and csch entries cancel; any positive start is valid,
+# so that case starts from 1.
+function _default_start(M::SymTridiagonal{T}, W::T) where {T}
+    s = sum(M.dv) + 2 * sum(M.ev)
+    c = s > 0 ? sqrt(W) / sqrt(s) : oneunit(T)
+    return fill(isfinite(c) && c > 0 ? c : oneunit(T), length(M.dv))
+end
+
 # _solve_amplitude(M, w) -> ψ
 #
 # Minimize the strictly convex potential `F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ` over `ψ > 0`
@@ -768,10 +797,10 @@ function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
                           stats::Union{Nothing,SolveStats}=nothing,
                           start::Union{Nothing,AbstractVector}=nothing) where {T<:AbstractFloat}
     n = length(w)
-    ψ = start === nothing ? fill(oneunit(T), n) : Vector{T}(start)   # strictly positive start
+    W = sum(w)                          # total multiplicity, the scale of F's two terms
+    ψ = start === nothing ? _default_start(M, W) : Vector{T}(start)   # strictly positive start
     g = similar(ψ); Δ = similar(ψ); ψnew = similar(ψ)
     Hdv = similar(ψ); Hev = similar(M.ev)   # Hessian factorization scratch
-    W = sum(w)                          # total multiplicity, the scale of F's two terms
     Fψ = _objective(M, w, ψ)
     prevstep = T(Inf)
     unguarded = false                   # has a step been taken without the Armijo test?
@@ -973,13 +1002,24 @@ _gauss8(::Type{Float64}) = _GAUSS8_F64
 #     J₁ = (tanh²u + u² sech²u) / (4κ²)
 #     J₂ = (3 tanh u - 3u sech²u + 2u³ sech²u) / (12κ³),
 # each reducing to the unbounded value as u → ∞. J₀ is `_tail_mass` at unit amplitude.
+#
+# Below u = 1 the moments are formed in units of Δ: Jₘ carries a factor u^{m+1}/κ^{m+1} =
+# Δ^{m+1} that would underflow in both numerator and denominator at tiny κΔ, and the difference
+# tanh u - u sech²u cancels to O(u³).
 function _tail_moments(κ::T, Δ::T) where {T}
     isfinite(Δ) || return (one(T) / (2κ), one(T) / (4κ^2), one(T) / (4κ^3))
     u = κ * Δ
     th, s2 = _tanh_stable(u), _sech2_stable(u)
-    J0 = (th + u * s2) / (2κ)
-    J1 = (th^2 + u^2 * s2) / (4κ^2)
-    J2 = (3th - 3u * s2 + 2u^3 * s2) / (12κ^3)
+    if u < 1
+        t = iszero(u) ? oneunit(T) : th / u     # tanh(u)/u; a node on the wall has u = 0
+        J0 = Δ * (t + s2) / 2
+        J1 = Δ^2 * (t^2 + s2) / 4
+        J2 = Δ^3 * (3 * _tanh_minus_usech2_over_u3(u) + 2 * s2) / 12
+    else
+        J0 = (th + u * s2) / (2κ)
+        J1 = (th^2 + u^2 * s2) / (4κ^2)
+        J2 = (3 * (th - u * s2) + 2u^3 * s2) / (12κ^3)
+    end
     return J0, J1, J2
 end
 
