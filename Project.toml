@@ -23,7 +23,7 @@ PenalizedDensityStatsBaseExt = "StatsBase"
 
 [compat]
 Aqua = "0.8"
-DensityInterface = "0.4"
+DensityInterface = "0.4, 1.0"
 Distributions = "0.25"
 ExplicitImports = "1"
 LinearAlgebra = "1"
