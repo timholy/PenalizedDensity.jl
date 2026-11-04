@@ -1,6 +1,7 @@
 using PenalizedDensity
 using PenalizedDensity: select_kappa_lscv, select_kappa_sensitivity, klcv, lscv, action_sensitivity
 using DensityInterface: DensityInterface, DensityKind, HasDensity
+using ForwardDiff
 import Distributions, StatsBase
 using LinearAlgebra: SymTridiagonal, ZeroPivotException, ldlt!
 using LogExpFunctions: logaddexp
@@ -2107,6 +2108,133 @@ end
         g = logdensity_node_gradient(d, ye, c)
         @test logdensity_node_gradient(d, OffsetArray(ye, -2), OffsetArray(c, -2)) == g
         @test logdensity_node_gradient(d, OffsetArray(ye, 5)) == logdensity_node_gradient(d, ye)
+    end
+
+    @testset "κ-derivative of the log-density sum" begin
+        # ∂/∂κ Σⱼ cⱼ ln Q̂(yⱼ) at fixed nodes, against central differences of refits.
+        Random.seed!(29)
+        xn = sort(randn(40))
+        ye = [minimum(xn) - 1.5; randn(20); maximum(xn) + 0.7]
+        c = collect(range(0.5, 1.5; length = length(ye)))
+        L(κ) = (dd = fit_unbounded(copy(xn), ones(40), κ); sum(cj * logdensity(dd, y) for (y, cj) in zip(ye, c)))
+        for κ in (0.3, 1.5, 8.0)
+            h = 1e-5 * κ
+            an = logdensity_kappa_derivative(fit_unbounded(copy(xn), ones(40), κ), ye, c)
+            @test an ≈ (L(κ + h) - L(κ - h)) / (2h) rtol = 1e-7
+        end
+        d = fit_unbounded(copy(xn), ones(40), 1.5)
+        @test logdensity_kappa_derivative(d, ye) ≈ logdensity_kappa_derivative(d, ye, ones(length(ye)))
+        @test logdensity_kappa_derivative(d, OffsetArray(ye, -2), OffsetArray(c, -2)) == logdensity_kappa_derivative(d, ye, c)
+        @test_throws "weights must have the axes of xeval" logdensity_kappa_derivative(d, ye, ones(3))
+        @test_throws "logdensity_kappa_derivative supports only unbounded fits" logdensity_kappa_derivative(DensityEstimate(xn, 1.0; support=(-5.0, 5.0)), ye)
+        @test_throws "supports only a single-rate (scalar κ) fit" logdensity_kappa_derivative(DensityEstimate(xn, t -> 1 + t^2 / 4), ye)
+    end
+
+    @testset "gradient of the selected scale" begin
+        PD = PenalizedDensity
+        r = cbrt(eps(Float64))
+        # The KLCV score as `select_kappa` evaluates it, for any number type.
+        score(xx, k) = (T = promote_type(eltype(xx), typeof(k));
+                        PD._score_at(PD._klcv, T.(xx), T(r), T(-Inf), T(Inf), T(k)))
+        dscore(xx, k) = ForwardDiff.derivative(kk -> score(xx, kk), k)
+        # Reference: forward-mode AD with one partial per observation through the score, O(N²),
+        # in BigFloat, where its Newton solve leaves the tangent accurate to about 1e-27.
+        function reference(xs, κ)
+            setprecision(BigFloat, 128) do
+                xb, κb = big.(xs), big(κ)
+                ∇S = ForwardDiff.gradient(xx -> score(xx, κb), xb)
+                ∇g = ForwardDiff.gradient(xx -> dscore(xx, κb), xb)
+                gκ = ForwardDiff.derivative(kk -> dscore(xb, kk), κb)
+                return (; ∇S, g = dscore(xb, κb), gκ, ∇g)
+            end
+        end
+        # Nodes, weights and node of each sorted observation, as `select_kappa_gradient` merges.
+        function merged(xs, κ)
+            nodeof = zeros(Int, length(xs))
+            nodes, w = PD._merge_presorted(xs, r / κ, nodeof)
+            return nodes, w, nodeof
+        end
+        # κ̂ refined to the stationary point by Newton's method, for finite differences of κ̂
+        # far below the precision of `select_kappa`'s search.
+        function κstar(xx)
+            κ = select_kappa(xx)
+            nodes, w, nodeof = merged(sort(xx), κ)
+            for _ in 1:4
+                _, g, gκ, _ = PD._klcv_kappa_derivatives(nodes, w, κ, nodeof)
+                κ -= g / gκ
+            end
+            return κ
+        end
+
+        Random.seed!(31)
+        xa = sort(randn(40))
+        xm = sort([xa; xa[5:10:end] .+ 1e-7])    # four observations merged into a neighbor
+        xo = sort([randn(40); 25.0])             # an isolated node, where h rounds to 1/2
+        for xs in (xa, xm, xo)
+            κ = select_kappa(xs)
+            nodes, w, nodeof = merged(xs, κ)
+            ref = reference(xs, κ)
+            # The reverse pass reproduces the score and its gradient.
+            M = PD._roughness_operator(nodes, κ, -Inf, Inf)
+            S, x̄, κ̄ = PD._klcv_adjoint(nodes, w, κ, PD._solve_amplitude(M, w), nodeof)
+            @test S ≈ score(xs, κ) rtol = 1e-14
+            ∇S = zeros(length(xs)); ∇S[[findfirst(==(k), nodeof) for k in eachindex(nodes)]] = x̄
+            @test ∇S ≈ ref.∇S rtol = 1e-7
+            @test κ̄ ≈ ref.g rtol = 1e-6 atol = 1e-12
+            # Its derivatives in κ, in Float64 and exactly in BigFloat.
+            _, g, gκ, ∇g = PD._klcv_kappa_derivatives(nodes, w, κ, nodeof)
+            ∇gs = zeros(length(xs)); ∇gs[[findfirst(==(k), nodeof) for k in eachindex(nodes)]] = ∇g
+            @test gκ ≈ ref.gκ rtol = 1e-7
+            @test ∇gs ≈ ref.∇g rtol = 1e-7
+            setprecision(BigFloat, 128) do
+                _, gb, gκb, ∇gb = PD._klcv_kappa_derivatives(big.(nodes), big.(w), big(κ), nodeof)
+                @test gκb ≈ ref.gκ rtol = 1e-24
+                ∇gbs = zeros(BigFloat, length(xs)); ∇gbs[[findfirst(==(k), nodeof) for k in eachindex(nodes)]] = ∇gb
+                @test ∇gbs ≈ ref.∇g rtol = 1e-24
+            end
+            # The public gradient: translating the sample leaves κ̂ unchanged, and scaling it by
+            # a scales κ̂ by 1/a.
+            ∇κ = select_kappa_gradient(xs, κ)
+            @test all(isfinite, ∇κ)
+            @test abs(sum(∇κ)) <= 1e-10 * sum(abs, ∇κ)
+            @test sum(∇κ .* xs) ≈ -κ rtol = 1e-5
+            @test ∇κ ≈ -ref.∇g ./ ref.gκ rtol = 1e-4   # ref is at κ, ∇κ at the refined κ
+        end
+        # Within a merged node only its first observation sets the position.
+        ∇κ = select_kappa_gradient(xm, select_kappa(xm))
+        @test count(iszero, ∇κ) == 4
+        @test all(iszero, ∇κ[findall(i -> i > 1 && xm[i] - xm[i-1] < 1e-6, eachindex(xm))])
+
+        # Finite differences of the refined κ̂, and the chain rule for L(x) = Σⱼ cⱼ ln Q̂(yⱼ)
+        # with the fit at κ̂(x).
+        Random.seed!(37)
+        xs = randn(60)
+        ye = [-3.0; randn(10); 3.5]
+        c = collect(range(0.5, 1.5; length = length(ye)))
+        κ = κstar(xs)
+        ∇κ = select_kappa_gradient(xs, select_kappa(xs))
+        d = DensityEstimate(xs, κ)
+        dL = logdensity_node_gradient(d, ye, c)[invperm(sortperm(xs))] .+
+             logdensity_kappa_derivative(d, ye, c) .* ∇κ
+        Lx(xx) = sum(c .* logdensity.(Ref(DensityEstimate(xx, κstar(xx))), ye))
+        for j in (1, 17, 60)
+            δ = 1e-4
+            xp = copy(xs); xp[j] += δ
+            xq = copy(xs); xq[j] -= δ
+            @test ∇κ[j] ≈ (κstar(xp) - κstar(xq)) / (2δ) rtol = 1e-6
+            @test dL[j] ≈ (Lx(xp) - Lx(xq)) / (2δ) rtol = 1e-6
+        end
+
+        # Axes follow x; Float32 is supported.
+        xp = shuffle(Xoshiro(1), xs)
+        @test select_kappa_gradient(OffsetArray(xp, -3), select_kappa(xp)) == OffsetArray(select_kappa_gradient(xp, select_kappa(xp)), -3)
+        x32 = Float32.(xs)
+        @test eltype(select_kappa_gradient(x32, select_kappa(x32))) === Float32
+
+        κ̂ = select_kappa(xs)
+        @test_throws "is not a minimum of the KLCV score" select_kappa_gradient(xs, 1.01κ̂)
+        @test_throws "is not a minimum of the KLCV score" select_kappa_gradient(xs, κ̂; rtol=1e-3)
+        @test_throws "requires distinct observations" select_kappa_gradient([xs; xs[3]], κ̂)
     end
 
     @testset "large κ stays finite (no sinh overflow)" begin

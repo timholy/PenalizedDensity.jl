@@ -1,8 +1,9 @@
 module PenalizedDensity
 
 using DensityInterface: DensityInterface, HasDensity
+using ForwardDiff: Dual, partials, value
 using LinearAlgebra: LinearAlgebra, I, SymTridiagonal, Symmetric, ZeroPivotException, cholesky, dot,
-                     issuccess, ldiv!, ldlt!, mul!
+                     issuccess, ldiv!, ldlt, ldlt!, mul!
 using LogExpFunctions: logabssinh, logaddexp, logcosh
 using QuadGK: gauss, quadgk
 using SpecialFunctions: erfc, erfcinv, erfcx
@@ -10,11 +11,12 @@ using Random: Random, AbstractRNG, SamplerTrivial
 using Statistics: Statistics, mean, median, quantile, std, var
 using StatsAPI: StatsAPI, nobs, pvalue
 
-export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support
+export AbstractDensityEstimate, DensityEstimate, IntervalDensityEstimate, amplitude, action, select_kappa, select_support,
+       select_kappa_gradient
 export Adaptive, AdaptiveScale, WindowScale, WindowRule
 export chisq, ChisqReference, chisq_pdf, chisq_ccdf, pvalue
 export entropy, negentropy
-export logdensity, logdensity_eval_gradient, logdensity_node_gradient
+export logdensity, logdensity_eval_gradient, logdensity_node_gradient, logdensity_kappa_derivative
 export cdf, quantile, median, mean, var, std, nobs
 export gaussianize, ungaussianize, gaussianize_logjacobian
 # `public` is a syntax error before Julia 1.11.
@@ -588,7 +590,7 @@ function roughness_operator(x::AbstractVector{<:Real}, κ::Real, lo::Real=-Inf, 
     return _roughness_operator(convert(AbstractVector{T}, x)::AbstractVector{T}, T(κ), T(lo), T(hi))
 end
 
-function _roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<:AbstractFloat}
+function _roughness_operator(x::AbstractVector{T}, κ::T, lo::T, hi::T) where {T<:Real}
     Base.require_one_based_indexing(x)
     n = length(x)
     n >= 1 || throw(ArgumentError("need at least one node to build the roughness operator"))
@@ -675,7 +677,7 @@ _operator(x::Vector{T}, κs::Vector{T}, κL::T, κR::T, lo::T, hi::T) where {T} 
     _roughness_operator(x, κs, κL, κR, _reference_scale(κs, κL, κR), lo, hi)
 
 # F(ψ) = ½ ψ'Mψ - Σ wᵢ ln ψᵢ, the potential minimized by _solve_amplitude.
-function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
+function _objective(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:Real}
     s = zero(T)
     for i in eachindex(w, ψ)
         s += w[i] * log(ψ[i])       # requires ψ > 0, which is enforced by the caller
@@ -689,7 +691,7 @@ end
 # multiple of eps times this, not of |F|: on nearly coincident nodes the coth entries reach
 # 1e5 or more while the quadratic form they enter nearly cancels, so |F| understates the
 # roundoff by that factor.
-function _objective_scale(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:AbstractFloat}
+function _objective_scale(M::SymTridiagonal{T}, w::Vector{T}, ψ::Vector{T}) where {T<:Real}
     s = zero(T)
     for i in eachindex(w, ψ)
         s += M.dv[i] * ψ[i]^2 + w[i] * abs(log(ψ[i]))
@@ -795,7 +797,7 @@ end
 # if given, is a strictly positive starting point, such as the solution for nearby weights.
 function _solve_amplitude(M::SymTridiagonal{T}, w::Vector{T}; maxiter::Int=100,
                           stats::Union{Nothing,SolveStats}=nothing,
-                          start::Union{Nothing,AbstractVector}=nothing) where {T<:AbstractFloat}
+                          start::Union{Nothing,AbstractVector}=nothing) where {T<:Real}
     n = length(w)
     W = sum(w)                          # total multiplicity, the scale of F's two terms
     ψ = start === nothing ? _default_start(M, W) : Vector{T}(start)   # strictly positive start
@@ -1373,7 +1375,7 @@ _right_tail_slope(κ, x, hi) = _right_tail_slope(promote(κ, x, hi)...)
 (d::DensityEstimate)(x::Real) = _amplitude(d, x)^2
 
 # sinh(v) - v, accurate for small v where the direct difference loses all precision.
-function _sinhm(v::T) where {T<:AbstractFloat}
+function _sinhm(v::T) where {T<:Real}
     abs(v) >= 1 && return sinh(v) - v
     v2 = v * v
     term = v * v2 / 6
@@ -2217,10 +2219,30 @@ Moving a node perturbs the fitted amplitude everywhere through the field equatio
 `M ψ = w ⊘ ψ`; the adjoint reuses the fit's Hessian `∇²F = M + diag(wᵢ/ψᵢ²)` and handles the
 whole evaluation batch with one extra tridiagonal solve.
 """
-function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector,
-                                  weights=nothing) where {T}
+logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector, weights=nothing) where {T} =
+    first(_logdensity_adjoint(d, xeval, weights, "logdensity_node_gradient"))
+
+"""
+    logdensity_kappa_derivative(d::DensityEstimate, xeval::AbstractVector, weights=nothing) -> ∂L/∂κ
+
+Derivative, with respect to the scale `κ` at fixed nodes, of the weighted sum of log densities
+at the points `xeval`,
+
+    ∂/∂κ  Σⱼ weightsⱼ · ln Q̂(xevalⱼ),
+
+where the fit is refitted at each `κ`. The cost is `O(N + M)` for `N` nodes and `M` evaluation
+points. The arguments, and the fits supported, are those of [`logdensity_node_gradient`](@ref).
+With [`select_kappa_gradient`](@ref) it gives the part of the gradient of `L` that acts
+through the selected scale.
+"""
+logdensity_kappa_derivative(d::DensityEstimate{T,T}, xeval::AbstractVector, weights=nothing) where {T} =
+    last(_logdensity_adjoint(d, xeval, weights, "logdensity_kappa_derivative"))
+
+# The gradient of L = Σⱼ cⱼ ln Q̂(yⱼ) with respect to the node positions, and ∂L/∂κ, for
+# `logdensity_node_gradient` and `logdensity_kappa_derivative`. The two share the adjoint μ.
+function _logdensity_adjoint(d::DensityEstimate{T,T}, xeval::AbstractVector, weights, fname) where {T}
     (isinf(d.lo) && isinf(d.hi)) ||
-        throw(ArgumentError("logdensity_node_gradient supports only unbounded fits; " *
+        throw(ArgumentError("$fname supports only unbounded fits; " *
                             "got support=[$(d.lo), $(d.hi)]"))
     weights === nothing || axes(weights) == axes(xeval) ||
         throw(DimensionMismatch("weights must have the axes of xeval: $(axes(weights)) vs $(axes(xeval))"))
@@ -2230,9 +2252,10 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
     φ = d.ψ .* sqrt(Z)
     M = roughness_operator(x, κ)
     H = SymTridiagonal(M.dv .+ w ./ φ.^2, copy(M.ev))   # ∇²F, the fit's Hessian
-    _, _, Gφ = _norm_sq_grad(x, φ, κ)                   # ½ ∂Z/∂φ
+    _, dZ, Gφ = _norm_sq_grad(x, φ, κ)                  # ∂Z/∂κ at fixed φ, and ½ ∂Z/∂φ
     src = zeros(T, n)                   # ∂L/∂φ, the adjoint source (L = Σ wⱼ ln Q̂(yⱼ))
     g = zeros(T, n)                     # explicit ∂L/∂xᵢ at fixed φ accumulates here
+    gκ = zero(T)                        # explicit ∂L/∂κ at fixed φ accumulates here
     C = zero(T)                         # Σ weightsⱼ, the coefficient of -ln Z in L
     wts = weights === nothing ? Iterators.repeated(one(T)) : weights
     for (yj, cj_) in zip(xeval, wts)
@@ -2243,9 +2266,11 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
         if y <= x[1]                    # left tail: ln φ = ln φ₁ + κ(y - x₁)
             src[1] += 2 * cj / φ[1]
             g[1]   -= 2 * cj * κ
+            gκ     += 2 * cj * (y - x[1])
         elseif y >= x[n]                # right tail: ln φ = ln φₙ - κ(y - xₙ)
             src[n] += 2 * cj / φ[n]
             g[n]   += 2 * cj * κ
+            gκ     += 2 * cj * (x[n] - y)
         else
             k = searchsortedlast(x, y)
             a = κ * (x[k+1] - y); b = κ * (y - x[k]); θ = a + b
@@ -2257,10 +2282,14 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
             src[k+1] += 2 * cj * SB / φy
             g[k]   += 2 * cj * κ * (ct - φ[k+1] * CB / φy)   # ∂ln φ(y)/∂xₖ at fixed nodes
             g[k+1] += 2 * cj * κ * (φ[k] * CA / φy - ct)
+            # κ ∂SA/∂κ = a CA - θ SA coth θ, and likewise for SB
+            gκ += 2 * cj * (φ[k] * (a * CA - θ * SA * ct) + φ[k+1] * (b * CB - θ * SB * ct)) / (κ * φy)
         end
     end
     @. src -= 2 * C / Z * Gφ            # -C ∂ln Z/∂φ
     μ = ldiv!(ldlt!(H), src)            # adjoint μ = H⁻¹ ∂L/∂φ (H and src are consumed)
+    # ∂L/∂κ adds the implicit response -μᵀ(∂M/∂κ)φ and the explicit -C ∂ln Z/∂κ|_φ.
+    gκ -= dot(μ, _dM_dκ_mul(x, κ, φ)) + C * dZ / Z
     # Add the implicit response -μᵀ(∂M/∂xᵢ)φ and the explicit -C ∂ln Z/∂xᵢ|_φ. Both act only
     # through θₖ = κ hₖ, with ∂θₖ/∂xᵢ = κ(δ_{i,k+1} - δ_{i,k}), so interval k contributes
     # ±(κ Bₖ + (C/Z) κ Dₖ) to nodes k and k+1. Bₖ is written as in `_dM_dκ_mul`, so that its two
@@ -2275,13 +2304,15 @@ function logdensity_node_gradient(d::DensityEstimate{T,T}, xeval::AbstractVector
         g[k]   += contrib
         g[k+1] -= contrib
     end
-    return g
+    return g, gκ
 end
 
 # The adjoint above differentiates the field equation of a single-rate fit; a per-interval
 # scale would need the κₖ-dependence of every roughness term.
 logdensity_node_gradient(::DensityEstimate{T,Vector{T}}, ::AbstractVector, weights=nothing) where {T} =
     throw(ArgumentError("logdensity_node_gradient supports only a single-rate (scalar κ) fit"))
+logdensity_kappa_derivative(::DensityEstimate{T,Vector{T}}, ::AbstractVector, weights=nothing) where {T} =
+    throw(ArgumentError("logdensity_kappa_derivative supports only a single-rate (scalar κ) fit"))
 
 """
     chisq(d::DensityEstimate, Q) -> χ²
@@ -2852,7 +2883,10 @@ _action_sensitivity(xs::Vector{T}, r::T, κ::T) where {T} =
 # Diagonal and first off-diagonal of the inverse of an SPD symmetric tridiagonal, in O(n), from
 # the top-down and bottom-up LDLᵀ pivots dᵢ, δᵢ: (H⁻¹)ᵢᵢ = 1/(dᵢ + δᵢ - aᵢ), with aᵢ the original
 # diagonal, and (H⁻¹)ᵢ,ᵢ₊₁ = -bᵢ (H⁻¹)ᵢ₊₁,ᵢ₊₁ / dᵢ.
-function _inv_band(H::SymTridiagonal{T}) where {T}
+_inv_band(H::SymTridiagonal) = _inv_band_pivots(H)[1:2]
+
+# `_inv_band`'s diagonal and off-diagonal, followed by the pivots d and δ they were formed from.
+function _inv_band_pivots(H::SymTridiagonal{T}) where {T}
     a, b = H.dv, H.ev
     n = length(a)
     d = similar(a); δ = similar(a)
@@ -2865,7 +2899,7 @@ function _inv_band(H::SymTridiagonal{T}) where {T}
         δ[i] = a[i] - b[i]^2 / δ[i+1]
     end
     g = inv.(d .+ δ .- a)
-    return g, [-b[i] * g[i+1] / d[i] for i in 1:n-1]
+    return g, [-b[i] * g[i+1] / d[i] for i in 1:n-1], d, δ
 end
 
 # ln(-Mₖ,ₖ₊₁) for the operator `_operator` assembles with reference scale κ̄, formed directly so
@@ -3195,7 +3229,10 @@ step, responds to over-fitting; no per-point refitting is needed, and the score 
 For an interval observation, the refit is approximated by minimizing over the interval's own
 nodal values with its term in the likelihood exact and the rest of the problem replaced by its
 quadratic model, which stays accurate when the deletion empties the interval. The score is
-minimized by a golden-section search over `ln κ`, bracketed by the grid `kappas`.
+minimized by a golden-section search over `ln κ`, bracketed by the grid `kappas`. The search
+compares values of the score, so rounding limits the returned `κ` to a relative precision of
+roughly `√(N eps(T))`, far below its sampling variability; [`select_kappa_gradient`](@ref)
+refines it to the stationary point before differentiating.
 
 For interval data the default `kappas` grid never extends past the `κ` at which `κ` times the
 widest interval reaches 4096, beyond which the fit cannot be computed accurately; a minimum
@@ -4091,5 +4128,6 @@ function __init__()
 end
 
 include("interval.jl")
+include("kappa_gradient.jl")
 
 end # module
