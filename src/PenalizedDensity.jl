@@ -3779,8 +3779,10 @@ scale or an [`AdaptiveScale`](@ref), chosen with `nse` as above); a window candi
 resolvable `c` never wins. The penalty accounts for `ĥ` depending on the held-out point
 itself: KLCV treats the shape as fixed, and so rates the window candidate too well, by an
 amount that grows with `gamma` and shrinks like `1/√N`. The default `k = 0.11` matches the
-optimism measured by exact leave-one-out refits (with `ĥ` re-estimated without the held-out
-point) on smooth and bimodal densities at `N = 1000` and `4000`. The threshold `z = 4` keeps
+optimism measured on normal and bimodal samples, which have no narrow features for the window
+to resolve, at `N = 250` to `8000`: recomputing `ĥ` without each held-out point, with `c`
+fixed, raises the score by `0.09` to `0.13` times `gamma/√N`. On samples with narrow features
+or heavy tails the optimism is larger, up to about `0.25·gamma/√N`. The threshold `z = 4` keeps
 the scan above the noise of the window statistics, which have unit standard deviation in any
 window without structure. `gamma` is fixed rather than selected per sample, because a
 per-sample choice of `gamma` is dominated by sampling noise in the score.
