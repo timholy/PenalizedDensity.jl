@@ -403,8 +403,11 @@ cross-validates.
 times the distance to the nearest node exceeds about 745, `d(x)` underflows to zero and
 `log(d(x))` gives `-Inf`, but `logdensity(d, x)` remains finite and accurate.
 
-Two functions give derivatives of the log density:
+Three functions give derivatives of the log density:
 [`logdensity_eval_gradient`](@ref) gives ``\partial \ln \hat Q(y)/\partial y`` in closed form,
-and [`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities
-with respect to the node positions, in ``O(N + M)`` for ``N`` nodes and ``M`` evaluation
-points.
+[`logdensity_node_gradient`](@ref) gives the gradient of a weighted sum of log densities
+with respect to the node positions, and [`logdensity_kappa_derivative`](@ref) gives its
+derivative with respect to ``\kappa``, each in ``O(N + M)`` for ``N`` nodes and ``M``
+evaluation points. When ``\kappa`` is itself chosen from the data by [`select_kappa`](@ref),
+[`select_kappa_gradient`](@ref) gives the gradient of the selected ``\hat\kappa`` with respect
+to the observations, also in ``O(N)``, and the gradient of the sum follows by the chain rule.
