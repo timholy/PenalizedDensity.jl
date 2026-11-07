@@ -109,6 +109,30 @@ function green_identity(d)
     return 4 * sum(d.w .* b ./ d.ψ)
 end
 
+# Reference for `_gaussianize` that computes both tail masses at every point and feeds Φ⁻¹
+# the smaller. The package computes only one wherever the node cumulatives decide which is
+# smaller; the two must agree bit for bit.
+function _gaussianize_reference(d, xin::Real)
+    PD = PenalizedDensity
+    xs, ψ, total = d.x, d.ψ, d.total
+    T = typeof(total)
+    n = length(xs)
+    κL, κR = PD._tail_rates(d)
+    x = T(xin)
+    if x <= xs[1]
+        isinf(d.lo) &&
+            return PD._probit_from_log(2 * κL * (x - xs[1]) + log(ψ[1]^2 / (2 * κL * total)))
+        x <= d.lo && return T(-Inf)
+    elseif x >= xs[n]
+        isinf(d.hi) &&
+            return -PD._probit_from_log(-2 * κR * (x - xs[n]) + log(ψ[n]^2 / (2 * κR * total)))
+        x >= d.hi && return T(Inf)
+    end
+    mlo, mhi = PD._cdf_mass(d, x), PD._ccdf_mass(d, x)
+    return mlo <= mhi ? -sqrt(T(2)) * PD.erfcinv(2 * (mlo / total)) :
+                         sqrt(T(2)) * PD.erfcinv(2 * (mhi / total))
+end
+
 @testset "PenalizedDensity.jl" begin
     @testset "single point is a Laplace density" begin
         κ = 1.5
@@ -914,6 +938,46 @@ end
         @test abs(mean(y)) < 0.05 && abs(var(y) - 1) < 0.07
         counts = [sum(0.1 * (b - 1) .<= Φ.(y) .< 0.1 * b) for b in 1:10]
         @test sum((counts .- 400) .^ 2 ./ 400) < 30     # χ²₉; multinomial noise only
+    end
+
+    @testset "gaussianize matches the both-masses reference bit for bit" begin
+        rng = Xoshiro(404)
+        z = randn(rng, 2000)
+        u = rand(rng, 2000)
+        xr = round.(randn(rng, 300); digits=1)
+        r = select_support(u)
+        fits = Any[DensityEstimate(z, select_kappa(z)),
+                   DensityEstimate(Float32.(z), select_kappa(Float32.(z))),
+                   DensityEstimate(randexp(rng, 1000) .^ 2, 3.0),
+                   DensityEstimate(u, r.κ; support=r.support),
+                   DensityEstimate(Float32.(u), 4.0f0; support=(0.0f0, 1.0f0)),
+                   DensityEstimate(u, 6.0; support=(0.0, Inf)),
+                   DensityEstimate(u, 6.0; support=(-Inf, 1.0)),
+                   DensityEstimate(z .^ 2, select_kappa(z .^ 2, Adaptive())),
+                   # Boundary segments that hold most of the mass on one side.
+                   DensityEstimate([0.8, 0.9], 0.5; support=(0.0, 1.0)),
+                   DensityEstimate([0.1, 0.2], 0.5; support=(0.0, 1.0)),
+                   IntervalDensityEstimate(xr, 3.0; resolution=0.1),
+                   IntervalDensityEstimate(xr, 3.0; resolution=0.1, support=(-5.0, 5.0))]
+        for d in fits
+            T = typeof(d.total)
+            xs, F, G = d.x, d.F, d.G
+            lo = isfinite(d.lo) ? d.lo : xs[1] - 5
+            hi = isfinite(d.hi) ? d.hi : xs[end] + 5
+            # Interval holding the median, where both masses are compared directly.
+            k = clamp(something(findlast(<=(0), F .- G), firstindex(xs)), firstindex(xs), lastindex(xs) - 1)
+            pts = Real[xs; prevfloat.(xs); nextfloat.(xs);                     # at nodes
+                       range(xs[k], xs[k+1]; length=201);                      # median interval
+                       quantile(d, 0.5); quantile(d, T(0.5));
+                       range(lo - 1, hi + 1; length=2001);                     # walls and beyond
+                       lo; hi; prevfloat(T(lo)); nextfloat(T(lo)); prevfloat(T(hi)); nextfloat(T(hi));
+                       xs[1] - 40; xs[end] + 40;                               # deep tails
+                       lo .+ (hi - lo) .* rand(rng, 5000);
+                       T.(lo .+ (hi - lo) .* rand(rng, 1000))]
+            filter!(isfinite, pts)
+            nbad = count(t -> gaussianize(d, t) !== _gaussianize_reference(d, t), pts)
+            @test nbad == 0
+        end
     end
 
     @testset "generic indexing: OffsetArray input" begin
