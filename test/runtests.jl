@@ -3355,7 +3355,7 @@ end
 # Evaluation through GPU-style array storage. JLArrays runs the GPUArrays broadcast machinery
 # on the CPU with scalar indexing disallowed, so every evaluation happens inside the kernel,
 # on the adapted fit; the arithmetic is the same as on `Vector` storage, so results must be
-# identical.
+# identical. `test/gpu/runtests.jl` runs the same evaluators on a CUDA GPU.
 @testset "array storage: Adapt to JLArray" begin
     x = randn(MersenneTwister(17), 400)
     fits = (DensityEstimate(x, 3.0),

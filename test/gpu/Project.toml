@@ -1,0 +1,14 @@
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+PenalizedDensity = "a53fa1a1-8a2d-4fe0-8d35-d78a1429f885"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+PenalizedDensity = {path = "../.."}
+
+[compat]
+Adapt = "4"
+CUDA = "6"
