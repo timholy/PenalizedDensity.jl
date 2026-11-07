@@ -83,18 +83,30 @@ held-out `entropy(d, xeval)` has no StatsBase counterpart, because StatsBase's t
 abstract type AbstractDensityEstimate end
 
 """
-    ConvergenceError(routine, msg)
+    ConvergenceError(routine, msg, state=(;))
 
 Thrown when an iterative routine (a fit's Newton solve, a quantile or probit inversion, or a
 selector's search) stops without converging. `routine` names it and `msg` describes the state
 at which it stopped. The result such a routine would return is unreliable, so it is not
 returned.
+
+`state`, a `NamedTuple`, holds values that locate the failure (such as the target of an
+inversion). It is printed after `msg` but stored unformatted, so the routines that GPU kernels
+can call need no string formatting to throw this error.
 """
-struct ConvergenceError <: Exception
+struct ConvergenceError{S<:NamedTuple} <: Exception
     routine::String
     msg::String
+    state::S
 end
-Base.showerror(io::IO, e::ConvergenceError) = print(io, "ConvergenceError in ", e.routine, ": ", e.msg)
+ConvergenceError(routine, msg) = ConvergenceError(routine, msg, NamedTuple())
+function Base.showerror(io::IO, e::ConvergenceError)
+    print(io, "ConvergenceError in ", e.routine, ": ", e.msg)
+    isempty(e.state) && return nothing
+    print(io, "\n  at ")
+    join(io, (string(k, " = ", v) for (k, v) in pairs(e.state)), ", ")
+    return nothing
+end
 
 # The evaluators order `x` against the nodes, and NaN has no place in that order.
 _check_not_nan(x) = isnan(x) ? throw(DomainError(x, "the evaluation point must not be NaN")) : nothing
@@ -1754,7 +1766,7 @@ function _invert_mass(d::AbstractDensityEstimate, massfun, lo::T, hi::T, y::T, t
         ynew == y && return y                     # the bracket has closed to adjacent floats
         y = ynew
     end
-    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations at target = $target; please report this"))
+    throw(ConvergenceError("quantile", "safeguarded Newton did not converge in 200 iterations; please report this", (; target)))
 end
 
 # `cq` is the upper-tail probability 1 - q. Callers that know it more precisely than `1 - q`
@@ -1831,7 +1843,7 @@ function _probit_from_log(ℓ::T) where {T<:AbstractFloat}
         t += Δ
         abs(Δ) <= 2 * eps(t) && return -t
     end
-    throw(ConvergenceError("gaussianize", "the probit Newton iteration did not converge in 12 iterations at ln(p) = $ℓ; please report this"))
+    throw(ConvergenceError("gaussianize", "the probit Newton iteration did not converge in 12 iterations; please report this", (; logp = ℓ)))
 end
 
 # Φ⁻¹ fed from whichever tail mass is smaller, so it always receives a probability at full

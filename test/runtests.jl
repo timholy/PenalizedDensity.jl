@@ -2514,6 +2514,10 @@ end
         end
         @test sprint(showerror, err) ==
               "ConvergenceError in the amplitude solve: Newton did not converge in 1 iterations"
+        # Values locating a failure are stored unformatted and printed after the message.
+        err = PenalizedDensity.ConvergenceError("quantile", "did not converge", (; target = 0.25, k = 3))
+        @test err.state === (; target = 0.25, k = 3)
+        @test sprint(showerror, err) == "ConvergenceError in quantile: did not converge\n  at target = 0.25, k = 3"
     end
 
     @testset "roughness_operator promotes its arguments" begin
