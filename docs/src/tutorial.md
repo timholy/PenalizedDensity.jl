@@ -411,3 +411,34 @@ derivative with respect to ``\kappa``, each in ``O(N + M)`` for ``N`` nodes and 
 evaluation points. When ``\kappa`` is itself chosen from the data by [`select_kappa`](@ref),
 [`select_kappa_gradient`](@ref) gives the gradient of the selected ``\hat\kappa`` with respect
 to the observations, also in ``O(N)``, and the gradient of the sum follows by the chain rule.
+
+## Evaluating on a GPU
+
+Fitting and scale selection run on the CPU, but a finished [`DensityEstimate`](@ref) can be
+moved to GPU array storage and evaluated there in bulk. With [Adapt](https://github.com/JuliaGPU/Adapt.jl)
+loaded (every GPU package loads it), `adapt` moves the fit's node data to the GPU, and the
+result broadcasts over GPU arrays:
+
+```julia
+using CUDA, Adapt
+d = DensityEstimate{Float32}(x, select_kappa(x))   # fit on the CPU, in single precision
+dg = adapt(CuArray, d)                             # the same fit, stored on the GPU
+X = CUDA.randn(Float32, 10^7)
+Y = gaussianize.(dg, X)                            # one GPU kernel
+```
+
+The pointwise evaluators work this way: `d(x)`, [`amplitude`](@ref), [`logdensity`](@ref),
+[`cdf`](@ref), [`quantile`](@ref Statistics.quantile), [`gaussianize`](@ref),
+[`ungaussianize`](@ref) and [`gaussianize_logjacobian`](@ref). Everything else (fitting, scale
+selection, [`entropy`](@ref), the goodness-of-fit functions) needs a fit with ordinary `Vector`
+storage; `adapt(Array, dg)` converts back. [`IntervalDensityEstimate`](@ref) does not support
+GPU storage.
+
+Most GPUs run `Float64` arithmetic many times slower than `Float32`, so fit in `Float32` and
+evaluate `Float32` points. The mass-based functions (`cdf`, `quantile`, `gaussianize`,
+`ungaussianize`) convert the point to the fit's type, but `d(x)`, `amplitude` and `logdensity`
+compute in the promotion of the two, so a `Float64` point on a `Float32` fit is evaluated in
+`Float64`.
+
+An error inside a GPU kernel, such as a `NaN` evaluation point, is reported by the GPU package
+as a generic kernel exception, without the message the same call gives on the CPU.

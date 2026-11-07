@@ -216,21 +216,28 @@ varying `κ` and a finite `support`, in addition to a constant `κ` on the unbou
 
 Passing a [`SolveStats`](@ref) as the `stats` keyword records the Newton-step and backtracking
 counts of the fixed-scale solve, for benchmarking; it does not change the fit.
+
+A fit stores its node data in `Vector`s. With Adapt.jl loaded, `adapt(CuArray, d)` (or any
+other array type) returns the same fit with GPU storage, on which the pointwise evaluators
+(`d(x)`, `amplitude`, `logdensity`, `cdf`, `quantile`, `gaussianize`, `ungaussianize`,
+`gaussianize_logjacobian`) broadcast over GPU arrays. Fitting and the other functions need
+`Vector` storage.
 """
-struct DensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: AbstractDensityEstimate
-    x::Vector{T}   # sorted, distinct node locations
-    w::Vector{T}   # weight (multiplicity) at each node
-    ψ::Vector{T}   # normalized amplitude at the nodes
+struct DensityEstimate{T<:AbstractFloat,K<:Union{T,AbstractVector{T}},V<:AbstractVector{T}} <: AbstractDensityEstimate
+    x::V           # sorted, distinct node locations
+    w::V           # weight (multiplicity) at each node
+    ψ::V           # normalized amplitude at the nodes
     κ::K           # smoothing scale: one number, or one per inter-node interval
     κL::T          # decay rate of the left tail
     κR::T          # decay rate of the right tail
     lo::T          # left edge of the support; -Inf for an unbounded left tail
     hi::T          # right edge of the support; +Inf for an unbounded right tail
     λ::T           # normalization multiplier (diagnostic)
-    F::Vector{T}   # mass below each node (see `_node_cumulatives`)
-    G::Vector{T}   # mass above each node
+    F::V           # mass below each node (see `_node_cumulatives`)
+    G::V           # mass above each node
     total::T       # total mass, F[end] + G[end]
 
+    # A new fit, with `Vector` storage, from its nodes, weights and amplitudes.
     function DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ) where {T<:AbstractFloat,K<:Union{T,Vector{T}}}
         length(x) == length(w) == length(ψ) ||
             throw(DimensionMismatch("nodes, weights, and amplitudes must have equal length, " *
@@ -239,9 +246,19 @@ struct DensityEstimate{T<:AbstractFloat,K<:Union{T,Vector{T}}} <: AbstractDensit
         # The node cumulatives are computed from the other fields. During that computation the
         # tables are empty and the total is NaN, so a premature read throws a BoundsError or
         # yields NaN rather than a plausible value.
-        d = new{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ, T[], T[], T(NaN))
+        d = new{T,K,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ, T[], T[], T(NaN))
         F, G, total = _node_cumulatives(d)
-        return new{T,K}(d.x, d.w, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi, d.λ, F, G, total)
+        return new{T,K,Vector{T}}(d.x, d.w, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi, d.λ, F, G, total)
+    end
+
+    # An existing fit with every field supplied, including the node cumulatives, which are
+    # taken as given. This moves a fit to other array storage (see the Adapt extension).
+    function DensityEstimate{T,K,V}(x, w, ψ, κ, κL, κR, lo, hi, λ, F, G, total) where {T<:AbstractFloat,K<:Union{T,AbstractVector{T}},V<:AbstractVector{T}}
+        length(x) == length(w) == length(ψ) == length(F) == length(G) ||
+            throw(DimensionMismatch("nodes, weights, amplitudes and node cumulatives must have equal length, " *
+                                    "got $(length(x)), $(length(w)), $(length(ψ)), $(length(F)), $(length(G))"))
+        _check_interval_scale(κ, length(x))
+        return new{T,K,V}(x, w, ψ, κ, κL, κR, lo, hi, λ, F, G, total)
     end
 end
 
@@ -253,6 +270,8 @@ _check_interval_scale(κ::AbstractVector, n) =
         "a per-interval scale needs one rate per inter-node interval: " *
         "got $(length(κ)) rates for $n nodes"))
 
+DensityEstimate{T,K,Vector{T}}(x, w, ψ, κ, κL, κR, lo, hi, λ) where {T,K} =
+    DensityEstimate{T,K}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 DensityEstimate{T}(x, w, ψ, κ::Real, κL, κR, lo, hi, λ) where {T} =
     DensityEstimate{T,T}(x, w, ψ, κ, κL, κR, lo, hi, λ)
 DensityEstimate{T}(x, w, ψ, κ::AbstractVector, κL, κR, lo, hi, λ) where {T} =
@@ -328,7 +347,7 @@ end
 # differ only here, so every evaluation routine below is written once and specializes to
 # the constant case at no cost.
 _kappa(d::DensityEstimate{T,T}, k::Integer) where {T} = d.κ
-_kappa(d::DensityEstimate{T,Vector{T}}, k::Integer) where {T} = d.κ[k]
+_kappa(d::DensityEstimate{T,<:AbstractVector{T}}, k::Integer) where {T} = d.κ[k]
 
 # The same accessor for a bare scale (one rate, or one per interval), for code that works on
 # nodes and weights rather than on a fit, such as the cross-validation scores.
@@ -336,7 +355,7 @@ _kappa(κ::Real, k::Integer) = κ
 _kappa(κs::AbstractVector, k::Integer) = κs[k]
 
 _show_kappa(d::DensityEstimate{T,T}) where {T} = "κ=$(d.κ)"
-function _show_kappa(d::DensityEstimate{T,Vector{T}}) where {T}
+function _show_kappa(d::DensityEstimate{T,<:AbstractVector{T}}) where {T}
     # A one-node fit has no intervals, only the two tails, so both extrema fold them in.
     lo = min(d.κL, d.κR, minimum(d.κ; init=typemax(T)))
     hi = max(d.κL, d.κR, maximum(d.κ; init=typemin(T)))
@@ -2337,9 +2356,9 @@ end
 
 # The adjoint above differentiates the field equation of a single-rate fit; a per-interval
 # scale would need the κₖ-dependence of every roughness term.
-logdensity_node_gradient(::DensityEstimate{T,Vector{T}}, ::AbstractVector, weights=nothing) where {T} =
+logdensity_node_gradient(::DensityEstimate{T,<:AbstractVector{T}}, ::AbstractVector, weights=nothing) where {T} =
     throw(ArgumentError("logdensity_node_gradient supports only a single-rate (scalar κ) fit"))
-logdensity_kappa_derivative(::DensityEstimate{T,Vector{T}}, ::AbstractVector, weights=nothing) where {T} =
+logdensity_kappa_derivative(::DensityEstimate{T,<:AbstractVector{T}}, ::AbstractVector, weights=nothing) where {T} =
     throw(ArgumentError("logdensity_kappa_derivative supports only a single-rate (scalar κ) fit"))
 
 """
