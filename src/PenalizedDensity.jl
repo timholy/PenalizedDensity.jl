@@ -1836,9 +1836,10 @@ end
 
 # Φ⁻¹ fed from whichever tail mass is smaller, so it always receives a probability at full
 # relative precision.
+_probit_lower(mlo::T, total::T) where {T} = -sqrt(T(2)) * erfcinv(2 * (mlo / total))
+_probit_upper(mhi::T, total::T) where {T} = sqrt(T(2)) * erfcinv(2 * (mhi / total))
 _probit_from_masses(mlo::T, mhi::T, total::T) where {T} =
-    mlo <= mhi ? -sqrt(T(2)) * erfcinv(2 * (mlo / total)) :
-                  sqrt(T(2)) * erfcinv(2 * (mhi / total))
+    mlo <= mhi ? _probit_lower(mlo, total) : _probit_upper(mhi, total)
 
 # y = Φ⁻¹(F(x)), assembled from whichever side of the distribution is smaller so Φ⁻¹ is
 # always fed a probability at full relative precision. Beyond the extreme nodes on an unbounded
@@ -1847,23 +1848,38 @@ _probit_from_masses(mlo::T, mhi::T, total::T) where {T} =
 # Beyond a finite wall the "tail" is the bounded cosh-arc boundary segment: its mass is finite,
 # so the same node-cumulative assembly as the interior applies, and past the wall F is 0 (or 1),
 # giving y = ∓Inf for a compact-support density.
+#
+# Elsewhere only the smaller mass is computed. For xs[k] ≤ x ≤ xs[k+1] the mass below x lies in
+# [F[k], F[k+1]] and the mass above it in [G[k+1], G[k]] (in a boundary segment, below F[1] or
+# above G[n] respectively), so the node tables decide which side is smaller without evaluating
+# either. The decision must match `_probit_from_masses` on the two computed masses, which can
+# stray past the node bounds by roundoff; the margin `tol` absorbs that, and inside it (the
+# cells near the median) both masses are computed and compared directly.
 function _gaussianize(d::AbstractDensityEstimate, xin::Real)
-    xs, ψ, total = d.x, d.ψ, d.total
+    xs, ψ, F, G, total = d.x, d.ψ, d.F, d.G, d.total
     T = typeof(total)
     n = length(xs)
     κL, κR = _tail_rates(d)
     _check_not_nan(xin)
     x = T(xin)
+    tol = sqrt(eps(T)) * total
     if x <= xs[1]
         isinf(d.lo) &&
             return _probit_from_log(2 * κL * (x - xs[1]) + log(ψ[1]^2 / (2 * κL * total)))
         x <= d.lo && return T(-Inf)
+        F[1] + tol < G[1] && return _probit_lower(_cdf_mass(d, x), total)
+        return _probit_from_masses(_cdf_mass(d, x), _ccdf_mass(d, x), total)
     elseif x >= xs[n]
         isinf(d.hi) &&
             return -_probit_from_log(-2 * κR * (x - xs[n]) + log(ψ[n]^2 / (2 * κR * total)))
         x >= d.hi && return T(Inf)
+        G[n] + tol < F[n] && return _probit_upper(_ccdf_mass(d, x), total)
+        return _probit_from_masses(_cdf_mass(d, x), _ccdf_mass(d, x), total)
     end
-    return _probit_from_masses(_cdf_mass(d, x), _ccdf_mass(d, x), total)
+    k = searchsortedlast(xs, x)         # xs[k] ≤ x < xs[k+1]
+    F[k+1] + tol < G[k+1] && return _probit_lower(_cdf_mass_interior(d, k, x), total)
+    G[k] + tol < F[k] && return _probit_upper(_ccdf_mass_interior(d, k, x), total)
+    return _probit_from_masses(_cdf_mass_interior(d, k, x), _ccdf_mass_interior(d, k, x), total)
 end
 
 # x = F⁻¹(Φ(y)), branched on the sign of y so the smaller of Φ(y), 1-Φ(y) is the one
