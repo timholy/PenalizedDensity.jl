@@ -10,6 +10,8 @@ using QuadGK: quadgk
 using Random, Statistics
 using Random: randn!
 using Test
+using Adapt: adapt
+using JLArrays: JLArray
 using Aqua
 using ExplicitImports
 
@@ -2514,6 +2516,10 @@ end
         end
         @test sprint(showerror, err) ==
               "ConvergenceError in the amplitude solve: Newton did not converge in 1 iterations"
+        # Values locating a failure are stored unformatted and printed after the message.
+        err = PenalizedDensity.ConvergenceError("quantile", "did not converge", (; target = 0.25, k = 3))
+        @test err.state === (; target = 0.25, k = 3)
+        @test sprint(showerror, err) == "ConvergenceError in quantile: did not converge\n  at target = 0.25, k = 3"
     end
 
     @testset "roughness_operator promotes its arguments" begin
@@ -3344,6 +3350,46 @@ end
         @info "select_support efficiency at N=50000" t_select_kappa=t1 t_select_support=t2 ratio=t2 / t1
         @test isfinite(t2)   # the search completes
     end
+end
+
+# Evaluation through GPU-style array storage. JLArrays runs the GPUArrays broadcast machinery
+# on the CPU with scalar indexing disallowed, so every evaluation happens inside the kernel,
+# on the adapted fit; the arithmetic is the same as on `Vector` storage, so results must be
+# identical. `test/gpu/runtests.jl` runs the same evaluators on a CUDA GPU.
+@testset "array storage: Adapt to JLArray" begin
+    x = randn(MersenneTwister(17), 400)
+    fits = (DensityEstimate(x, 3.0),
+            DensityEstimate{Float32}(x, 3.0; support=(-5.0, 5.0)),
+            DensityEstimate(x, t -> 2 + t^2 / 4))
+    for d in fits
+        T = eltype(d)
+        dj = adapt(JLArray, d)
+        @test dj isa DensityEstimate{T}
+        @test dj.x isa JLArray{T,1} && dj.F isa JLArray{T,1} && dj.G isa JLArray{T,1}
+        @test d.κ isa Real ? dj.κ === d.κ : dj.κ isa JLArray{T,1}
+        @test Array(dj.x) == d.x && Array(dj.ψ) == d.ψ && Array(dj.F) == d.F && Array(dj.G) == d.G
+        @test (dj.κL, dj.κR, dj.lo, dj.hi, dj.λ, dj.total) === (d.κL, d.κR, d.lo, d.hi, d.λ, d.total)
+        @test sprint(show, dj) == sprint(show, d)
+        # Points at and between nodes, at the median, in both tails, past any wall, and ±Inf.
+        t = T[-Inf; -40; -6; -5; d.x[1]; d.x[2:7:end]; (d.x[2:7:end-1] .+ d.x[3:7:end]) ./ 2;
+              median(d); d.x[end]; 5; 6; 40; Inf]
+        tj = JLArray(t)
+        for f in (amplitude, logdensity, cdf, gaussianize, (d, s) -> d(s),
+                  (d, s) -> gaussianize_logjacobian(d, s).logjac)
+            @test isequal(Array(f.(dj, tj)), f.(d, t))
+        end
+        y = T[-Inf, -40, -3, -0.5, 0, 0.7, 3, 40, Inf]
+        @test isequal(Array(ungaussianize.(dj, JLArray(y))), ungaussianize.(d, y))
+        p = T[0, 1e-6, 0.1, 0.5, 0.9, 1]
+        @test isequal(Array(quantile.(dj, JLArray(p))), quantile.(d, p))
+        # Back to `Vector` storage.
+        dv = adapt(Array, dj)
+        @test dv isa DensityEstimate{T,typeof(d.κ),Vector{T}}
+        @test dv.x == d.x && dv.F == d.F && gaussianize.(dv, t) == gaussianize.(d, t)
+    end
+    d = fits[1]
+    @test_throws DimensionMismatch DensityEstimate{Float64,Float64,Vector{Float64}}(
+        d.x, d.w, d.ψ, d.κ, d.κL, d.κR, d.lo, d.hi, d.λ, d.F[2:end], d.G, d.total)
 end
 
 include("interval.jl")
